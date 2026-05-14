@@ -9,6 +9,12 @@
 
 export abstract class IMotorCognitivo {
   /**
+   * Define o sinal de aborto para cancelamento de operações pendentes.
+   * @param signal - Sinal AbortSignal para cancelamento gracioso.
+   */
+  abstract setAbortSignal(signal: AbortSignal): void;
+
+  /**
    * Envia um prompt ao motor cognitivo e retorna a resposta gerada.
    * @param prompt - O texto de entrada para o modelo de linguagem.
    * @returns A resposta gerada pelo modelo.

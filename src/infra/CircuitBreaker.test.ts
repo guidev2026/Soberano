@@ -11,20 +11,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { CircuitBreaker } from './CircuitBreaker.ts';
 import { CircuitState } from '../core/ICircuitBreaker.ts';
-import { ILogger, LogLevel } from '../core/ILogger.ts';
+import { ILogger } from '../core/ILogger.ts';
 
 class MockLogger extends ILogger {
   public logs: string[] = [];
-  private readonly level: LogLevel;
-
-  constructor(minLevel: LogLevel = LogLevel.DEBUG) {
-    super();
-    this.level = minLevel;
-  }
-
-  get minLevel(): LogLevel {
-    return this.level;
-  }
 
   info(message: string): void {
     this.logs.push(`INFO: ${message}`);
@@ -94,7 +84,7 @@ describe('CircuitBreaker', () => {
         () => cb.execute(successFn),
         (err: unknown) => {
           if (err instanceof Error) {
-            assert.ok(err.message.includes('Circuito aberto'));
+            assert.ok(err.message.includes('Circuit is open'));
           }
           return true;
         }
@@ -113,7 +103,7 @@ describe('CircuitBreaker', () => {
       await assert.rejects(() => cb.execute(successFn));
 
       assert.ok(
-        logger.logs.some((log) => log.includes('ABERTO')),
+        logger.logs.some((log) => log.includes('OPEN')),
         'Deve registrar log de circuito aberto'
       );
     });

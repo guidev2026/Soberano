@@ -16,10 +16,6 @@ export class ConsoleLogger extends ILogger {
     this.level = minLevel;
   }
 
-  get minLevel(): LogLevel {
-    return this.level;
-  }
-
   private formatMessage(level: string, message: string): string {
     const timestamp = new Date().toISOString();
     return `[${timestamp}] [${this.prefix}] [${level}] ${message}`;

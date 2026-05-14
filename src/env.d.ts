@@ -22,6 +22,8 @@ declare class AbortSignal {
   readonly aborted: boolean;
   addEventListener(type: 'abort', listener: () => void): void;
   removeEventListener(type: 'abort', listener: () => void): void;
+  static timeout(ms: number): AbortSignal;
+  static any(signals: AbortSignal[]): AbortSignal;
 }
 
 // setTimeout e clearTimeout
@@ -39,11 +41,22 @@ declare module 'node:test' {
   }
   export function describe(name: string, fn: () => void): void;
   export function it(name: string, fn: (t: TestContext) => void | Promise<void>): void;
+  interface MockFunction<T extends (...args: unknown[]) => unknown> {
+    (...args: Parameters<T>): ReturnType<T>;
+  }
+  interface MockMethod<T, K extends keyof T> {
+    mock: {
+      restore: () => void;
+    };
+  }
   export const mock: {
     fn: typeof Function;
+    method<T, K extends keyof T>(object: T, method: K, implementation?: (...args: any[]) => any): MockMethod<T, K>;
   };
   export function before(fn: () => void | Promise<void>): void;
   export function after(fn: () => void | Promise<void>): void;
+  export function beforeEach(fn: () => void | Promise<void>): void;
+  export function afterEach(fn: () => void | Promise<void>): void;
 }
 
 // node:assert

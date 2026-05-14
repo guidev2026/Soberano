@@ -13,9 +13,6 @@ export enum LogLevel {
 }
 
 export abstract class ILogger {
-  /** Nível mínimo de log para filtrar mensagens (DEBUG=0, INFO=1, WARN=2, ERROR=3) */
-  abstract minLevel: LogLevel;
-
   /** Informational message */
   abstract info(message: string): void;
   /** Warning that does not halt execution */
