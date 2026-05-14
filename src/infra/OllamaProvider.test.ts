@@ -12,6 +12,7 @@ import assert from 'node:assert';
 import { OllamaProvider } from './OllamaProvider.ts';
 import { ILogger } from '../core/ILogger.ts';
 import { ICircuitBreaker, CircuitState } from '../core/ICircuitBreaker.ts';
+import type { ChatMessage } from '../core/IMotorCognitivo.ts';
 
 /**
  * Logger fictício (mock) que estende ILogger sem efeitos colaterais.
@@ -64,7 +65,7 @@ describe('OllamaProvider', () => {
   });
 
   describe('Chamada fetch - gerarResposta', () => {
-    it('deve chamar fetch com a URL e payload corretos', async () => {
+    it('deve chamar fetch com a URL e payload corretos (endpoint /api/chat)', async () => {
       const mockLogger = new MockLogger();
 
       let capturedUrl: string | undefined;
@@ -77,7 +78,10 @@ describe('OllamaProvider', () => {
         return new Response(JSON.stringify({
           model: 'test-model',
           created_at: new Date().toISOString(),
-          response: 'Resposta de teste do SOBERANO.',
+          message: {
+            role: 'assistant',
+            content: 'Resposta de teste do SOBERANO.',
+          },
           done: true,
         }), {
           status: 200,
@@ -87,10 +91,12 @@ describe('OllamaProvider', () => {
 
       const mockCB = new MockCircuitBreaker();
       const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:11434', model: 'test-model', circuitBreaker: mockCB });
-      const resposta = await provider.gerarResposta('Prompt de teste');
 
-      // Valida que fetch foi chamado na URL correta
-      assert.strictEqual(capturedUrl, 'http://localhost:11434/api/generate');
+      const mensagens: ChatMessage[] = [{ role: 'user', content: 'Prompt de teste' }];
+      const resposta = await provider.gerarResposta(mensagens);
+
+      // Valida que fetch foi chamado na URL correta (/api/chat)
+      assert.strictEqual(capturedUrl, 'http://localhost:11434/api/chat');
 
       // Valida que o payload foi enviado corretamente
       assert.ok(capturedOptions, 'fetch deve ter sido chamado com options');
@@ -99,7 +105,7 @@ describe('OllamaProvider', () => {
 
       const sentBody = JSON.parse(capturedOptions!.body as string);
       assert.strictEqual(sentBody.model, 'test-model');
-      assert.strictEqual(sentBody.prompt, 'Prompt de teste');
+      assert.deepStrictEqual(sentBody.messages, [{ role: 'user', content: 'Prompt de teste' }]);
       assert.strictEqual(sentBody.stream, false);
 
       // Valida que a resposta foi processada corretamente
@@ -129,7 +135,7 @@ describe('OllamaProvider', () => {
       const mockCB = new MockCircuitBreaker();
       const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
       await assert.rejects(
-        () => provider.gerarResposta('teste'),
+        () => provider.gerarResposta([{ role: 'user', content: 'teste' }]),
         (err: unknown) => {
           if (err instanceof Error) {
             assert.ok(err.message.includes('HTTP error 404'));
@@ -150,7 +156,7 @@ describe('OllamaProvider', () => {
       const mockCB = new MockCircuitBreaker();
       const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:99999', model: 'test-model', delayBase: 1, circuitBreaker: mockCB });
       await assert.rejects(
-        () => provider.gerarResposta('teste'),
+        () => provider.gerarResposta([{ role: 'user', content: 'teste' }]),
         (err: unknown) => {
           if (err instanceof Error) {
             assert.ok(err.message.includes('fetch failed'));
@@ -192,7 +198,7 @@ describe('OllamaProvider', () => {
 
       const mockCB = new MockCircuitBreaker();
       const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
-      await assert.rejects(() => provider.gerarResposta('teste'));
+      await assert.rejects(() => provider.gerarResposta([{ role: 'user', content: 'teste' }]));
       // Deve ter chamado fetch apenas 1 vez (sem retry para 4xx)
       assert.strictEqual(callCount, 1, 'Não deve haver retry para erro HTTP 4xx');
     });

@@ -11,6 +11,7 @@
  */
 
 import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
+import type { ChatMessage } from '../core/IMotorCognitivo.ts';
 import { ILogger } from '../core/ILogger.ts';
 import { ICircuitBreaker } from '../core/ICircuitBreaker.ts';
 
@@ -24,12 +25,17 @@ export interface OllamaConfig {
   circuitBreaker?: ICircuitBreaker;
 }
 
-export interface OllamaGenerateResponse {
+export interface OllamaChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+  images?: string[];
+}
+
+export interface OllamaChatResponse {
   model: string;
   created_at: string;
-  response: string;
+  message: OllamaChatMessage;
   done: boolean;
-  context?: number[];
   total_duration?: number;
   load_duration?: number;
   prompt_eval_count?: number;
@@ -39,14 +45,14 @@ export interface OllamaGenerateResponse {
 }
 
 /**
- * Valida em runtime se um valor desconhecido é um OllamaGenerateResponse válido.
+ * Valida em runtime se um valor desconhecido é um OllamaChatResponse válido.
  * Lança erro descritivo se algum campo obrigatório estiver ausente ou com tipo incorreto.
  *
  * @param data - Dado desconhecido a ser validado
- * @returns O dado tipado como OllamaGenerateResponse
+ * @returns O dado tipado como OllamaChatResponse
  * @throws {Error} Se a validação falhar
  */
-export function validateOllamaResponse(data: unknown): OllamaGenerateResponse {
+export function validateOllamaResponse(data: unknown): OllamaChatResponse {
   if (data === null || data === undefined || typeof data !== 'object') {
     throw new Error(
       `[OllamaProvider] Invalid response: expected object, received ${typeof data}`
@@ -58,12 +64,6 @@ export function validateOllamaResponse(data: unknown): OllamaGenerateResponse {
   if (typeof record.model !== 'string') {
     throw new Error(
       `[OllamaProvider] Field "model" missing or invalid: expected string, received ${typeof record.model}`
-    );
-  }
-
-  if (typeof record.response !== 'string') {
-    throw new Error(
-      `[OllamaProvider] Field "response" missing or invalid: expected string, received ${typeof record.response}`
     );
   }
 
@@ -80,12 +80,35 @@ export function validateOllamaResponse(data: unknown): OllamaGenerateResponse {
     );
   }
 
+  if (record.message === null || record.message === undefined || typeof record.message !== 'object') {
+    throw new Error(
+      `[OllamaProvider] Field "message" missing or invalid: expected object, received ${typeof record.message}`
+    );
+  }
+
+  const messageRecord = record.message as Record<string, unknown>;
+
+  if (typeof messageRecord.role !== 'string' || !['system', 'user', 'assistant'].includes(messageRecord.role as string)) {
+    throw new Error(
+      `[OllamaProvider] Field "message.role" missing or invalid: expected 'system' | 'user' | 'assistant', received ${typeof messageRecord.role}`
+    );
+  }
+
+  if (typeof messageRecord.content !== 'string') {
+    throw new Error(
+      `[OllamaProvider] Field "message.content" missing or invalid: expected string, received ${typeof messageRecord.content}`
+    );
+  }
+
   return {
     model: record.model,
     created_at: record.created_at,
-    response: record.response,
+    message: {
+      role: messageRecord.role as 'system' | 'user' | 'assistant',
+      content: messageRecord.content,
+      images: Array.isArray(messageRecord.images) ? (messageRecord.images as string[]) : undefined,
+    },
     done: record.done,
-    context: Array.isArray(record.context) ? (record.context as number[]) : undefined,
     total_duration: typeof record.total_duration === 'number' ? record.total_duration : undefined,
     load_duration: typeof record.load_duration === 'number' ? record.load_duration : undefined,
     prompt_eval_count: typeof record.prompt_eval_count === 'number' ? record.prompt_eval_count : undefined,
@@ -179,27 +202,28 @@ export class OllamaProvider extends IMotorCognitivo {
         msg.includes('network') ||
         msg.includes('timeout') ||
         msg.includes('fetch failed')
-    );
+      );
     }
     return false;
   }
 
   /**
-   * Envia um prompt ao modelo Ollama e retorna a resposta gerada.
+   * Envia uma lista de mensagens no formato chat ao modelo Ollama
+   * e retorna a resposta gerada.
    * Utiliza exclusivamente o fetch nativo do Node.js (sem dependências externas).
    * Implementa retry automático (máximo configurável) para erros de conexão.
    * Implementa timeout via AbortController em cada tentativa.
    *
-   * @param prompt - O texto de entrada para o modelo.
-   * @returns A resposta gerada pelo modelo.
+   * @param mensagens - Array de mensagens no formato ChatMessage[].
+   * @returns A resposta gerada pelo modelo (content da mensagem assistant).
    * @throws {Error} Se após todas as tentativas a comunicação falhar.
    */
-  async gerarResposta(prompt: string): Promise<string> {
-    const url = `${this.baseUrl}/api/generate`;
+  async gerarResposta(mensagens: ChatMessage[]): Promise<string> {
+    const url = `${this.baseUrl}/api/chat`;
 
     const payload = {
       model: this.model,
-      prompt,
+      messages: mensagens,
       stream: false,
     };
 
@@ -214,7 +238,7 @@ export class OllamaProvider extends IMotorCognitivo {
 
       try {
         this.logger.info(
-          `[OllamaProvider] Attempt ${attempt}/${this.maxRetries} - Sending prompt to model "${this.model}"`
+          `[OllamaProvider] Attempt ${attempt}/${this.maxRetries} - Sending messages to model "${this.model}"`
         );
 
         // Configura timeout para esta tentativa
@@ -238,7 +262,7 @@ export class OllamaProvider extends IMotorCognitivo {
           }
         }
 
-        const executeFetch = async (): Promise<OllamaGenerateResponse> => {
+        const executeFetch = async (): Promise<OllamaChatResponse> => {
           const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -264,15 +288,15 @@ export class OllamaProvider extends IMotorCognitivo {
           const validated = validateOllamaResponse(rawData);
 
           this.logger.info(
-            `[OllamaProvider] Attempt ${attempt} succeeded. Response received (${validated.response.length} chars).`
+            `[OllamaProvider] Attempt ${attempt} succeeded. Response received (${validated.message.content.length} chars).`
           );
 
           return validated;
         };
 
-        const data: OllamaGenerateResponse = await this.circuitBreaker.execute(executeFetch);
+        const data: OllamaChatResponse = await this.circuitBreaker.execute(executeFetch);
 
-        return data.response;
+        return data.message.content;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 

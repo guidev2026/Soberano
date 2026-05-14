@@ -7,6 +7,16 @@
  *              a estrutura em runtime com --experimental-transform-types.
  */
 
+/**
+ * Representa uma mensagem no formato de chat multi-turno.
+ * Suporta os papéis: system (instrução de sistema), user (usuário),
+ * assistant (modelo).
+ */
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
 export abstract class IMotorCognitivo {
   /**
    * Define o sinal de aborto para cancelamento de operações pendentes.
@@ -15,9 +25,10 @@ export abstract class IMotorCognitivo {
   abstract setAbortSignal(signal: AbortSignal): void;
 
   /**
-   * Envia um prompt ao motor cognitivo e retorna a resposta gerada.
-   * @param prompt - O texto de entrada para o modelo de linguagem.
-   * @returns A resposta gerada pelo modelo.
+   * Envia uma lista de mensagens no formato chat ao motor cognitivo
+   * e retorna a resposta gerada pelo modelo.
+   * @param mensagens - Array de mensagens no formato ChatMessage[].
+   * @returns A resposta gerada pelo modelo (content da mensagem assistant).
    */
-  abstract gerarResposta(prompt: string): Promise<string>;
+  abstract gerarResposta(mensagens: ChatMessage[]): Promise<string>;
 }

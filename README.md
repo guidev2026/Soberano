@@ -1,6 +1,6 @@
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.3.0 — Fase 3 (Memória - RAG Tradicional)
+**Versão:** 0.5.0 — Fase 5 (Gerenciamento de Contexto - Sessões + RAG)
 
 ## Stack
 
@@ -18,24 +18,33 @@
 ```
 src/
 ├── core/              # Contratos e lógica de negócio pura ("A Alma")
-│   ├── ILogger.ts         # Abstração de logging + LogLevel enum
-│   ├── IMotorCognitivo.ts # Abstração do motor cognitivo (LLM)
-│   ├── ICircuitBreaker.ts # Abstração do Circuit Breaker
-│   ├── IHttpServer.ts     # Abstração do servidor HTTP
-│   ├── ISensor.ts         # Abstração genérica de sensor (T)
-│   ├── IEmbeddings.ts     # Contrato para geração de embeddings vetoriais
-│   └── IVectorStore.ts    # Contrato para armazenamento e busca vetorial
+│   ├── ILogger.ts             # Abstração de logging + LogLevel enum
+│   ├── IMotorCognitivo.ts     # Abstração do motor cognitivo (LLM) + ChatMessage
+│   ├── ICircuitBreaker.ts     # Abstração do Circuit Breaker
+│   ├── IHttpServer.ts         # Abstração do servidor HTTP
+│   ├── ISensor.ts             # Abstração genérica de sensor (T)
+│   ├── IEmbeddings.ts         # Contrato para geração de embeddings vetoriais
+│   ├── IVectorStore.ts        # Contrato para armazenamento e busca vetorial
+│   ├── ISessionManager.ts     # Contrato para gestão de sessões de conversa
+│   └── IConversationManager.ts # Contrato do Maestro (orquestração multi-turno)
 ├── infra/             # Implementações técnicas ("Os Músculos")
-│   ├── ConsoleLogger.ts       # Logger concreto (stdout)
-│   ├── OllamaProvider.ts      # Provider Ollama via fetch nativo
-│   ├── OllamaProvider.test.ts # Testes unitários do provider
-│   ├── CircuitBreaker.ts      # Circuit Breaker (3 estados)
-│   ├── CircuitBreaker.test.ts # Testes unitários do CB
-│   ├── FileSensor.ts          # Sensor de arquivo (ISensor<string>)
-│   ├── FileSensor.test.ts     # Testes unitários do FileSensor
-│   ├── NativeHttpServer.ts    # Servidor HTTP nativo (IHttpServer)
-│   ├── NativeHttpServer.test.ts # Testes unitários do NativeHttpServer
-│   └── MockVectorStore.ts     # Vector Store mock (validação sem dependências externas)
+│   ├── ConsoleLogger.ts            # Logger concreto (stdout)
+│   ├── ConsoleLogger.test.ts
+│   ├── OllamaProvider.ts           # Provider Ollama via fetch nativo (endpoint /api/chat)
+│   ├── OllamaProvider.test.ts
+│   ├── validateOllamaResponse.test.ts # Testes de validação de schema da API
+│   ├── CircuitBreaker.ts           # Circuit Breaker (3 estados)
+│   ├── CircuitBreaker.test.ts
+│   ├── FileSensor.ts               # Sensor de arquivo (ISensor<string>)
+│   ├── FileSensor.test.ts
+│   ├── NativeHttpServer.ts         # Servidor HTTP nativo (IHttpServer)
+│   ├── NativeHttpServer.test.ts
+│   ├── MockVectorStore.ts          # Vector Store mock (validação sem dependências externas)
+│   ├── InMemorySessionManager.ts   # Gestão de sessões em memória (ISessionManager)
+│   ├── InMemorySessionManager.test.ts
+│   ├── ConversationManager.ts      # Maestro: orquestra sessão + RAG + motor cognitivo
+│   └── ConversationManager.test.ts
+├── env.d.ts           # Tipos manuais para APIs nativas do Node
 └── main.ts            # Orquestração, wiring manual, ponto de entrada
 ```
 
@@ -53,7 +62,8 @@ src/
 |----------------|--------|
 | Logging estruturado com níveis (DEBUG, INFO, WARN, ERROR) | ✅ |
 | Filtragem por nível mínimo de log | ✅ |
-| Comunicação com Ollama via REST (fetch nativo) | ✅ Estabilizada |
+| Comunicação com Ollama via REST (fetch nativo) — endpoint /api/chat | ✅ |
+| Interface ChatMessage (role: system/user/assistant, content) | ✅ |
 | Retry automático com backoff progressivo | ✅ |
 | Circuit Breaker (CLOSED / OPEN / HALF_OPEN) | ✅ |
 | Timeout global (120s) via `AbortSignal.timeout` | ✅ |
@@ -66,7 +76,12 @@ src/
 | Contrato IEmbeddings para geração de vetores | ✅ |
 | Contrato IVectorStore para armazenamento e busca vetorial | ✅ |
 | MockVectorStore — implementação em memória com similaridade cosseno | ✅ |
-| Demonstração integrada no main.ts (Fase 3) | ✅ |
+| Contrato ISessionManager — gestão de sessões de conversa | ✅ |
+| InMemorySessionManager — implementação em memória com limite de mensagens | ✅ |
+| Contrato IConversationManager — Maestro de orquestração multi-turno | ✅ |
+| ConversationManager — pipeline: salva → RAG → funde contexto → envia → salva resposta | ✅ |
+| Embedding Heurístico — vetor de 10 dimensões sem dependência externa | ✅ |
+| Demonstração integrada no main.ts (2 turnos de conversa com sessão) | ✅ |
 
 ## Como Executar
 
@@ -85,12 +100,6 @@ npm start
 # Rodar todos os testes
 npm test
 
-# Rodar testes específicos
-npm run test:ollama
-npm run test:circuit
-npm run test:file
-npm run test:http
-
 # Typecheck sem executar
 npm run typecheck
 ```
@@ -103,7 +112,7 @@ npm run typecheck
 | **2** | Sensores — FileSensor (leitura de arquivos locais) | ✅ **Concluída** |
 | **3** | Memória — Embeddings + Vector Store (RAG Tradicional) | ✅ **Concluída** |
 | **4** | Qualidade de Teste e Determinismo — timeouts mínimos, mock.fn, assertions de retry | ✅ **Concluída** |
-| **5** | Gerenciamento de contexto e sessões multi-turno | ⏳ Planejada |
+| **5** | Gerenciamento de contexto e sessões multi-turno | ✅ **Concluída** |
 | **6** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
 | **7** | Web UI (React) + WebSocket | ⏳ Planejada |
 
@@ -125,9 +134,14 @@ abstract class ILogger {
 ### `IMotorCognitivo`
 
 ```typescript
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
 abstract class IMotorCognitivo {
   abstract setAbortSignal(signal: AbortSignal): void;
-  abstract gerarResposta(prompt: string): Promise<string>;
+  abstract gerarResposta(mensagens: ChatMessage[]): Promise<string>;
 }
 ```
 
@@ -168,6 +182,24 @@ abstract class IVectorStore<M = any> {
   abstract buscarSimilares(vector: number[], limit: number): Promise<
     { id: string; metadata: M; score: number }[]
   >;
+}
+```
+
+### `ISessionManager`
+
+```typescript
+abstract class ISessionManager {
+  abstract adicionarMensagem(sessionId: string, message: ChatMessage): Promise<void>;
+  abstract obterHistorico(sessionId: string): Promise<ChatMessage[]>;
+  abstract limparSessao(sessionId: string): Promise<void>;
+}
+```
+
+### `IConversationManager`
+
+```typescript
+abstract class IConversationManager {
+  abstract conversar(sessionId: string, input: string): Promise<string>;
 }
 ```
 

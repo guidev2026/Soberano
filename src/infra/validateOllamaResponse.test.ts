@@ -2,7 +2,7 @@
  * @file validateOllamaResponse.test.ts
  * @description Testes unitários isolados para a função pura validateOllamaResponse.
  *              A função está exportada em OllamaProvider.ts e valida o schema
- *              de respostas da API Ollama em runtime.
+ *              de respostas da API Ollama /api/chat em runtime.
  *
  *              Como executar:
  *   node --experimental-transform-types --test src/infra/validateOllamaResponse.test.ts
@@ -12,7 +12,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { validateOllamaResponse } from './OllamaProvider.ts';
 
-describe('validateOllamaResponse (função pura)', () => {
+describe('validateOllamaResponse (função pura) - /api/chat', () => {
   describe('casos de erro — entrada nula/indefinida/não-objeto', () => {
     it('deve lançar erro para null', () => {
       assert.throws(
@@ -55,16 +55,16 @@ describe('validateOllamaResponse (função pura)', () => {
   describe('casos de erro — campos obrigatórios ausentes', () => {
     const validBase = {
       model: 'qwen2.5-coder:3b',
-      response: 'some text',
+      message: { role: 'assistant', content: 'some text' },
       done: true,
       created_at: '2024-01-01T00:00:00Z',
     };
 
-    it('deve lançar erro quando response está ausente', () => {
-      const { response: _, ...withoutResponse } = validBase;
+    it('deve lançar erro quando message está ausente', () => {
+      const { message: _, ...withoutMessage } = validBase;
       assert.throws(
-        () => validateOllamaResponse(withoutResponse),
-        /Field "response" missing or invalid/
+        () => validateOllamaResponse(withoutMessage),
+        /Field "message" missing or invalid/
       );
     });
 
@@ -91,48 +91,102 @@ describe('validateOllamaResponse (função pura)', () => {
         /Field "created_at" missing or invalid/
       );
     });
+
+    it('deve lançar erro quando message.role está ausente', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { content: 'text' },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "message.role" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando message.content está ausente', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { role: 'assistant' },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "message.content" missing or invalid/
+      );
+    });
   });
 
   describe('casos de erro — campos obrigatórios com tipos errados', () => {
     it('deve lançar erro quando model não é string (number)', () => {
       assert.throws(
-        () => validateOllamaResponse({ model: 123, response: 'ok', done: true, created_at: '2024-01-01T00:00:00Z' }),
+        () => validateOllamaResponse({
+          model: 123,
+          message: { role: 'assistant', content: 'ok' },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
         /Field "model" missing or invalid/
       );
     });
 
-    it('deve lançar erro quando response não é string (boolean)', () => {
+    it('deve lançar erro quando message não é objeto (boolean)', () => {
       assert.throws(
-        () => validateOllamaResponse({ model: 'x', response: true, done: true, created_at: '2024-01-01T00:00:00Z' }),
-        /Field "response" missing or invalid/
+        () => validateOllamaResponse({
+          model: 'x',
+          message: true,
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "message" missing or invalid/
       );
     });
 
     it('deve lançar erro quando done não é boolean (string)', () => {
       assert.throws(
-        () => validateOllamaResponse({ model: 'x', response: 'ok', done: 'yes', created_at: '2024-01-01T00:00:00Z' }),
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { role: 'assistant', content: 'ok' },
+          done: 'yes',
+          created_at: '2024-01-01T00:00:00Z',
+        }),
         /Field "done" missing or invalid/
       );
     });
 
     it('deve lançar erro quando created_at não é string (number)', () => {
       assert.throws(
-        () => validateOllamaResponse({ model: 'x', response: 'ok', done: true, created_at: 12345 }),
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { role: 'assistant', content: 'ok' },
+          done: true,
+          created_at: 12345,
+        }),
         /Field "created_at" missing or invalid/
       );
     });
 
     it('deve lançar erro quando model é null', () => {
       assert.throws(
-        () => validateOllamaResponse({ model: null, response: 'ok', done: true, created_at: '2024-01-01T00:00:00Z' }),
+        () => validateOllamaResponse({
+          model: null,
+          message: { role: 'assistant', content: 'ok' },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
         /Field "model" missing or invalid/
       );
     });
 
-    it('deve lançar erro quando response é objeto vazio', () => {
+    it('deve lançar erro quando message.content não é string (objeto vazio)', () => {
       assert.throws(
-        () => validateOllamaResponse({ model: 'x', response: {}, done: true, created_at: '2024-01-01T00:00:00Z' }),
-        /Field "response" missing or invalid/
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { role: 'assistant', content: {} },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "message.content" missing or invalid/
       );
     });
   });
@@ -142,7 +196,10 @@ describe('validateOllamaResponse (função pura)', () => {
       const input = {
         model: 'qwen2.5-coder:3b',
         created_at: '2024-05-14T16:00:00Z',
-        response: 'Resposta válida do modelo.',
+        message: {
+          role: 'assistant',
+          content: 'Resposta válida do modelo.',
+        },
         done: true,
       };
 
@@ -150,17 +207,20 @@ describe('validateOllamaResponse (função pura)', () => {
 
       assert.strictEqual(result.model, input.model);
       assert.strictEqual(result.created_at, input.created_at);
-      assert.strictEqual(result.response, input.response);
+      assert.strictEqual(result.message.role, input.message.role);
+      assert.strictEqual(result.message.content, input.message.content);
       assert.strictEqual(result.done, input.done);
     });
 
-    it('deve preservar campos opcionais (context, total_duration, etc.)', () => {
+    it('deve preservar campos opcionais (total_duration, etc.)', () => {
       const input = {
         model: 'qwen2.5-coder:3b',
         created_at: '2024-05-14T16:00:00Z',
-        response: 'Resposta.',
+        message: {
+          role: 'assistant',
+          content: 'Resposta.',
+        },
         done: true,
-        context: [1, 2, 3],
         total_duration: 1_234_567_890,
         load_duration: 100_000,
         prompt_eval_count: 42,
@@ -171,7 +231,6 @@ describe('validateOllamaResponse (função pura)', () => {
 
       const result = validateOllamaResponse(input);
 
-      assert.strictEqual(result.context, input.context);
       assert.strictEqual(result.total_duration, input.total_duration);
       assert.strictEqual(result.load_duration, input.load_duration);
       assert.strictEqual(result.prompt_eval_count, input.prompt_eval_count);
@@ -184,14 +243,16 @@ describe('validateOllamaResponse (função pura)', () => {
       const input = {
         model: 'qwen2.5-coder:3b',
         created_at: '2024-05-14T16:00:00Z',
-        response: 'Resposta.',
+        message: {
+          role: 'assistant',
+          content: 'Resposta.',
+        },
         done: true,
-        // context, durations, etc. ausentes
+        // total_duration, eval_duration etc. ausentes
       };
 
       const result = validateOllamaResponse(input);
 
-      assert.strictEqual(result.context, undefined);
       assert.strictEqual(result.total_duration, undefined);
       assert.strictEqual(result.eval_duration, undefined);
     });
@@ -200,16 +261,34 @@ describe('validateOllamaResponse (função pura)', () => {
       const input = {
         model: 'qwen2.5-coder:3b',
         created_at: '2024-05-14T16:00:00Z',
-        response: 'Resposta.',
+        message: {
+          role: 'assistant',
+          content: 'Resposta.',
+        },
         done: true,
-        context: 'não-array', // tipo errado
         total_duration: 'não-número', // tipo errado
       };
 
       const result = validateOllamaResponse(input);
 
-      assert.strictEqual(result.context, undefined);
       assert.strictEqual(result.total_duration, undefined);
+    });
+
+    it('deve preservar message.images quando presente', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: 'Resposta com imagem.',
+          images: ['base64data'],
+        },
+        done: true,
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.deepStrictEqual(result.message.images, ['base64data']);
     });
   });
 });
