@@ -40,40 +40,39 @@ function registerShutdownHandlers(
 ): void {
   const shutdown = async (signal: string) => {
     if (isShuttingDown) {
-      logger.warn(`[main] Sinal ${signal} recebido novamente. Forçando saída.`);
+      logger.warn(`[main] Signal ${signal} received again. Forcing exit.`);
       process.exit(1);
     }
 
     isShuttingDown = true;
-    logger.info(`[main] Sinal ${signal} recebido. Iniciando encerramento gracioso...`);
+    logger.info(`[main] Signal ${signal} received. Initiating graceful shutdown...`);
 
-    // Tempo limite para não travar o processo caso algo emperre
+    // Timeout to prevent the process from hanging
     const forceExitTimer = setTimeout(() => {
-      logger.error('[main] Tempo limite de encerramento excedido. Forçando saída.');
+      logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
       process.exit(1);
     }, 5_000);
 
-    // Desregistra os handlers para evitar loop
+    // Remove handlers to prevent loop
     process.removeAllListeners('SIGINT');
     process.removeAllListeners('SIGTERM');
 
-    // Aborta todas as operações em andamento (fetch do OllamaProvider)
+    // Abort all in-flight operations (OllamaProvider fetch)
     shutdownController.abort();
 
-    // O timer de 5s permanece ativo durante toda a limpeza.
-    // Se operações assíncronas de cleanup forem adicionadas no futuro
-    // e travarem, o timer dispara e força process.exit(1).
+    // 5s timer stays active during cleanup.
+    // If future async cleanup operations lock up,
+    // the timer fires and forces process.exit(1).
 
-    // Só cancela o timer se a limpeza terminou dentro do prazo de 5s
     clearTimeout(forceExitTimer);
-    logger.info('[main] Recursos liberados. Até logo, SOBERANO.');
+    logger.info('[main] Resources released. Goodbye, SOBERANO.');
     process.exit(0);
   };
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  logger.info('[main] Handlers de graceful shutdown registrados (SIGINT/SIGTERM).');
+  logger.info('[main] Graceful shutdown handlers registered (SIGINT/SIGTERM).');
 }
 
 async function bootstrap(): Promise<void> {
@@ -96,21 +95,25 @@ async function bootstrap(): Promise<void> {
   // --- CIRCUIT BREAKER ---
   const circuitBreaker = new CircuitBreaker(logger);
 
+  // --- GLOBAL TIMEOUT (fallback para evitar travamento silencioso) ---
+  const globalTimeoutSignal = AbortSignal.timeout(120_000);
+  const combinedSignal = AbortSignal.any([shutdownController.signal, globalTimeoutSignal]);
+
   // --- WIRING MANUAL (Injeção de Dependência) ---
   // A variável "motor" é tipada como IMotorCognitivo (abstração).
   // O módulo de alto nível (main.ts) depende da abstração, não da implementação concreta.
   // O Logger é injetado via construtor em ambas as dependências.
-  const provider = new OllamaProvider(logger, undefined, undefined, undefined, undefined, undefined, circuitBreaker);
+  const provider = new OllamaProvider({ logger, circuitBreaker });
 
-  // Injeta o sinal de abort para graceful shutdown
-  provider.setAbortSignal(shutdownController.signal);
+  // Injeta o sinal combinado (shutdown + timeout global) para abort automático
+  provider.setAbortSignal(combinedSignal);
 
   // A partir daqui, usa-se a abstração IMotorCognitivo
   const motor: IMotorCognitivo = provider;
 
   const promptTeste = 'Olá, Soberano. Confirme que seus sistemas base estão online.';
 
-  logger.info(`[main] Enviando prompt ao motor cognitivo...`);
+  logger.info(`[main] Sending prompt to cognitive engine...`);
   logger.info(`[main] Prompt: "${promptTeste}"`);
 
   try {
@@ -122,11 +125,11 @@ async function bootstrap(): Promise<void> {
       '╚══════════════════════════════════════════════════╝'
     );
     logger.info(resposta);
-    logger.info('[main] Teste concluído com sucesso.');
+    logger.info('[main] Test completed successfully.');
   } catch (error) {
     // Se o erro foi causado pelo shutdown, não é uma falha real
     if (shutdownController.signal.aborted) {
-      logger.info('[main] Operação cancelada devido ao encerramento do sistema.');
+      logger.info('[main] Operation cancelled due to system shutdown.');
       return;
     }
 
@@ -139,13 +142,13 @@ async function bootstrap(): Promise<void> {
     if (error instanceof Error) {
       logger.error(error.message);
     } else {
-      logger.error(`[main] Erro desconhecido: ${String(error)}`);
+      logger.error(`[main] Unknown error: ${String(error)}`);
     }
 
     logger.error('[main] O sistema não pôde se comunicar com o motor cognitivo.');
     logger.error('[main] Verifique se o servidor Ollama está em execução: ollama serve');
 
-    // Encerra o processo com código 1 (erro) sem depender de @types/node
+    // Exit with code 1 (error) without depending on @types/node
     process.exit(1);
   }
 }

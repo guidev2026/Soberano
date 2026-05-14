@@ -10,7 +10,7 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { OllamaProvider } from './OllamaProvider.ts';
-import { ILogger } from '../core/ILogger.ts';
+import { ILogger, LogLevel } from '../core/ILogger.ts';
 
 /**
  * Logger fictício (mock) que estende ILogger sem efeitos colaterais.
@@ -18,9 +18,15 @@ import { ILogger } from '../core/ILogger.ts';
  */
 class MockLogger extends ILogger {
   public logs: string[] = [];
+  private readonly level: LogLevel;
 
-  constructor() {
+  constructor(minLevel: LogLevel = LogLevel.DEBUG) {
     super();
+    this.level = minLevel;
+  }
+
+  get minLevel(): LogLevel {
+    return this.level;
   }
 
   info(message: string): void {
@@ -63,7 +69,7 @@ describe('OllamaProvider', () => {
       };
 
       try {
-        const provider = new OllamaProvider(mockLogger, 'http://localhost:11434', 'test-model');
+        const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:11434', model: 'test-model' });
         const resposta = await provider.gerarResposta('Prompt de teste');
 
         // Valida que fetch foi chamado na URL correta
@@ -108,7 +114,7 @@ describe('OllamaProvider', () => {
       };
 
       try {
-        const provider = new OllamaProvider(mockLogger);
+        const provider = new OllamaProvider({ logger: mockLogger });
         await assert.rejects(
           () => provider.gerarResposta('teste'),
           (err: unknown) => {
@@ -133,7 +139,7 @@ describe('OllamaProvider', () => {
       };
 
       try {
-        const provider = new OllamaProvider(mockLogger, 'http://localhost:99999', 'test-model');
+        const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:99999', model: 'test-model' });
         await assert.rejects(
           () => provider.gerarResposta('teste'),
           (err: unknown) => {
@@ -170,7 +176,7 @@ describe('OllamaProvider', () => {
       };
 
       try {
-        const provider = new OllamaProvider(mockLogger);
+        const provider = new OllamaProvider({ logger: mockLogger });
         await assert.rejects(() => provider.gerarResposta('teste'));
         // Deve ter chamado fetch apenas 1 vez (sem retry para 4xx)
         assert.strictEqual(callCount, 1, 'Não deve haver retry para erro HTTP 4xx');

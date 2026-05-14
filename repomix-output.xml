@@ -32,7 +32,7 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
-- Only files matching these patterns are included: src/**/*, .clinerules
+- Only files matching these patterns are included: src/**/*, .clinerules, package.json, tsconfig.json
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
@@ -43,19 +43,64 @@ The content is organized as follows:
 <directory_structure>
 src/
   core/
+    ICircuitBreaker.ts
     ILogger.ts
     IMotorCognitivo.ts
   infra/
+    CircuitBreaker.test.ts
+    CircuitBreaker.ts
     ConsoleLogger.ts
     OllamaProvider.test.ts
     OllamaProvider.ts
   env.d.ts
   main.ts
 .clinerules
+package.json
+tsconfig.json
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/core/ICircuitBreaker.ts">
+/**
+ * @file ICircuitBreaker.ts
+ * @description Contrato de abstração para o padrão Circuit Breaker.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ *
+ *              Estados: CLOSED (normal), OPEN (falhando), HALF_OPEN (teste).
+ */
+
+export enum CircuitState {
+  CLOSED = 'CLOSED',
+  OPEN = 'OPEN',
+  HALF_OPEN = 'HALF_OPEN',
+}
+
+export abstract class ICircuitBreaker {
+  /** Estado atual do circuit breaker */
+  abstract get state(): CircuitState;
+
+  /**
+   * Executa uma operação respeitando o estado do circuit breaker.
+   * - CLOSED: executa normalmente, registra sucesso/falha
+   * - OPEN: lança erro imediatamente (a menos que o timeout tenha expirado para HALF_OPEN)
+   * - HALF_OPEN: permite 1 chamada de teste; sucesso volta para CLOSED, falha volta para OPEN
+   *
+   * @param fn - Função assíncrona a ser protegida
+   * @returns O resultado da função
+   * @throws {Error} Se o circuit breaker estiver OPEN e o timeout não tiver expirado
+   */
+  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
+
+  /** Registra uma falha manualmente (para uso externo) */
+  abstract recordFailure(): void;
+
+  /** Reseta o circuit breaker para o estado CLOSED */
+  abstract reset(): void;
+}
+</file>
 
 <file path="src/core/ILogger.ts">
 /**
@@ -94,6 +139,337 @@ export abstract class IMotorCognitivo {
    * @returns A resposta gerada pelo modelo.
    */
   abstract gerarResposta(prompt: string): Promise<string>;
+}
+</file>
+
+<file path="src/infra/CircuitBreaker.test.ts">
+/**
+ * @file CircuitBreaker.test.ts
+ * @description Testes unitários para CircuitBreaker utilizando
+ *              node:test e node:assert (zero dependências externas).
+ *
+ * Como executar:
+ *   node --experimental-transform-types src/infra/CircuitBreaker.test.ts
+ */
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import { CircuitBreaker } from './CircuitBreaker.ts';
+import { CircuitState } from '../core/ICircuitBreaker.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+class MockLogger extends ILogger {
+  public logs: string[] = [];
+
+  constructor() {
+    super();
+  }
+
+  info(message: string): void {
+    this.logs.push(`INFO: ${message}`);
+  }
+  warn(message: string): void {
+    this.logs.push(`WARN: ${message}`);
+  }
+  error(message: string): void {
+    this.logs.push(`ERROR: ${message}`);
+  }
+  debug(message: string): void {
+    this.logs.push(`DEBUG: ${message}`);
+  }
+}
+
+describe('CircuitBreaker', () => {
+  describe('Estado inicial', () => {
+    it('deve iniciar em CLOSED', () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger);
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
+    });
+  });
+
+  describe('Transição CLOSED -> OPEN', () => {
+    it('deve abrir após N falhas consecutivas (padrão: 3)', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 3, 30_000);
+
+      const failingFn = () => Promise.reject(new Error('Falha simulada'));
+
+      // Primeira falha: ainda CLOSED
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
+
+      // Segunda falha: ainda CLOSED
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
+
+      // Terceira falha: deve abrir
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+    });
+
+    it('deve abrir com threshold customizado', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 1, 30_000); // abre na primeira falha
+
+      const failingFn = () => Promise.reject(new Error('Falha simulada'));
+
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+    });
+  });
+
+  describe('Estado OPEN', () => {
+    it('deve rejeitar chamadas imediatamente com erro', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 1, 30_000); // abre na 1ª falha
+
+      const failingFn = () => Promise.reject(new Error('Falha simulada'));
+      await assert.rejects(() => cb.execute(failingFn)); // abre
+
+      // Em OPEN, deve rejeitar sem chamar a função
+      const successFn = () => Promise.resolve('ok');
+      await assert.rejects(
+        () => cb.execute(successFn),
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('Circuito aberto'));
+          }
+          return true;
+        }
+      );
+    });
+
+    it('deve registrar log de circuito aberto', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 1, 30_000);
+
+      const failingFn = () => Promise.reject(new Error('Falha'));
+      await assert.rejects(() => cb.execute(failingFn));
+
+      // Tenta executar em estado OPEN
+      const successFn = () => Promise.resolve('ok');
+      await assert.rejects(() => cb.execute(successFn));
+
+      assert.ok(
+        logger.logs.some((log) => log.includes('ABERTO')),
+        'Deve registrar log de circuito aberto'
+      );
+    });
+  });
+
+  describe('Transição OPEN -> HALF_OPEN', () => {
+    it('deve transitar para HALF_OPEN após o timeout expirar', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 1, 50); // timeout de 50ms
+
+      const failingFn = () => Promise.reject(new Error('Falha'));
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+
+      // Aguarda o timeout expirar
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      // Ao acessar .state, deve transitar para HALF_OPEN
+      assert.strictEqual(cb.state, CircuitState.HALF_OPEN);
+    });
+  });
+
+  describe('Transição HALF_OPEN -> CLOSED', () => {
+    it('deve retornar para CLOSED após sucesso em HALF_OPEN', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 1, 50);
+
+      const failingFn = () => Promise.reject(new Error('Falha'));
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+
+      // Aguarda timeout para HALF_OPEN
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      // Executa com sucesso: deve transitar para CLOSED
+      const successFn = () => Promise.resolve('recuperado');
+      const result = await cb.execute(successFn);
+      assert.strictEqual(result, 'recuperado');
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
+    });
+  });
+
+  describe('Transição HALF_OPEN -> OPEN', () => {
+    it('deve voltar para OPEN após falha em HALF_OPEN', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 1, 50);
+
+      const failingFn = () => Promise.reject(new Error('Falha'));
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+
+      // Aguarda timeout para HALF_OPEN
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      // Falha em HALF_OPEN: volta para OPEN
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+    });
+  });
+
+  describe('recordFailure e reset', () => {
+    it('recordFailure deve incrementar contagem e abrir ao atingir threshold', () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 2, 30_000);
+
+      cb.recordFailure();
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
+
+      cb.recordFailure();
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+    });
+
+    it('reset deve voltar ao estado CLOSED', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker(logger, 1, 30_000);
+
+      const failingFn = () => Promise.reject(new Error('Falha'));
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+
+      cb.reset();
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
+
+      // Após reset, deve executar novamente
+      const successFn = () => Promise.resolve('ok');
+      const result = await cb.execute(successFn);
+      assert.strictEqual(result, 'ok');
+    });
+  });
+});
+</file>
+
+<file path="src/infra/CircuitBreaker.ts">
+/**
+ * @file CircuitBreaker.ts
+ * @description Implementação concreta do padrão Circuit Breaker com 3 estados:
+ *              CLOSED, OPEN, HALF_OPEN.
+ *              - Abre após N falhas consecutivas (padrão: 3)
+ *              - Permanece OPEN por tempo configurável (padrão: 30s)
+ *              - Em OPEN, lança erro imediatamente sem tentar a operação
+ *              - Injeta ILogger via construtor
+ */
+
+import { ICircuitBreaker, CircuitState } from '../core/ICircuitBreaker.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+export class CircuitBreaker extends ICircuitBreaker {
+  private _state: CircuitState = CircuitState.CLOSED;
+  private failureCount: number = 0;
+  private lastFailureTime: number = 0;
+  private readonly failureThreshold: number;
+  private readonly openTimeoutMs: number;
+  private readonly logger: ILogger;
+
+  /**
+   * @param logger          - Instância de ILogger para logging estruturado
+   * @param failureThreshold - Número de falhas consecutivas para abrir o circuito (padrão: 3)
+   * @param openTimeoutMs    - Tempo em ms para permanecer em OPEN antes de HALF_OPEN (padrão: 30000)
+   */
+  constructor(
+    logger: ILogger,
+    failureThreshold: number = 3,
+    openTimeoutMs: number = 30_000
+  ) {
+    super();
+    this.logger = logger;
+    this.failureThreshold = failureThreshold;
+    this.openTimeoutMs = openTimeoutMs;
+  }
+
+  get state(): CircuitState {
+    // Verifica se o timeout de OPEN expirou para transitar para HALF_OPEN
+    if (this._state === CircuitState.OPEN && this.hasTimeoutElapsed()) {
+      this.transitionTo(CircuitState.HALF_OPEN);
+    }
+    return this._state;
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    const currentState = this.state; // aciona transição OPEN -> HALF_OPEN se necessário
+
+    if (currentState === CircuitState.OPEN) {
+      this.logger.warn(
+        `[CircuitBreaker] Circuito ABERTO. Chamada rejeitada imediatamente.`
+      );
+      throw new Error(
+        '[CircuitBreaker] Circuito aberto. Operação não permitida no momento.'
+      );
+    }
+
+    if (currentState === CircuitState.HALF_OPEN) {
+      this.logger.info(
+        `[CircuitBreaker] Circuito em HALF_OPEN. Permitindo chamada de teste.`
+      );
+    }
+
+    try {
+      const result = await fn();
+      this.recordSuccess();
+      return result;
+    } catch (error) {
+      this.recordFailure();
+      throw error;
+    }
+  }
+
+  recordFailure(): void {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+
+    this.logger.warn(
+      `[CircuitBreaker] Falha registrada (${this.failureCount}/${this.failureThreshold}). Estado atual: ${this._state}`
+    );
+
+    if (
+      this._state === CircuitState.CLOSED &&
+      this.failureCount >= this.failureThreshold
+    ) {
+      this.transitionTo(CircuitState.OPEN);
+    } else if (this._state === CircuitState.HALF_OPEN) {
+      this.transitionTo(CircuitState.OPEN);
+    }
+  }
+
+  reset(): void {
+    this.failureCount = 0;
+    this.lastFailureTime = 0;
+    this.transitionTo(CircuitState.CLOSED);
+  }
+
+  private recordSuccess(): void {
+    if (this._state === CircuitState.HALF_OPEN) {
+      this.logger.info(
+        `[CircuitBreaker] Chamada de teste bem-sucedida. Retornando ao estado CLOSED.`
+      );
+    }
+
+    this.failureCount = 0;
+    this.lastFailureTime = 0;
+
+    if (this._state !== CircuitState.CLOSED) {
+      this.transitionTo(CircuitState.CLOSED);
+    }
+  }
+
+  private hasTimeoutElapsed(): boolean {
+    return Date.now() - this.lastFailureTime >= this.openTimeoutMs;
+  }
+
+  private transitionTo(newState: CircuitState): void {
+    const oldState = this._state;
+    this._state = newState;
+
+    this.logger.info(
+      `[CircuitBreaker] Transição de estado: ${oldState} -> ${newState}`
+    );
+  }
 }
 </file>
 
@@ -322,171 +698,29 @@ describe('OllamaProvider', () => {
 });
 </file>
 
-<file path="src/infra/OllamaProvider.ts">
-/**
- * @file OllamaProvider.ts
- * @description Implementação concreta de IMotorCognitivo que se comunica
- *              com o servidor local Ollama via API REST (fetch nativo).
- *              - Depende da abstração IMotorCognitivo, não o contrário (DIP).
- *              - Retry automático (3 tentativas) para erros de conexão.
- *              - Logger injetado via construtor.
- */
+<file path=".clinerules">
+# Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
 
-import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
-import { ILogger } from '../core/ILogger.ts';
+## 1. Stack e Restrições Rígidas
+- [cite_start]Linguagem: TypeScript (Node.js nativo).
+- [cite_start]Dependências: PROIBIDO o uso de bibliotecas externas (ex: axios, jest, dotenv).
+- [cite_start]Utilizar exclusivamente módulos nativos (fs, path, node:test, node:assert, fetch global).
 
-interface OllamaGenerateResponse {
-  model: string;
-  created_at: string;
-  response: string;
-  done: boolean;
-  context?: number[];
-  total_duration?: number;
-  load_duration?: number;
-  prompt_eval_count?: number;
-  prompt_eval_duration?: number;
-  eval_count?: number;
-  eval_duration?: number;
-}
+## 2. Arquitetura e SOLID (DIP)
+- [cite_start]Abstração Primeiro: Sempre defina uma Interface/Classe Abstrata em `src/core` antes da implementação.
+- Inversão de Dependência: Módulos de alto nível dependem de abstrações. [cite_start]Injeção de dependência via construtor é obrigatória.
+- [cite_start]Desacoplamento de Infraestrutura: Detalhes técnicos (APIs, Banco de Dados) nunca vazam para o Core.
+## 3. Robustez e Confiabilidade (Padrões Industriais)
+- [cite_start]Testes Unitários: Toda nova funcionalidade de infraestrutura deve ter testes usando o `node:test` nativo.
+- [cite_start]Resiliência: Implementar Política de Retry (Retentativas) e Circuit Breaker para integrações com LLMs.
+- [cite_start]Observabilidade: Todo componente deve injetar uma interface `ILogger` para registro de eventos.
+- [cite_start]Estabilidade: Implementar 'Graceful Shutdown' para sinais SIGINT/SIGTERM no ponto de entrada.
+- [cite_start]Validação: Respostas de serviços externos devem passar por validação rigorosa de schema.
 
-export class OllamaProvider extends IMotorCognitivo {
-  private readonly baseUrl: string;
-  private readonly model: string;
-  private readonly logger: ILogger;
-  private readonly maxRetries: number = 3;
-
-  /**
-   * @param logger  - Instância de ILogger para logging estruturado
-   * @param baseUrl - URL base do servidor Ollama (padrão: http://localhost:11434)
-   * @param model   - Nome do modelo a ser utilizado (padrão: qwen2.5-coder:3b)
-   */
-  constructor(
-    logger: ILogger,
-    baseUrl: string = 'http://localhost:11434',
-    model: string = 'qwen2.5-coder:3b'
-  ) {
-    super();
-    this.logger = logger;
-    this.baseUrl = baseUrl;
-    this.model = model;
-  }
-
-  /**
-   * Aguarda um tempo determinado (ms) usando setTimeout encapsulado em Promise.
-   * Usado entre tentativas de retry.
-   */
-  private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Determina se um erro é recuperável (conexão/temporário) para retry.
-   */
-  private isRetryableError(error: unknown): boolean {
-    if (error instanceof TypeError && error.message.includes('fetch')) {
-      return true;
-    }
-    if (error instanceof Error) {
-      // Erros de rede/DNS/ECONNREFUSED geralmente disparam TypeError no fetch
-      const msg = error.message.toLowerCase();
-      return (
-        msg.includes('econnrefused') ||
-        msg.includes('socket hang up') ||
-        msg.includes('network') ||
-        msg.includes('timeout') ||
-        msg.includes('fetch failed')
-      );
-    }
-    return false;
-  }
-
-  /**
-   * Envia um prompt ao modelo Ollama e retorna a resposta gerada.
-   * Utiliza exclusivamente o fetch nativo do Node.js (sem dependências externas).
-   * Implementa retry automático (máximo de 3 tentativas) para erros de conexão.
-   *
-   * @param prompt - O texto de entrada para o modelo.
-   * @returns A resposta gerada pelo modelo.
-   * @throws {Error} Se após todas as tentativas a comunicação falhar.
-   */
-  async gerarResposta(prompt: string): Promise<string> {
-    const url = `${this.baseUrl}/api/generate`;
-
-    const payload = {
-      model: this.model,
-      prompt,
-      stream: false,
-    };
-
-    let lastError: Error | null = null;
-
-    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-      try {
-        this.logger.info(
-          `[OllamaProvider] Tentativa ${attempt}/${this.maxRetries} - Enviando prompt ao modelo "${this.model}"`
-        );
-
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-        });
-
-        if (!response.ok) {
-          const errorBody = await response.text().catch(() => 'Sem corpo de erro disponível');
-          throw new Error(
-            `[OllamaProvider] Erro HTTP ${response.status} ao comunicar com o motor cognitivo.\n` +
-            `  URL: ${url}\n` +
-            `  Modelo: ${this.model}\n` +
-            `  Detalhes: ${errorBody}`
-          );
-        }
-
-        const data = (await response.json()) as OllamaGenerateResponse;
-
-        if (data.response === undefined || data.response === null) {
-          throw new Error(
-            `[OllamaProvider] Resposta inesperada do motor cognitivo: campo "response" ausente.\n` +
-            `  Corpo recebido: ${JSON.stringify(data)}`
-          );
-        }
-
-        this.logger.info(
-          `[OllamaProvider] Tentativa ${attempt} bem-sucedida. Resposta recebida (${data.response.length} caracteres).`
-        );
-
-        return data.response;
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-
-        if (this.isRetryableError(error) && attempt < this.maxRetries) {
-          const delayMs = 1000 * attempt; // backoff: 1s, 2s, 3s
-          this.logger.warn(
-            `[OllamaProvider] Tentativa ${attempt} falhou (erro de conexão). ` +
-            `Nova tentativa em ${delayMs}ms...\n` +
-            `  Erro: ${lastError.message}`
-          );
-          await this.delay(delayMs);
-          continue;
-        }
-
-        // Se não for retryável ou acabaram as tentativas, propaga o erro
-        if (attempt >= this.maxRetries) {
-          this.logger.error(
-            `[OllamaProvider] Todas as ${this.maxRetries} tentativas falharam. ` +
-            `Desistindo.\n  Último erro: ${lastError.message}`
-          );
-        }
-        break;
-      }
-    }
-
-    // Se chegou aqui, todas as tentativas falharam
-    throw lastError ?? new Error('[OllamaProvider] Falha desconhecida após retry');
-  }
-}
+## 4. Estrutura de Pastas
+- [cite_start]src/core: Contratos, interfaces e lógica de negócio pura (A "Alma").
+- [cite_start]src/infra: Implementações técnicas, provedores e drivers (Os "Músculos").
+- [cite_start]src/main.ts: Orquestração, Wiring manual e tratamento de sinais do sistema.
 </file>
 
 <file path="src/env.d.ts">
@@ -503,6 +737,26 @@ declare var process: {
   on(event: string, listener: (...args: unknown[]) => void): void;
   removeAllListeners(event?: string): void;
 };
+
+// AbortController e AbortSignal (API nativa global)
+declare class AbortController {
+  readonly signal: AbortSignal;
+  abort(): void;
+}
+
+declare class AbortSignal {
+  readonly aborted: boolean;
+  addEventListener(type: 'abort', listener: () => void): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
+}
+
+// setTimeout e clearTimeout
+declare function setTimeout(
+  callback: (...args: unknown[]) => void,
+  ms?: number,
+  ...args: unknown[]
+): ReturnType<typeof setTimeout>;
+declare function clearTimeout(timeoutId: ReturnType<typeof setTimeout> | undefined): void;
 
 // node:test
 declare module 'node:test' {
@@ -535,6 +789,339 @@ declare module 'node:assert' {
 }
 </file>
 
+<file path="package.json">
+{
+  "name": "soberano",
+  "version": "0.1.0",
+  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-transform-types src/main.ts",
+    "test": "node --experimental-transform-types --test src/infra/*.test.ts",
+    "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
+    "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["soberano", "llm", "ollama"],
+  "license": "MIT"
+}
+</file>
+
+<file path="src/infra/OllamaProvider.ts">
+/**
+ * @file OllamaProvider.ts
+ * @description Implementação concreta de IMotorCognitivo que se comunica
+ *              com o servidor local Ollama via API REST (fetch nativo).
+ *              - Depende da abstração IMotorCognitivo, não o contrário (DIP).
+ *              - Retry automático com maxRetries e delayBase configuráveis.
+ *              - Timeout configurável via AbortController.
+ *              - Aceita AbortSignal externo para graceful shutdown.
+ *              - Validação rigorosa de schema da resposta.
+ *              - Logger injetado via construtor.
+ */
+
+import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
+import { ILogger } from '../core/ILogger.ts';
+import { ICircuitBreaker } from '../core/ICircuitBreaker.ts';
+
+export interface OllamaGenerateResponse {
+  model: string;
+  created_at: string;
+  response: string;
+  done: boolean;
+  context?: number[];
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
+  eval_count?: number;
+  eval_duration?: number;
+}
+
+/**
+ * Valida em runtime se um valor desconhecido é um OllamaGenerateResponse válido.
+ * Lança erro descritivo se algum campo obrigatório estiver ausente ou com tipo incorreto.
+ *
+ * @param data - Dado desconhecido a ser validado
+ * @returns O dado tipado como OllamaGenerateResponse
+ * @throws {Error} Se a validação falhar
+ */
+export function validateOllamaResponse(data: unknown): OllamaGenerateResponse {
+  if (data === null || data === undefined || typeof data !== 'object') {
+    throw new Error(
+      `[OllamaProvider] Resposta inválida: esperado objeto, recebido ${typeof data}`
+    );
+  }
+
+  const record = data as Record<string, unknown>;
+
+  if (typeof record.model !== 'string') {
+    throw new Error(
+      `[OllamaProvider] Campo "model" ausente ou inválido: esperado string, recebido ${typeof record.model}`
+    );
+  }
+
+  if (typeof record.response !== 'string') {
+    throw new Error(
+      `[OllamaProvider] Campo "response" ausente ou inválido: esperado string, recebido ${typeof record.response}`
+    );
+  }
+
+  if (typeof record.done !== 'boolean') {
+    throw new Error(
+      `[OllamaProvider] Campo "done" ausente ou inválido: esperado boolean, recebido ${typeof record.done}`
+    );
+  }
+
+  // created_at é obrigatório na especificação da API Ollama
+  if (typeof record.created_at !== 'string') {
+    throw new Error(
+      `[OllamaProvider] Campo "created_at" ausente ou inválido: esperado string, recebido ${typeof record.created_at}`
+    );
+  }
+
+  return {
+    model: record.model,
+    created_at: record.created_at,
+    response: record.response,
+    done: record.done,
+    context: Array.isArray(record.context) ? (record.context as number[]) : undefined,
+    total_duration: typeof record.total_duration === 'number' ? record.total_duration : undefined,
+    load_duration: typeof record.load_duration === 'number' ? record.load_duration : undefined,
+    prompt_eval_count: typeof record.prompt_eval_count === 'number' ? record.prompt_eval_count : undefined,
+    prompt_eval_duration: typeof record.prompt_eval_duration === 'number' ? record.prompt_eval_duration : undefined,
+    eval_count: typeof record.eval_count === 'number' ? record.eval_count : undefined,
+    eval_duration: typeof record.eval_duration === 'number' ? record.eval_duration : undefined,
+  };
+}
+
+export class OllamaProvider extends IMotorCognitivo {
+  private readonly baseUrl: string;
+  private readonly model: string;
+  private readonly logger: ILogger;
+  private readonly maxRetries: number;
+  private readonly delayBase: number;
+  private readonly timeoutMs: number;
+  private readonly circuitBreaker?: ICircuitBreaker;
+  private externalSignal: AbortSignal | null = null;
+
+  /**
+   * @param logger         - Instância de ILogger para logging estruturado
+   * @param baseUrl        - URL base do servidor Ollama (padrão: http://localhost:11434)
+   * @param model          - Nome do modelo a ser utilizado (padrão: qwen2.5-coder:3b)
+   * @param maxRetries     - Número máximo de tentativas em caso de erro retryable (padrão: 3)
+   * @param delayBase      - Base do delay entre tentativas em ms (padrão: 1000)
+   * @param timeoutMs      - Timeout em ms para cada requisição fetch (padrão: 30000)
+   * @param circuitBreaker - (Opcional) Instância de ICircuitBreaker para proteger chamadas ao Ollama
+   */
+  constructor(
+    logger: ILogger,
+    baseUrl: string = 'http://localhost:11434',
+    model: string = 'qwen2.5-coder:3b',
+    maxRetries: number = 3,
+    delayBase: number = 1_000,
+    timeoutMs: number = 30_000,
+    circuitBreaker?: ICircuitBreaker
+  ) {
+    super();
+    this.logger = logger;
+    this.baseUrl = baseUrl;
+    this.model = model;
+    this.maxRetries = maxRetries;
+    this.delayBase = delayBase;
+    this.timeoutMs = timeoutMs;
+    this.circuitBreaker = circuitBreaker;
+  }
+
+  /**
+   * Injeta um AbortSignal externo para graceful shutdown.
+   * Quando este sinal for abortado, todas as requisições em andamento
+   * serão canceladas.
+   */
+  setAbortSignal(signal: AbortSignal): void {
+    this.externalSignal = signal;
+  }
+
+  /**
+   * Aguarda um tempo determinado (ms) usando setTimeout encapsulado em Promise.
+   * Usado entre tentativas de retry.
+   */
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Determina se um erro é recuperável (conexão/temporário) para retry.
+   */
+  private isRetryableError(error: unknown): boolean {
+    if (error instanceof TypeError && error.message.includes('fetch')) {
+      return true;
+    }
+    if (error instanceof Error) {
+      // Erros de rede/DNS/ECONNREFUSED geralmente disparam TypeError no fetch
+      const msg = error.message.toLowerCase();
+      return (
+        msg.includes('econnrefused') ||
+        msg.includes('socket hang up') ||
+        msg.includes('network') ||
+        msg.includes('timeout') ||
+        msg.includes('fetch failed')
+    );
+    }
+    return false;
+  }
+
+  /**
+   * Envia um prompt ao modelo Ollama e retorna a resposta gerada.
+   * Utiliza exclusivamente o fetch nativo do Node.js (sem dependências externas).
+   * Implementa retry automático (máximo configurável) para erros de conexão.
+   * Implementa timeout via AbortController em cada tentativa.
+   *
+   * @param prompt - O texto de entrada para o modelo.
+   * @returns A resposta gerada pelo modelo.
+   * @throws {Error} Se após todas as tentativas a comunicação falhar.
+   */
+  async gerarResposta(prompt: string): Promise<string> {
+    const url = `${this.baseUrl}/api/generate`;
+
+    const payload = {
+      model: this.model,
+      prompt,
+      stream: false,
+    };
+
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      const attemptController = new AbortController();
+      let timeoutHandle: ReturnType<typeof setTimeout>;
+
+      // Função de cleanup que remove o listener externo e limpa o timeout
+      let removeExternalListener: (() => void) | null = null;
+
+      try {
+        this.logger.info(
+          `[OllamaProvider] Tentativa ${attempt}/${this.maxRetries} - Enviando prompt ao modelo "${this.model}"`
+        );
+
+        // Configura timeout para esta tentativa
+        timeoutHandle = setTimeout(() => {
+          attemptController.abort();
+        }, this.timeoutMs);
+
+        // Se há um sinal externo (shutdown), escuta para propagar o abort
+        if (this.externalSignal) {
+          const onAbort = () => {
+            attemptController.abort();
+          };
+          this.externalSignal.addEventListener('abort', onAbort);
+          removeExternalListener = () => {
+            this.externalSignal!.removeEventListener('abort', onAbort);
+          };
+
+          // Se o sinal externo já está abortado, aborta imediatamente
+          if (this.externalSignal.aborted) {
+            attemptController.abort();
+          }
+        }
+
+        const executeFetch = async (): Promise<OllamaGenerateResponse> => {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+            signal: attemptController.signal,
+          });
+
+          if (!response.ok) {
+            const errorBody = await response.text().catch(() => 'Sem corpo de erro disponível');
+            throw new Error(
+              `[OllamaProvider] Erro HTTP ${response.status} ao comunicar com o motor cognitivo.\n` +
+              `  URL: ${url}\n` +
+              `  Modelo: ${this.model}\n` +
+              `  Detalhes: ${errorBody}`
+            );
+          }
+
+          const rawData: unknown = await response.json();
+
+          // Validação rigorosa de schema em runtime
+          const validated = validateOllamaResponse(rawData);
+
+          this.logger.info(
+            `[OllamaProvider] Tentativa ${attempt} bem-sucedida. Resposta recebida (${validated.response.length} caracteres).`
+          );
+
+          return validated;
+        };
+
+        const data: OllamaGenerateResponse = this.circuitBreaker
+          ? await this.circuitBreaker.execute(executeFetch)
+          : await executeFetch();
+
+        return data.response;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (this.isRetryableError(error) && attempt < this.maxRetries) {
+          const delayMs = this.delayBase * attempt; // backoff: 1x, 2x, 3x
+          this.logger.warn(
+            `[OllamaProvider] Tentativa ${attempt} falhou (erro de conexão). ` +
+            `Nova tentativa em ${delayMs}ms...\n` +
+            `  Erro: ${lastError.message}`
+          );
+          if (this.externalSignal?.aborted) {
+            break;
+          }
+          await this.delay(delayMs);
+          continue;
+        }
+
+        // Se não for retryável ou acabaram as tentativas, propaga o erro
+        if (attempt >= this.maxRetries) {
+          this.logger.error(
+            `[OllamaProvider] Todas as ${this.maxRetries} tentativas falharam. ` +
+            `Desistindo.\n  Último erro: ${lastError.message}`
+          );
+        }
+        break;
+      } finally {
+        clearTimeout(timeoutHandle);
+        if (removeExternalListener) {
+          removeExternalListener();
+        }
+      }
+    }
+
+    // Se chegou aqui, todas as tentativas falharam
+    throw lastError ?? new Error('[OllamaProvider] Falha desconhecida após retry');
+  }
+}
+</file>
+
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "outDir": "dist/",
+    "rootDir": "src/",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+</file>
+
 <file path="src/main.ts">
 /**
  * @file main.ts
@@ -542,6 +1129,8 @@ declare module 'node:assert' {
  *              Realiza o wiring manual (Injeção de Dependência) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
+ *              - Cria AbortController global para graceful shutdown
+ *              - Injeta AbortSignal no OllamaProvider para cancelar fetch em andamento
  *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
  *              - Executa o teste inicial de comunicação com o motor cognitivo
  */
@@ -550,6 +1139,7 @@ import { OllamaProvider } from './infra/OllamaProvider.ts';
 import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
 import { ConsoleLogger } from './infra/ConsoleLogger.ts';
 import { ILogger } from './core/ILogger.ts';
+import { CircuitBreaker } from './infra/CircuitBreaker.ts';
 
 /**
  * Sinalizador de encerramento usado pelas rotinas de graceful shutdown.
@@ -563,11 +1153,17 @@ let isShuttingDown = false;
  * SIGINT  -> Ctrl+C no terminal
  * SIGTERM -> kill padrão do sistema
  *
- * O encerramento é feito de forma limpa: mensagem de log,
- * sinalizador ligado e processo finalizado com código 0.
+ * O encerramento é feito de forma limpa: aborta operações em andamento,
+ * mensagem de log, sinalizador ligado e processo finalizado com código 0.
+ *
+ * @param logger            - Instância de ILogger para logging
+ * @param shutdownController - AbortController global para cancelar operações
  */
-function registerShutdownHandlers(logger: ILogger): void {
-  const shutdown = (signal: string) => {
+function registerShutdownHandlers(
+  logger: ILogger,
+  shutdownController: AbortController
+): void {
+  const shutdown = async (signal: string) => {
     if (isShuttingDown) {
       logger.warn(`[main] Sinal ${signal} recebido novamente. Forçando saída.`);
       process.exit(1);
@@ -586,9 +1182,14 @@ function registerShutdownHandlers(logger: ILogger): void {
     process.removeAllListeners('SIGINT');
     process.removeAllListeners('SIGTERM');
 
-    // Operações de limpeza podem ser adicionadas aqui no futuro
-    // (ex: fechar conexões HTTP, liberar recursos, etc.)
+    // Aborta todas as operações em andamento (fetch do OllamaProvider)
+    shutdownController.abort();
 
+    // O timer de 5s permanece ativo durante toda a limpeza.
+    // Se operações assíncronas de cleanup forem adicionadas no futuro
+    // e travarem, o timer dispara e força process.exit(1).
+
+    // Só cancela o timer se a limpeza terminou dentro do prazo de 5s
     clearTimeout(forceExitTimer);
     logger.info('[main] Recursos liberados. Até logo, SOBERANO.');
     process.exit(0);
@@ -611,14 +1212,26 @@ async function bootstrap(): Promise<void> {
     '╚══════════════════════════════════════════════════╝'
   );
 
+  // --- ABORT CONTROLLER GLOBAL PARA GRACEFUL SHUTDOWN ---
+  const shutdownController = new AbortController();
+
   // --- GRACEFUL SHUTDOWN ---
-  registerShutdownHandlers(logger);
+  registerShutdownHandlers(logger, shutdownController);
+
+  // --- CIRCUIT BREAKER ---
+  const circuitBreaker = new CircuitBreaker(logger);
 
   // --- WIRING MANUAL (Injeção de Dependência) ---
   // A variável "motor" é tipada como IMotorCognitivo (abstração).
   // O módulo de alto nível (main.ts) depende da abstração, não da implementação concreta.
   // O Logger é injetado via construtor em ambas as dependências.
-  const motor: IMotorCognitivo = new OllamaProvider(logger);
+  const provider = new OllamaProvider(logger, undefined, undefined, undefined, undefined, undefined, circuitBreaker);
+
+  // Injeta o sinal de abort para graceful shutdown
+  provider.setAbortSignal(shutdownController.signal);
+
+  // A partir daqui, usa-se a abstração IMotorCognitivo
+  const motor: IMotorCognitivo = provider;
 
   const promptTeste = 'Olá, Soberano. Confirme que seus sistemas base estão online.';
 
@@ -636,6 +1249,12 @@ async function bootstrap(): Promise<void> {
     logger.info(resposta);
     logger.info('[main] Teste concluído com sucesso.');
   } catch (error) {
+    // Se o erro foi causado pelo shutdown, não é uma falha real
+    if (shutdownController.signal.aborted) {
+      logger.info('[main] Operação cancelada devido ao encerramento do sistema.');
+      return;
+    }
+
     logger.error(
       '╔══════════════════════════════════════════════════╗\n' +
       '║       ERRO NA COMUNICAÇÃO COM O MOTOR           ║\n' +
@@ -657,31 +1276,6 @@ async function bootstrap(): Promise<void> {
 }
 
 bootstrap();
-</file>
-
-<file path=".clinerules">
-# Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
-
-## 1. Stack e Restrições Rígidas
-- [cite_start]Linguagem: TypeScript (Node.js nativo).
-- [cite_start]Dependências: PROIBIDO o uso de bibliotecas externas (ex: axios, jest, dotenv).
-- [cite_start]Utilizar exclusivamente módulos nativos (fs, path, node:test, node:assert, fetch global).
-
-## 2. Arquitetura e SOLID (DIP)
-- [cite_start]Abstração Primeiro: Sempre defina uma Interface/Classe Abstrata em `src/core` antes da implementação.
-- Inversão de Dependência: Módulos de alto nível dependem de abstrações. [cite_start]Injeção de dependência via construtor é obrigatória.
-- [cite_start]Desacoplamento de Infraestrutura: Detalhes técnicos (APIs, Banco de Dados) nunca vazam para o Core.
-## 3. Robustez e Confiabilidade (Padrões Industriais)
-- [cite_start]Testes Unitários: Toda nova funcionalidade de infraestrutura deve ter testes usando o `node:test` nativo.
-- [cite_start]Resiliência: Implementar Política de Retry (Retentativas) e Circuit Breaker para integrações com LLMs.
-- [cite_start]Observabilidade: Todo componente deve injetar uma interface `ILogger` para registro de eventos.
-- [cite_start]Estabilidade: Implementar 'Graceful Shutdown' para sinais SIGINT/SIGTERM no ponto de entrada.
-- [cite_start]Validação: Respostas de serviços externos devem passar por validação rigorosa de schema.
-
-## 4. Estrutura de Pastas
-- [cite_start]src/core: Contratos, interfaces e lógica de negócio pura (A "Alma").
-- [cite_start]src/infra: Implementações técnicas, provedores e drivers (Os "Músculos").
-- [cite_start]src/main.ts: Orquestração, Wiring manual e tratamento de sinais do sistema.
 </file>
 
 </files>

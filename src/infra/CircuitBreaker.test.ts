@@ -11,13 +11,19 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { CircuitBreaker } from './CircuitBreaker.ts';
 import { CircuitState } from '../core/ICircuitBreaker.ts';
-import { ILogger } from '../core/ILogger.ts';
+import { ILogger, LogLevel } from '../core/ILogger.ts';
 
 class MockLogger extends ILogger {
   public logs: string[] = [];
+  private readonly level: LogLevel;
 
-  constructor() {
+  constructor(minLevel: LogLevel = LogLevel.DEBUG) {
     super();
+    this.level = minLevel;
+  }
+
+  get minLevel(): LogLevel {
+    return this.level;
   }
 
   info(message: string): void {

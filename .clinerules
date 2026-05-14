@@ -1,22 +1,28 @@
 # Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
 
 ## 1. Stack e Restrições Rígidas
-- [cite_start]Linguagem: TypeScript (Node.js nativo).
-- [cite_start]Dependências: PROIBIDO o uso de bibliotecas externas (ex: axios, jest, dotenv).
-- [cite_start]Utilizar exclusivamente módulos nativos (fs, path, node:test, node:assert, fetch global).
+- Linguagem: TypeScript (Node.js nativo).
+- Dependências: PROIBIDO o uso de bibliotecas externas (ex: axios, jest, dotenv).
+- Utilizar exclusivamente módulos nativos (fs, path, node:test, node:assert, fetch global).
 
 ## 2. Arquitetura e SOLID (DIP)
-- [cite_start]Abstração Primeiro: Sempre defina uma Interface/Classe Abstrata em `src/core` antes da implementação.
-- Inversão de Dependência: Módulos de alto nível dependem de abstrações. [cite_start]Injeção de dependência via construtor é obrigatória.
-- [cite_start]Desacoplamento de Infraestrutura: Detalhes técnicos (APIs, Banco de Dados) nunca vazam para o Core.
-## 3. Robustez e Confiabilidade (Padrões Industriais)
-- [cite_start]Testes Unitários: Toda nova funcionalidade de infraestrutura deve ter testes usando o `node:test` nativo.
-- [cite_start]Resiliência: Implementar Política de Retry (Retentativas) e Circuit Breaker para integrações com LLMs.
-- [cite_start]Observabilidade: Todo componente deve injetar uma interface `ILogger` para registro de eventos.
-- [cite_start]Estabilidade: Implementar 'Graceful Shutdown' para sinais SIGINT/SIGTERM no ponto de entrada.
-- [cite_start]Validação: Respostas de serviços externos devem passar por validação rigorosa de schema.
+- [cite_start]Abstração Primeiro: Sempre defina uma Interface/Classe Abstrata em `src/core` antes da implementação[cite: 167].
+- Inversão de Dependência: Módulos de alto nível dependem de abstrações. [cite_start]Injeção de dependência via construtor é obrigatória[cite: 168].
+- [cite_start]Padrão de Construtor: Para classes com múltiplas configurações, utilize um objeto de configuração (Options Object) em vez de parâmetros posicionais[cite: 412].
+- [cite_start]Desacoplamento: Detalhes técnicos nunca vazam para o Core[cite: 161].
 
-## 4. Estrutura de Pastas
-- [cite_start]src/core: Contratos, interfaces e lógica de negócio pura (A "Alma").
-- [cite_start]src/infra: Implementações técnicas, provedores e drivers (Os "Músculos").
-- [cite_start]src/main.ts: Orquestração, Wiring manual e tratamento de sinais do sistema.
+## 3. Robustez, Confiabilidade e Observabilidade
+- [cite_start]Testes Unitários: Use o `node:test` nativo com `mock.method()` para garantir isolamento e restore automático.
+- [cite_start]Resiliência: Implementar Política de Retry, Circuit Breaker e AbortSignal.timeout() global no bootstrap.
+- Log Standardization: Padronize logs e erros internos em Inglês. [cite_start]Mensagens de interface com o usuário devem ser em PT-BR.
+- [cite_start]Controle de Log: O sistema de logging deve suportar níveis (DEBUG, INFO, WARN, ERROR) e filtragem de nível mínimo[cite: 412].
+- [cite_start]Estabilidade: Implementar 'Graceful Shutdown' (SIGINT/SIGTERM) com cancelamento de operações pendentes[cite: 273].
+
+## 4. Documentação e Evolução
+- [cite_start]Manutenção de Contexto: O arquivo `README.md` deve ser atualizado obrigatoriamente pelo Cline sempre que uma Fase do Roadmap for concluída ou um Contrato (Core) for alterado.
+- [cite_start]Alinhamento de Roadmap: Mantenha o status das fases atualizado conforme o progresso real[cite: 422].
+
+## 5. Estrutura de Pastas
+- [cite_start]src/core: Contratos, interfaces e lógica de negócio pura (A "Alma")[cite: 161].
+- [cite_start]src/infra: Implementações técnicas, provedores e drivers (Os "Músculos")[cite: 161].
+- [cite_start]src/main.ts: Orquestração, Wiring manual e ponto de entrada[cite: 162].

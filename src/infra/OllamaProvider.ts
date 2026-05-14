@@ -14,6 +14,16 @@ import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
 import { ILogger } from '../core/ILogger.ts';
 import { ICircuitBreaker } from '../core/ICircuitBreaker.ts';
 
+export interface OllamaConfig {
+  logger: ILogger;
+  baseUrl?: string;
+  model?: string;
+  maxRetries?: number;
+  delayBase?: number;
+  timeoutMs?: number;
+  circuitBreaker?: ICircuitBreaker;
+}
+
 export interface OllamaGenerateResponse {
   model: string;
   created_at: string;
@@ -39,7 +49,7 @@ export interface OllamaGenerateResponse {
 export function validateOllamaResponse(data: unknown): OllamaGenerateResponse {
   if (data === null || data === undefined || typeof data !== 'object') {
     throw new Error(
-      `[OllamaProvider] Resposta inválida: esperado objeto, recebido ${typeof data}`
+      `[OllamaProvider] Invalid response: expected object, received ${typeof data}`
     );
   }
 
@@ -47,26 +57,26 @@ export function validateOllamaResponse(data: unknown): OllamaGenerateResponse {
 
   if (typeof record.model !== 'string') {
     throw new Error(
-      `[OllamaProvider] Campo "model" ausente ou inválido: esperado string, recebido ${typeof record.model}`
+      `[OllamaProvider] Field "model" missing or invalid: expected string, received ${typeof record.model}`
     );
   }
 
   if (typeof record.response !== 'string') {
     throw new Error(
-      `[OllamaProvider] Campo "response" ausente ou inválido: esperado string, recebido ${typeof record.response}`
+      `[OllamaProvider] Field "response" missing or invalid: expected string, received ${typeof record.response}`
     );
   }
 
   if (typeof record.done !== 'boolean') {
     throw new Error(
-      `[OllamaProvider] Campo "done" ausente ou inválido: esperado boolean, recebido ${typeof record.done}`
+      `[OllamaProvider] Field "done" missing or invalid: expected boolean, received ${typeof record.done}`
     );
   }
 
-  // created_at é obrigatório na especificação da API Ollama
+  // created_at is required by the Ollama API specification
   if (typeof record.created_at !== 'string') {
     throw new Error(
-      `[OllamaProvider] Campo "created_at" ausente ou inválido: esperado string, recebido ${typeof record.created_at}`
+      `[OllamaProvider] Field "created_at" missing or invalid: expected string, received ${typeof record.created_at}`
     );
   }
 
@@ -96,31 +106,17 @@ export class OllamaProvider extends IMotorCognitivo {
   private externalSignal: AbortSignal | null = null;
 
   /**
-   * @param logger         - Instância de ILogger para logging estruturado
-   * @param baseUrl        - URL base do servidor Ollama (padrão: http://localhost:11434)
-   * @param model          - Nome do modelo a ser utilizado (padrão: qwen2.5-coder:3b)
-   * @param maxRetries     - Número máximo de tentativas em caso de erro retryable (padrão: 3)
-   * @param delayBase      - Base do delay entre tentativas em ms (padrão: 1000)
-   * @param timeoutMs      - Timeout em ms para cada requisição fetch (padrão: 30000)
-   * @param circuitBreaker - (Opcional) Instância de ICircuitBreaker para proteger chamadas ao Ollama
+   * @param config - Objeto de configuração (OllamaConfig). Apenas `logger` é obrigatório.
    */
-  constructor(
-    logger: ILogger,
-    baseUrl: string = 'http://localhost:11434',
-    model: string = 'qwen2.5-coder:3b',
-    maxRetries: number = 3,
-    delayBase: number = 1_000,
-    timeoutMs: number = 30_000,
-    circuitBreaker?: ICircuitBreaker
-  ) {
+  constructor(config: OllamaConfig) {
     super();
-    this.logger = logger;
-    this.baseUrl = baseUrl;
-    this.model = model;
-    this.maxRetries = maxRetries;
-    this.delayBase = delayBase;
-    this.timeoutMs = timeoutMs;
-    this.circuitBreaker = circuitBreaker;
+    this.logger = config.logger;
+    this.baseUrl = config.baseUrl ?? 'http://localhost:11434';
+    this.model = config.model ?? 'qwen2.5-coder:3b';
+    this.maxRetries = config.maxRetries ?? 3;
+    this.delayBase = config.delayBase ?? 1_000;
+    this.timeoutMs = config.timeoutMs ?? 30_000;
+    this.circuitBreaker = config.circuitBreaker;
   }
 
   /**
@@ -191,7 +187,7 @@ export class OllamaProvider extends IMotorCognitivo {
 
       try {
         this.logger.info(
-          `[OllamaProvider] Tentativa ${attempt}/${this.maxRetries} - Enviando prompt ao modelo "${this.model}"`
+          `[OllamaProvider] Attempt ${attempt}/${this.maxRetries} - Sending prompt to model "${this.model}"`
         );
 
         // Configura timeout para esta tentativa
@@ -226,12 +222,12 @@ export class OllamaProvider extends IMotorCognitivo {
           });
 
           if (!response.ok) {
-            const errorBody = await response.text().catch(() => 'Sem corpo de erro disponível');
+            const errorBody = await response.text().catch(() => 'No error body available');
             throw new Error(
-              `[OllamaProvider] Erro HTTP ${response.status} ao comunicar com o motor cognitivo.\n` +
+              `[OllamaProvider] HTTP error ${response.status} communicating with the cognitive engine.\n` +
               `  URL: ${url}\n` +
-              `  Modelo: ${this.model}\n` +
-              `  Detalhes: ${errorBody}`
+              `  Model: ${this.model}\n` +
+              `  Details: ${errorBody}`
             );
           }
 
@@ -241,7 +237,7 @@ export class OllamaProvider extends IMotorCognitivo {
           const validated = validateOllamaResponse(rawData);
 
           this.logger.info(
-            `[OllamaProvider] Tentativa ${attempt} bem-sucedida. Resposta recebida (${validated.response.length} caracteres).`
+            `[OllamaProvider] Attempt ${attempt} succeeded. Response received (${validated.response.length} chars).`
           );
 
           return validated;
@@ -258,9 +254,9 @@ export class OllamaProvider extends IMotorCognitivo {
         if (this.isRetryableError(error) && attempt < this.maxRetries) {
           const delayMs = this.delayBase * attempt; // backoff: 1x, 2x, 3x
           this.logger.warn(
-            `[OllamaProvider] Tentativa ${attempt} falhou (erro de conexão). ` +
-            `Nova tentativa em ${delayMs}ms...\n` +
-            `  Erro: ${lastError.message}`
+            `[OllamaProvider] Attempt ${attempt} failed (connection error). ` +
+            `Retrying in ${delayMs}ms...\n` +
+            `  Error: ${lastError.message}`
           );
           if (this.externalSignal?.aborted) {
             break;
@@ -272,8 +268,8 @@ export class OllamaProvider extends IMotorCognitivo {
         // Se não for retryável ou acabaram as tentativas, propaga o erro
         if (attempt >= this.maxRetries) {
           this.logger.error(
-            `[OllamaProvider] Todas as ${this.maxRetries} tentativas falharam. ` +
-            `Desistindo.\n  Último erro: ${lastError.message}`
+            `[OllamaProvider] All ${this.maxRetries} attempts failed. ` +
+            `Giving up.\n  Last error: ${lastError.message}`
           );
         }
         break;
@@ -286,6 +282,6 @@ export class OllamaProvider extends IMotorCognitivo {
     }
 
     // Se chegou aqui, todas as tentativas falharam
-    throw lastError ?? new Error('[OllamaProvider] Falha desconhecida após retry');
+    throw lastError ?? new Error('[OllamaProvider] Unknown failure after retry');
   }
 }

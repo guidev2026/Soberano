@@ -48,16 +48,16 @@ export class CircuitBreaker extends ICircuitBreaker {
 
     if (currentState === CircuitState.OPEN) {
       this.logger.warn(
-        `[CircuitBreaker] Circuito ABERTO. Chamada rejeitada imediatamente.`
+        `[CircuitBreaker] Circuit is OPEN. Request rejected immediately.`
       );
       throw new Error(
-        '[CircuitBreaker] Circuito aberto. Operação não permitida no momento.'
+        '[CircuitBreaker] Circuit is open. Operation not allowed at this time.'
       );
     }
 
     if (currentState === CircuitState.HALF_OPEN) {
       this.logger.info(
-        `[CircuitBreaker] Circuito em HALF_OPEN. Permitindo chamada de teste.`
+        `[CircuitBreaker] Circuit is HALF_OPEN. Allowing test request.`
       );
     }
 
@@ -76,7 +76,7 @@ export class CircuitBreaker extends ICircuitBreaker {
     this.lastFailureTime = Date.now();
 
     this.logger.warn(
-      `[CircuitBreaker] Falha registrada (${this.failureCount}/${this.failureThreshold}). Estado atual: ${this._state}`
+      `[CircuitBreaker] Failure recorded (${this.failureCount}/${this.failureThreshold}). Current state: ${this._state}`
     );
 
     if (
@@ -98,7 +98,7 @@ export class CircuitBreaker extends ICircuitBreaker {
   private recordSuccess(): void {
     if (this._state === CircuitState.HALF_OPEN) {
       this.logger.info(
-        `[CircuitBreaker] Chamada de teste bem-sucedida. Retornando ao estado CLOSED.`
+        `[CircuitBreaker] Test request succeeded. Returning to CLOSED state.`
       );
     }
 
@@ -119,7 +119,7 @@ export class CircuitBreaker extends ICircuitBreaker {
     this._state = newState;
 
     this.logger.info(
-      `[CircuitBreaker] Transição de estado: ${oldState} -> ${newState}`
+      `[CircuitBreaker] State transition: ${oldState} -> ${newState}`
     );
   }
 }

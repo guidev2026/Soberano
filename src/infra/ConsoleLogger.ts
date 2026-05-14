@@ -4,14 +4,20 @@
  *              Depende da abstração ILogger, não o contrário.
  */
 
-import { ILogger } from '../core/ILogger.ts';
+import { ILogger, LogLevel } from '../core/ILogger.ts';
 
 export class ConsoleLogger extends ILogger {
   private readonly prefix: string;
+  private readonly level: LogLevel;
 
-  constructor(prefix: string = 'SOBERANO') {
+  constructor(prefix: string = 'SOBERANO', minLevel: LogLevel = LogLevel.INFO) {
     super();
     this.prefix = prefix;
+    this.level = minLevel;
+  }
+
+  get minLevel(): LogLevel {
+    return this.level;
   }
 
   private formatMessage(level: string, message: string): string {
@@ -20,18 +26,26 @@ export class ConsoleLogger extends ILogger {
   }
 
   info(message: string): void {
-    console.log(this.formatMessage('INFO', message));
+    if (this.level <= LogLevel.INFO) {
+      console.log(this.formatMessage('INFO', message));
+    }
   }
 
   warn(message: string): void {
-    console.warn(this.formatMessage('WARN', message));
+    if (this.level <= LogLevel.WARN) {
+      console.warn(this.formatMessage('WARN', message));
+    }
   }
 
   error(message: string): void {
-    console.error(this.formatMessage('ERROR', message));
+    if (this.level <= LogLevel.ERROR) {
+      console.error(this.formatMessage('ERROR', message));
+    }
   }
 
   debug(message: string): void {
-    console.log(this.formatMessage('DEBUG', message));
+    if (this.level <= LogLevel.DEBUG) {
+      console.log(this.formatMessage('DEBUG', message));
+    }
   }
 }

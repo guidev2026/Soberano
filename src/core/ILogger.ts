@@ -5,13 +5,23 @@
  *              não de implementações concretas.
  */
 
+export enum LogLevel {
+  DEBUG = 0,
+  INFO = 1,
+  WARN = 2,
+  ERROR = 3,
+}
+
 export abstract class ILogger {
-  /** Mensagem informativa padrão */
+  /** Nível mínimo de log para filtrar mensagens (DEBUG=0, INFO=1, WARN=2, ERROR=3) */
+  abstract minLevel: LogLevel;
+
+  /** Informational message */
   abstract info(message: string): void;
-  /** Aviso que não impede a execução mas merece atenção */
+  /** Warning that does not halt execution */
   abstract warn(message: string): void;
-  /** Erro operacional recuperável ou crítico */
+  /** Operational or critical error */
   abstract error(message: string): void;
-  /** Mensagem de depuração (desenvolvimento) */
+  /** Debug message (development only) */
   abstract debug(message: string): void;
 }
