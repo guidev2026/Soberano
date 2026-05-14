@@ -50,6 +50,7 @@ src/
     IMotorCognitivo.ts
     ISensor.ts
     ISessionManager.ts
+    ITool.ts
     IVectorStore.ts
   infra/
     CircuitBreaker.test.ts
@@ -193,6 +194,60 @@ export abstract class IHttpServer {
    * Fecha todas as conexões ativas e libera a porta.
    */
   abstract stop(): Promise<void>;
+}
+</file>
+
+<file path="src/core/ITool.ts">
+/**
+ * @file ITool.ts
+ * @description Contrato abstrato para uma Ferramenta (Tool) que pode ser
+ *              exposta ao motor cognitivo para Tool Calling.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração.
+ */
+
+import type { IToolDefinition } from './IMotorCognitivo.ts';
+
+/**
+ * Interface abstrata genérica para uma ferramenta executável.
+ * Define o contrato que toda ferramenta concreta deve implementar.
+ */
+export abstract class ITool {
+  /**
+   * Nome único da ferramenta.
+   */
+  abstract get name(): string;
+
+  /**
+   * Descrição legível para o modelo LLM entender quando usar esta ferramenta.
+   */
+  abstract get description(): string;
+
+  /**
+   * Schema JSON dos parâmetros esperados pelo método execute().
+   */
+  abstract get parametersSchema(): Record<string, any>;
+
+  /**
+   * Executa a ferramenta com os argumentos fornecidos.
+   * @param args - Argumentos no formato definido por parametersSchema.
+   * @returns Resultado da execução.
+   */
+  abstract execute(args: Record<string, any>): Promise<any>;
+
+  /**
+   * Retorna a definição da ferramenta no formato IToolDefinition,
+   * compatível com o protocolo de Tool Calling do Ollama/OpenAI.
+   */
+  getDefinition(): IToolDefinition {
+    return {
+      type: 'function',
+      function: {
+        name: this.name,
+        description: this.description,
+        parameters: this.parametersSchema,
+      },
+    };
+  }
 }
 </file>
 
@@ -717,202 +772,6 @@ export abstract class IVectorStore<M = any> {
 }
 </file>
 
-<file path="src/infra/ConversationManager.ts">
-/**
- * @file ConversationManager.ts
- * @description Implementação do Maestro — orquestrador central que concretiza
- *              a Sprint 5.3 (Fusão de Contexto). Une a Memória Vetorial (RAG)
- *              e a Memória de Curto Prazo (Sessões) em um único fluxo.
- *
- *              Depende de abstrações (DIP): ILogger, IMotorCognitivo,
- *              ISessionManager e opcionalmente IVectorStore.
- *
- *              Fluxo do método conversar():
- *              1. Guarda inputUsuario no SessionManager (role: user).
- *              2. Se IVectorStore existir, gera um embedding heurístico simples
- *                 (baseado no comprimento do texto) para buscar contextos similares.
- *              3. Obtém o histórico atualizado do SessionManager.
- *              4. Constrói mensagem system fundindo regras do SOBERANO
- *                 com os documentos recuperados do VectorStore (Context Fusion).
- *              5. Envia [SystemMessage, ...Historico] para IMotorCognitivo.gerarResposta().
- *              6. Guarda resposta (role: assistant) no SessionManager.
- *              7. Retorna resposta ao chamador.
- */
-
-import { IConversationManager } from '../core/IConversationManager.ts';
-import type { ChatMessage } from '../core/IMotorCognitivo.ts';
-import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
-import { ISessionManager } from '../core/ISessionManager.ts';
-import { IVectorStore } from '../core/IVectorStore.ts';
-import { ILogger } from '../core/ILogger.ts';
-
-export interface ConversationManagerOptions {
-  /** Instância obrigatória de ILogger para logging estruturado */
-  logger: ILogger;
-  /** Instância obrigatória do motor cognitivo (LLM) */
-  motor: IMotorCognitivo;
-  /** Instância obrigatória do gerenciador de sessões */
-  sessionManager: ISessionManager;
-  /** Instância opcional do Vector Store para RAG (Memória Vetorial).
-   *  Se não fornecida, o RAG é desabilitado. */
-  vectorStore?: IVectorStore;
-  /** Nome do sistema SOBERANO para a mensagem de system prompt */
-  systemName?: string;
-}
-
-export class ConversationManager extends IConversationManager {
-  private readonly logger: ILogger;
-  private readonly motor: IMotorCognitivo;
-  private readonly sessionManager: ISessionManager;
-  private readonly vectorStore?: IVectorStore;
-  private readonly systemName: string;
-
-  /**
-   * @param options - Options Object (ConversationManagerOptions).
-   *                  Apenas `logger`, `motor` e `sessionManager` são obrigatórios.
-   */
-  constructor(options: ConversationManagerOptions) {
-    super();
-    this.logger = options.logger;
-    this.motor = options.motor;
-    this.sessionManager = options.sessionManager;
-    this.vectorStore = options.vectorStore;
-    this.systemName = options.systemName ?? 'SOBERANO';
-  }
-
-  /**
-   * Gera um embedding heurístico simples a partir de um texto.
-   * Cada palavra contribui com uma dimensão baseada no hash do caractere.
-   * Isso permite buscas no VectorStore mesmo sem um provedor de embeddings real.
-   *
-   * @param text - Texto a ser convertido em vetor
-   * @returns Vetor numérico de 10 dimensões
-   */
-  private gerarEmbeddingHeuristico(text: string): number[] {
-    const words = text.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
-    const dimensions = 10;
-    const vector = new Array(dimensions).fill(0);
-
-    for (let i = 0; i < words.length; i++) {
-      const word = words[i] as string;
-      for (let j = 0; j < word.length; j++) {
-        const dim = j % dimensions;
-        vector[dim] = (vector[dim] as number) + (word.charCodeAt(j) % 10) + 1;
-      }
-    }
-
-    // Normaliza para evitar valores muito grandes
-    const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
-    if (magnitude > 0) {
-      for (let i = 0; i < dimensions; i++) {
-        vector[i] = (vector[i] as number) / magnitude;
-      }
-    }
-
-    return vector;
-  }
-
-  /**
-   * Processa uma interação completa de conversa multi-turno com RAG.
-   *
-   * @param sessionId    - Identificador único da sessão.
-   * @param inputUsuario - Texto de entrada do usuário.
-   * @returns A resposta gerada pelo motor cognitivo.
-   */
-  async conversar(sessionId: string, inputUsuario: string): Promise<string> {
-    this.logger.info(
-      `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
-    );
-
-    // --- Passo 1: Guarda o input do usuário na sessão ---
-    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
-    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
-    this.logger.debug('[ConversationManager] User message saved to session.');
-
-    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
-    let documentosRecuperados: string[] = [];
-    if (this.vectorStore) {
-      try {
-        // Gera embedding heurístico para a consulta do usuário
-        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
-        this.logger.debug(
-          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
-        );
-
-        // Busca os 3 documentos mais similares
-        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
-
-        if (resultados.length > 0) {
-          documentosRecuperados = resultados.map((r) => {
-            const metadata = r.metadata as Record<string, unknown>;
-            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
-          });
-          this.logger.info(
-            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
-          );
-        } else {
-          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
-        }
-      } catch (ragError) {
-        this.logger.error(
-          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
-        );
-        throw ragError;
-      }
-    } else {
-      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
-    }
-
-    // --- Passo 3: Obtém o histórico completo da sessão ---
-    const historico = await this.sessionManager.obterHistorico(sessionId);
-    this.logger.debug(
-      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
-    );
-
-    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
-    let systemContent =
-      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
-      `Responda em Português do Brasil de forma clara e objetiva. ` +
-      `Mantenha o contexto da conversa ao responder.`;
-
-    if (documentosRecuperados.length > 0) {
-      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
-      systemContent +=
-        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
-        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
-        `mas não invente informações que não estejam presentes.`;
-    }
-
-    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
-
-    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
-    const historicoFiltrado = historico.filter(m => m.role !== 'system');
-
-    // --- Passo 5: Monta array final e envia ao motor cognitivo ---
-    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
-
-    this.logger.info(
-      `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +
-      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'}).`
-    );
-
-    const resposta = await this.motor.gerarResposta(mensagensParaMotor);
-
-    // --- Passo 6: Guarda a resposta (assistant) na sessão ---
-    const mensagemAssistant: ChatMessage = { role: 'assistant', content: resposta };
-    await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
-
-    this.logger.info(
-      `[ConversationManager] Assistant response saved to session "${sessionId}". ` +
-      `Response length: ${resposta.length} chars.`
-    );
-
-    // --- Passo 7: Retorna a resposta ---
-    return resposta;
-  }
-}
-</file>
-
 <file path="src/infra/InMemorySessionManager.ts">
 /**
  * @file InMemorySessionManager.ts
@@ -1168,303 +1027,6 @@ export class MockVectorStore<M = any> extends IVectorStore<M> {
 }
 </file>
 
-<file path="src/infra/validateOllamaResponse.test.ts">
-/**
- * @file validateOllamaResponse.test.ts
- * @description Testes unitários isolados para a função pura validateOllamaResponse.
- *              A função está exportada em OllamaProvider.ts e valida o schema
- *              de respostas da API Ollama /api/chat em runtime.
- *
- *              Como executar:
- *   node --experimental-transform-types --test src/infra/validateOllamaResponse.test.ts
- */
-
-import { describe, it } from 'node:test';
-import assert from 'node:assert';
-import { validateOllamaResponse } from './OllamaProvider.ts';
-
-describe('validateOllamaResponse (função pura) - /api/chat', () => {
-  describe('casos de erro — entrada nula/indefinida/não-objeto', () => {
-    it('deve lançar erro para null', () => {
-      assert.throws(
-        () => validateOllamaResponse(null),
-        /expected object/
-      );
-    });
-
-    it('deve lançar erro para undefined', () => {
-      assert.throws(
-        () => validateOllamaResponse(undefined),
-        /expected object/
-      );
-    });
-
-    it('deve lançar erro para número (não-objeto)', () => {
-      assert.throws(
-        () => validateOllamaResponse(42),
-        /expected object/
-      );
-    });
-
-    it('deve lançar erro para string (não-objeto)', () => {
-      assert.throws(
-        () => validateOllamaResponse('string'),
-        /expected object/
-      );
-    });
-  });
-
-  describe('casos de erro — objeto vazio', () => {
-    it('deve lançar erro para objeto vazio {}', () => {
-      assert.throws(
-        () => validateOllamaResponse({}),
-        /Field "model" missing or invalid/
-      );
-    });
-  });
-
-  describe('casos de erro — campos obrigatórios ausentes', () => {
-    const validBase = {
-      model: 'qwen2.5-coder:3b',
-      message: { role: 'assistant', content: 'some text' },
-      done: true,
-      created_at: '2024-01-01T00:00:00Z',
-    };
-
-    it('deve lançar erro quando message está ausente', () => {
-      const { message: _, ...withoutMessage } = validBase;
-      assert.throws(
-        () => validateOllamaResponse(withoutMessage),
-        /Field "message" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando done está ausente', () => {
-      const { done: _, ...withoutDone } = validBase;
-      assert.throws(
-        () => validateOllamaResponse(withoutDone),
-        /Field "done" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando model está ausente', () => {
-      const { model: _, ...withoutModel } = validBase;
-      assert.throws(
-        () => validateOllamaResponse(withoutModel),
-        /Field "model" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando created_at está ausente', () => {
-      const { created_at: _, ...withoutCreatedAt } = validBase;
-      assert.throws(
-        () => validateOllamaResponse(withoutCreatedAt),
-        /Field "created_at" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando message.role está ausente', () => {
-      assert.throws(
-        () => validateOllamaResponse({
-          model: 'x',
-          message: { content: 'text' },
-          done: true,
-          created_at: '2024-01-01T00:00:00Z',
-        }),
-        /Field "message.role" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando message.content está ausente', () => {
-      assert.throws(
-        () => validateOllamaResponse({
-          model: 'x',
-          message: { role: 'assistant' },
-          done: true,
-          created_at: '2024-01-01T00:00:00Z',
-        }),
-        /Field "message.content" missing or invalid/
-      );
-    });
-  });
-
-  describe('casos de erro — campos obrigatórios com tipos errados', () => {
-    it('deve lançar erro quando model não é string (number)', () => {
-      assert.throws(
-        () => validateOllamaResponse({
-          model: 123,
-          message: { role: 'assistant', content: 'ok' },
-          done: true,
-          created_at: '2024-01-01T00:00:00Z',
-        }),
-        /Field "model" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando message não é objeto (boolean)', () => {
-      assert.throws(
-        () => validateOllamaResponse({
-          model: 'x',
-          message: true,
-          done: true,
-          created_at: '2024-01-01T00:00:00Z',
-        }),
-        /Field "message" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando done não é boolean (string)', () => {
-      assert.throws(
-        () => validateOllamaResponse({
-          model: 'x',
-          message: { role: 'assistant', content: 'ok' },
-          done: 'yes',
-          created_at: '2024-01-01T00:00:00Z',
-        }),
-        /Field "done" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando created_at não é string (number)', () => {
-      assert.throws(
-        () => validateOllamaResponse({
-          model: 'x',
-          message: { role: 'assistant', content: 'ok' },
-          done: true,
-          created_at: 12345,
-        }),
-        /Field "created_at" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando model é null', () => {
-      assert.throws(
-        () => validateOllamaResponse({
-          model: null,
-          message: { role: 'assistant', content: 'ok' },
-          done: true,
-          created_at: '2024-01-01T00:00:00Z',
-        }),
-        /Field "model" missing or invalid/
-      );
-    });
-
-    it('deve lançar erro quando message.content não é string (objeto vazio)', () => {
-      assert.throws(
-        () => validateOllamaResponse({
-          model: 'x',
-          message: { role: 'assistant', content: {} },
-          done: true,
-          created_at: '2024-01-01T00:00:00Z',
-        }),
-        /Field "message.content" missing or invalid/
-      );
-    });
-  });
-
-  describe('casos de sucesso', () => {
-    it('deve retornar o objeto validado para dados completos e corretos', () => {
-      const input = {
-        model: 'qwen2.5-coder:3b',
-        created_at: '2024-05-14T16:00:00Z',
-        message: {
-          role: 'assistant',
-          content: 'Resposta válida do modelo.',
-        },
-        done: true,
-      };
-
-      const result = validateOllamaResponse(input);
-
-      assert.strictEqual(result.model, input.model);
-      assert.strictEqual(result.created_at, input.created_at);
-      assert.strictEqual(result.message.role, input.message.role);
-      assert.strictEqual(result.message.content, input.message.content);
-      assert.strictEqual(result.done, input.done);
-    });
-
-    it('deve preservar campos opcionais (total_duration, etc.)', () => {
-      const input = {
-        model: 'qwen2.5-coder:3b',
-        created_at: '2024-05-14T16:00:00Z',
-        message: {
-          role: 'assistant',
-          content: 'Resposta.',
-        },
-        done: true,
-        total_duration: 1_234_567_890,
-        load_duration: 100_000,
-        prompt_eval_count: 42,
-        prompt_eval_duration: 500_000,
-        eval_count: 128,
-        eval_duration: 2_000_000,
-      };
-
-      const result = validateOllamaResponse(input);
-
-      assert.strictEqual(result.total_duration, input.total_duration);
-      assert.strictEqual(result.load_duration, input.load_duration);
-      assert.strictEqual(result.prompt_eval_count, input.prompt_eval_count);
-      assert.strictEqual(result.prompt_eval_duration, input.prompt_eval_duration);
-      assert.strictEqual(result.eval_count, input.eval_count);
-      assert.strictEqual(result.eval_duration, input.eval_duration);
-    });
-
-    it('deve ignorar campos opcionais ausentes (undefined)', () => {
-      const input = {
-        model: 'qwen2.5-coder:3b',
-        created_at: '2024-05-14T16:00:00Z',
-        message: {
-          role: 'assistant',
-          content: 'Resposta.',
-        },
-        done: true,
-        // total_duration, eval_duration etc. ausentes
-      };
-
-      const result = validateOllamaResponse(input);
-
-      assert.strictEqual(result.total_duration, undefined);
-      assert.strictEqual(result.eval_duration, undefined);
-    });
-
-    it('deve ignorar campos opcionais com tipos errados', () => {
-      const input = {
-        model: 'qwen2.5-coder:3b',
-        created_at: '2024-05-14T16:00:00Z',
-        message: {
-          role: 'assistant',
-          content: 'Resposta.',
-        },
-        done: true,
-        total_duration: 'não-número', // tipo errado
-      };
-
-      const result = validateOllamaResponse(input);
-
-      assert.strictEqual(result.total_duration, undefined);
-    });
-
-    it('deve preservar message.images quando presente', () => {
-      const input = {
-        model: 'qwen2.5-coder:3b',
-        created_at: '2024-05-14T16:00:00Z',
-        message: {
-          role: 'assistant',
-          content: 'Resposta com imagem.',
-          images: ['base64data'],
-        },
-        done: true,
-      };
-
-      const result = validateOllamaResponse(input);
-
-      assert.deepStrictEqual(result.message.images, ['base64data']);
-    });
-  });
-});
-</file>
-
 <file path=".clinerules">
 # Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
 
@@ -1523,43 +1085,6 @@ export abstract class ILogger {
 }
 </file>
 
-<file path="src/core/IMotorCognitivo.ts">
-/**
- * @file IMotorCognitivo.ts
- * @description Contrato de abstração para o motor cognitivo (LLM).
- *              Módulos de alto nível dependem desta abstração,
- *              não de implementações concretas (DIP).
- *              Classe abstrata em vez de interface para preservar
- *              a estrutura em runtime com --experimental-transform-types.
- */
-
-/**
- * Representa uma mensagem no formato de chat multi-turno.
- * Suporta os papéis: system (instrução de sistema), user (usuário),
- * assistant (modelo).
- */
-export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
-}
-
-export abstract class IMotorCognitivo {
-  /**
-   * Define o sinal de aborto para cancelamento de operações pendentes.
-   * @param signal - Sinal AbortSignal para cancelamento gracioso.
-   */
-  abstract setAbortSignal(signal: AbortSignal): void;
-
-  /**
-   * Envia uma lista de mensagens no formato chat ao motor cognitivo
-   * e retorna a resposta gerada pelo modelo.
-   * @param mensagens - Array de mensagens no formato ChatMessage[].
-   * @returns A resposta gerada pelo modelo (content da mensagem assistant).
-   */
-  abstract gerarResposta(mensagens: ChatMessage[]): Promise<string>;
-}
-</file>
-
 <file path="src/infra/ConsoleLogger.ts">
 /**
  * @file ConsoleLogger.ts
@@ -1606,6 +1131,203 @@ export class ConsoleLogger extends ILogger {
     if (this.level <= LogLevel.DEBUG) {
       console.log(this.formatMessage('DEBUG', message));
     }
+  }
+}
+</file>
+
+<file path="src/infra/ConversationManager.ts">
+/**
+ * @file ConversationManager.ts
+ * @description Implementação do Maestro — orquestrador central que concretiza
+ *              a Sprint 5.3 (Fusão de Contexto). Une a Memória Vetorial (RAG)
+ *              e a Memória de Curto Prazo (Sessões) em um único fluxo.
+ *
+ *              Depende de abstrações (DIP): ILogger, IMotorCognitivo,
+ *              ISessionManager e opcionalmente IVectorStore.
+ *
+ *              Fluxo do método conversar():
+ *              1. Guarda inputUsuario no SessionManager (role: user).
+ *              2. Se IVectorStore existir, gera um embedding heurístico simples
+ *                 (baseado no comprimento do texto) para buscar contextos similares.
+ *              3. Obtém o histórico atualizado do SessionManager.
+ *              4. Constrói mensagem system fundindo regras do SOBERANO
+ *                 com os documentos recuperados do VectorStore (Context Fusion).
+ *              5. Envia [SystemMessage, ...Historico] para IMotorCognitivo.gerarResposta().
+ *              6. Guarda resposta (role: assistant) no SessionManager.
+ *              7. Retorna resposta ao chamador.
+ */
+
+import { IConversationManager } from '../core/IConversationManager.ts';
+import type { ChatMessage } from '../core/IMotorCognitivo.ts';
+import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
+import { ISessionManager } from '../core/ISessionManager.ts';
+import { IVectorStore } from '../core/IVectorStore.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+export interface ConversationManagerOptions {
+  /** Instância obrigatória de ILogger para logging estruturado */
+  logger: ILogger;
+  /** Instância obrigatória do motor cognitivo (LLM) */
+  motor: IMotorCognitivo;
+  /** Instância obrigatória do gerenciador de sessões */
+  sessionManager: ISessionManager;
+  /** Instância opcional do Vector Store para RAG (Memória Vetorial).
+   *  Se não fornecida, o RAG é desabilitado. */
+  vectorStore?: IVectorStore;
+  /** Nome do sistema SOBERANO para a mensagem de system prompt */
+  systemName?: string;
+}
+
+export class ConversationManager extends IConversationManager {
+  private readonly logger: ILogger;
+  private readonly motor: IMotorCognitivo;
+  private readonly sessionManager: ISessionManager;
+  private readonly vectorStore?: IVectorStore;
+  private readonly systemName: string;
+
+  /**
+   * @param options - Options Object (ConversationManagerOptions).
+   *                  Apenas `logger`, `motor` e `sessionManager` são obrigatórios.
+   */
+  constructor(options: ConversationManagerOptions) {
+    super();
+    this.logger = options.logger;
+    this.motor = options.motor;
+    this.sessionManager = options.sessionManager;
+    this.vectorStore = options.vectorStore;
+    this.systemName = options.systemName ?? 'SOBERANO';
+  }
+
+  /**
+   * Gera um embedding heurístico simples a partir de um texto.
+   * Cada palavra contribui com uma dimensão baseada no hash do caractere.
+   * Isso permite buscas no VectorStore mesmo sem um provedor de embeddings real.
+   *
+   * @param text - Texto a ser convertido em vetor
+   * @returns Vetor numérico de 10 dimensões
+   */
+  private gerarEmbeddingHeuristico(text: string): number[] {
+    const words = text.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
+    const dimensions = 10;
+    const vector = new Array(dimensions).fill(0);
+
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i] as string;
+      for (let j = 0; j < word.length; j++) {
+        const dim = j % dimensions;
+        vector[dim] = (vector[dim] as number) + (word.charCodeAt(j) % 10) + 1;
+      }
+    }
+
+    // Normaliza para evitar valores muito grandes
+    const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
+    if (magnitude > 0) {
+      for (let i = 0; i < dimensions; i++) {
+        vector[i] = (vector[i] as number) / magnitude;
+      }
+    }
+
+    return vector;
+  }
+
+  /**
+   * Processa uma interação completa de conversa multi-turno com RAG.
+   *
+   * @param sessionId    - Identificador único da sessão.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @returns A resposta gerada pelo motor cognitivo.
+   */
+  async conversar(sessionId: string, inputUsuario: string): Promise<string> {
+    this.logger.info(
+      `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
+    );
+
+    // --- Passo 1: Guarda o input do usuário na sessão ---
+    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
+    this.logger.debug('[ConversationManager] User message saved to session.');
+
+    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
+    let documentosRecuperados: string[] = [];
+    if (this.vectorStore) {
+      try {
+        // Gera embedding heurístico para a consulta do usuário
+        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
+        this.logger.debug(
+          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
+        );
+
+        // Busca os 3 documentos mais similares
+        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
+
+        if (resultados.length > 0) {
+          documentosRecuperados = resultados.map((r) => {
+            const metadata = r.metadata as Record<string, unknown>;
+            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
+          });
+          this.logger.info(
+            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
+          );
+        } else {
+          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
+        }
+      } catch (ragError) {
+        this.logger.error(
+          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
+        );
+        throw ragError;
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
+    }
+
+    // --- Passo 3: Obtém o histórico completo da sessão ---
+    const historico = await this.sessionManager.obterHistorico(sessionId);
+    this.logger.debug(
+      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
+    );
+
+    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
+    let systemContent =
+      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
+      `Responda em Português do Brasil de forma clara e objetiva. ` +
+      `Mantenha o contexto da conversa ao responder.`;
+
+    if (documentosRecuperados.length > 0) {
+      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
+      systemContent +=
+        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
+        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
+        `mas não invente informações que não estejam presentes.`;
+    }
+
+    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
+
+    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
+    const historicoFiltrado = historico.filter(m => m.role !== 'system');
+
+    // --- Passo 5: Monta array final e envia ao motor cognitivo ---
+    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
+
+    this.logger.info(
+      `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +
+      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'}).`
+    );
+
+    const respostaMessage = await this.motor.gerarResposta(mensagensParaMotor);
+
+    // --- Passo 6: Guarda a resposta (assistant) na sessão ---
+    const respostaContent = respostaMessage.content;
+    const mensagemAssistant: ChatMessage = { role: 'assistant', content: respostaContent };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
+
+    this.logger.info(
+      `[ConversationManager] Assistant response saved to session "${sessionId}". ` +
+      `Response length: ${respostaContent.length} chars.`
+    );
+
+    // --- Passo 7: Retorna a resposta ---
+    return respostaContent;
   }
 }
 </file>
@@ -2253,6 +1975,380 @@ export class NativeHttpServer extends IHttpServer {
 }
 </file>
 
+<file path="src/infra/validateOllamaResponse.test.ts">
+/**
+ * @file validateOllamaResponse.test.ts
+ * @description Testes unitários isolados para a função pura validateOllamaResponse.
+ *              A função está exportada em OllamaProvider.ts e valida o schema
+ *              de respostas da API Ollama /api/chat em runtime.
+ *
+ *              Como executar:
+ *   node --experimental-transform-types --test src/infra/validateOllamaResponse.test.ts
+ */
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import { validateOllamaResponse } from './OllamaProvider.ts';
+
+describe('validateOllamaResponse (função pura) - /api/chat', () => {
+  describe('casos de erro — entrada nula/indefinida/não-objeto', () => {
+    it('deve lançar erro para null', () => {
+      assert.throws(
+        () => validateOllamaResponse(null),
+        /expected object/
+      );
+    });
+
+    it('deve lançar erro para undefined', () => {
+      assert.throws(
+        () => validateOllamaResponse(undefined),
+        /expected object/
+      );
+    });
+
+    it('deve lançar erro para número (não-objeto)', () => {
+      assert.throws(
+        () => validateOllamaResponse(42),
+        /expected object/
+      );
+    });
+
+    it('deve lançar erro para string (não-objeto)', () => {
+      assert.throws(
+        () => validateOllamaResponse('string'),
+        /expected object/
+      );
+    });
+  });
+
+  describe('casos de erro — objeto vazio', () => {
+    it('deve lançar erro para objeto vazio {}', () => {
+      assert.throws(
+        () => validateOllamaResponse({}),
+        /Field "model" missing or invalid/
+      );
+    });
+  });
+
+  describe('casos de erro — campos obrigatórios ausentes', () => {
+    const validBase = {
+      model: 'qwen2.5-coder:3b',
+      message: { role: 'assistant', content: 'some text' },
+      done: true,
+      created_at: '2024-01-01T00:00:00Z',
+    };
+
+    it('deve lançar erro quando message está ausente', () => {
+      const { message: _, ...withoutMessage } = validBase;
+      assert.throws(
+        () => validateOllamaResponse(withoutMessage),
+        /Field "message" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando done está ausente', () => {
+      const { done: _, ...withoutDone } = validBase;
+      assert.throws(
+        () => validateOllamaResponse(withoutDone),
+        /Field "done" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando model está ausente', () => {
+      const { model: _, ...withoutModel } = validBase;
+      assert.throws(
+        () => validateOllamaResponse(withoutModel),
+        /Field "model" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando created_at está ausente', () => {
+      const { created_at: _, ...withoutCreatedAt } = validBase;
+      assert.throws(
+        () => validateOllamaResponse(withoutCreatedAt),
+        /Field "created_at" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando message.role está ausente', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { content: 'text' },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "message.role" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando message.content está ausente', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { role: 'assistant' },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "message.content" missing or invalid/
+      );
+    });
+  });
+
+  describe('casos de erro — campos obrigatórios com tipos errados', () => {
+    it('deve lançar erro quando model não é string (number)', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 123,
+          message: { role: 'assistant', content: 'ok' },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "model" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando message não é objeto (boolean)', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 'x',
+          message: true,
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "message" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando done não é boolean (string)', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { role: 'assistant', content: 'ok' },
+          done: 'yes',
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "done" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando created_at não é string (number)', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { role: 'assistant', content: 'ok' },
+          done: true,
+          created_at: 12345,
+        }),
+        /Field "created_at" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando model é null', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: null,
+          message: { role: 'assistant', content: 'ok' },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "model" missing or invalid/
+      );
+    });
+
+    it('deve lançar erro quando message.content não é string (objeto vazio)', () => {
+      assert.throws(
+        () => validateOllamaResponse({
+          model: 'x',
+          message: { role: 'assistant', content: {} },
+          done: true,
+          created_at: '2024-01-01T00:00:00Z',
+        }),
+        /Field "message.content" missing or invalid/
+      );
+    });
+  });
+
+  describe('casos de sucesso', () => {
+    it('deve retornar o objeto validado para dados completos e corretos', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: 'Resposta válida do modelo.',
+        },
+        done: true,
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.strictEqual(result.model, input.model);
+      assert.strictEqual(result.created_at, input.created_at);
+      assert.strictEqual(result.message.role, input.message.role);
+      assert.strictEqual(result.message.content, input.message.content);
+      assert.strictEqual(result.done, input.done);
+    });
+
+    it('deve preservar campos opcionais (total_duration, etc.)', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: 'Resposta.',
+        },
+        done: true,
+        total_duration: 1_234_567_890,
+        load_duration: 100_000,
+        prompt_eval_count: 42,
+        prompt_eval_duration: 500_000,
+        eval_count: 128,
+        eval_duration: 2_000_000,
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.strictEqual(result.total_duration, input.total_duration);
+      assert.strictEqual(result.load_duration, input.load_duration);
+      assert.strictEqual(result.prompt_eval_count, input.prompt_eval_count);
+      assert.strictEqual(result.prompt_eval_duration, input.prompt_eval_duration);
+      assert.strictEqual(result.eval_count, input.eval_count);
+      assert.strictEqual(result.eval_duration, input.eval_duration);
+    });
+
+    it('deve ignorar campos opcionais ausentes (undefined)', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: 'Resposta.',
+        },
+        done: true,
+        // total_duration, eval_duration etc. ausentes
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.strictEqual(result.total_duration, undefined);
+      assert.strictEqual(result.eval_duration, undefined);
+    });
+
+    it('deve ignorar campos opcionais com tipos errados', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: 'Resposta.',
+        },
+        done: true,
+        total_duration: 'não-número', // tipo errado
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.strictEqual(result.total_duration, undefined);
+    });
+
+    it('deve preservar message.images quando presente', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: 'Resposta com imagem.',
+          images: ['base64data'],
+        },
+        done: true,
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.deepStrictEqual(result.message.images, ['base64data']);
+    });
+
+    it('NÃO deve falhar quando content é vazio mas tool_calls está presente', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              function: {
+                name: 'get_weather',
+                arguments: { city: 'São Paulo' },
+              },
+            },
+          ],
+        },
+        done: true,
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.strictEqual(result.message.content, '');
+      assert.ok(result.message.tool_calls, 'tool_calls deve estar presente');
+      assert.strictEqual(result.message.tool_calls!.length, 1);
+      assert.strictEqual(result.message.tool_calls![0]!.function.name, 'get_weather');
+      assert.deepStrictEqual(result.message.tool_calls![0]!.function.arguments, { city: 'São Paulo' });
+    });
+
+    it('deve lançar erro quando content é vazio e não há tool_calls', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: '',
+        },
+        done: true,
+      };
+
+      assert.throws(
+        () => validateOllamaResponse(input),
+        /empty and no tool_calls/
+      );
+    });
+
+    it('deve validar tool_calls com múltiplas ferramentas', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              function: {
+                name: 'get_weather',
+                arguments: { city: 'São Paulo' },
+              },
+            },
+            {
+              function: {
+                name: 'get_time',
+                arguments: { timezone: 'America/Sao_Paulo' },
+              },
+            },
+          ],
+        },
+        done: true,
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.strictEqual(result.message.tool_calls!.length, 2);
+      assert.strictEqual(result.message.tool_calls![0]!.function.name, 'get_weather');
+      assert.strictEqual(result.message.tool_calls![1]!.function.name, 'get_time');
+    });
+  });
+});
+</file>
+
 <file path="tsconfig.json">
 {
   "compilerOptions": {
@@ -2271,6 +2367,62 @@ export class NativeHttpServer extends IHttpServer {
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
+}
+</file>
+
+<file path="src/core/IMotorCognitivo.ts">
+/**
+ * @file IMotorCognitivo.ts
+ * @description Contrato de abstração para o motor cognitivo (LLM).
+ *              Módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas (DIP).
+ *              Classe abstrata em vez de interface para preservar
+ *              a estrutura em runtime com --experimental-transform-types.
+ */
+
+/**
+ * Representa uma mensagem no formato de chat multi-turno.
+ * Suporta os papéis: system (instrução de sistema), user (usuário),
+ * assistant (modelo), tool (resultado de ferramenta).
+ */
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  /** Chamadas de ferramenta emitidas pelo assistant (tool_calls do Ollama/OpenAI). */
+  tool_calls?: Array<{ function: { name: string; arguments: Record<string, any> } }>;
+  /** ID de correlação para tool call (formato OpenAI/Ollama compatível). */
+  tool_call_id?: string;
+}
+
+/**
+ * Definição de uma ferramenta (function calling) para envio ao motor cognitivo.
+ * Segue o formato esperado pelo Ollama na propriedade `tools` da requisição.
+ */
+export interface IToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, any>;
+  };
+}
+
+export abstract class IMotorCognitivo {
+  /**
+   * Define o sinal de aborto para cancelamento de operações pendentes.
+   * @param signal - Sinal AbortSignal para cancelamento gracioso.
+   */
+  abstract setAbortSignal(signal: AbortSignal): void;
+
+  /**
+   * Envia uma lista de mensagens no formato chat ao motor cognitivo
+   * e retorna a resposta gerada pelo modelo.
+   * @param mensagens - Array de mensagens no formato ChatMessage[].
+   * @param tools - Array opcional de definições de ferramentas (tool calling).
+   * @returns A mensagem completa de resposta (ChatMessage), podendo conter
+   *          tool_calls se o modelo decidir chamar uma ferramenta.
+   */
+  abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
 }
 </file>
 
@@ -2680,6 +2832,33 @@ describe('CircuitBreaker', () => {
 });
 </file>
 
+<file path="package.json">
+{
+  "name": "soberano",
+  "version": "0.3.0",
+  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-transform-types src/main.ts",
+    "test": "node --experimental-transform-types --test src/infra/*.test.ts",
+    "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
+    "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
+    "test:file": "node --experimental-transform-types src/infra/FileSensor.test.ts",
+    "test:http": "node --experimental-transform-types --test src/infra/NativeHttpServer.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "soberano",
+    "llm",
+    "ollama"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
+</file>
+
 <file path="src/infra/OllamaProvider.test.ts">
 /**
  * @file OllamaProvider.test.ts
@@ -2791,8 +2970,9 @@ describe('OllamaProvider', () => {
       assert.deepStrictEqual(sentBody.messages, [{ role: 'user', content: 'Prompt de teste' }]);
       assert.strictEqual(sentBody.stream, false);
 
-      // Valida que a resposta foi processada corretamente
-      assert.strictEqual(resposta, 'Resposta de teste do SOBERANO.');
+      // Valida que a resposta foi processada corretamente (agora retorna ChatMessage)
+      assert.strictEqual(resposta.role, 'assistant');
+      assert.strictEqual(resposta.content, 'Resposta de teste do SOBERANO.');
 
       // Valida que o logger registrou a operação
       assert.ok(
@@ -2889,33 +3069,6 @@ describe('OllamaProvider', () => {
 });
 </file>
 
-<file path="package.json">
-{
-  "name": "soberano",
-  "version": "0.3.0",
-  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
-  "type": "module",
-  "scripts": {
-    "start": "node --experimental-transform-types src/main.ts",
-    "test": "node --experimental-transform-types --test src/infra/*.test.ts",
-    "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
-    "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
-    "test:file": "node --experimental-transform-types src/infra/FileSensor.test.ts",
-    "test:http": "node --experimental-transform-types --test src/infra/NativeHttpServer.test.ts",
-    "typecheck": "tsc --noEmit"
-  },
-  "keywords": [
-    "soberano",
-    "llm",
-    "ollama"
-  ],
-  "license": "MIT",
-  "devDependencies": {
-    "typescript": "^6.0.3"
-  }
-}
-</file>
-
 <file path="src/infra/OllamaProvider.ts">
 /**
  * @file OllamaProvider.ts
@@ -2927,10 +3080,11 @@ describe('OllamaProvider', () => {
  *              - Aceita AbortSignal externo para graceful shutdown.
  *              - Validação rigorosa de schema da resposta.
  *              - Logger injetado via construtor.
+ *              - Suporte a Tool Calling (Fase 6).
  */
 
 import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
-import type { ChatMessage } from '../core/IMotorCognitivo.ts';
+import type { ChatMessage, IToolDefinition } from '../core/IMotorCognitivo.ts';
 import { ILogger } from '../core/ILogger.ts';
 import { ICircuitBreaker } from '../core/ICircuitBreaker.ts';
 
@@ -2945,9 +3099,10 @@ export interface OllamaConfig {
 }
 
 export interface OllamaChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   images?: string[];
+  tool_calls?: Array<{ function: { name: string; arguments: Record<string, any> } }>;
 }
 
 export interface OllamaChatResponse {
@@ -2966,6 +3121,7 @@ export interface OllamaChatResponse {
 /**
  * Valida em runtime se um valor desconhecido é um OllamaChatResponse válido.
  * Lança erro descritivo se algum campo obrigatório estiver ausente ou com tipo incorreto.
+ * Agora suporta tool_calls: message.content pode ser string vazia se tool_calls estiver presente.
  *
  * @param data - Dado desconhecido a ser validado
  * @returns O dado tipado como OllamaChatResponse
@@ -3007,25 +3163,62 @@ export function validateOllamaResponse(data: unknown): OllamaChatResponse {
 
   const messageRecord = record.message as Record<string, unknown>;
 
-  if (typeof messageRecord.role !== 'string' || !['system', 'user', 'assistant'].includes(messageRecord.role as string)) {
+  if (typeof messageRecord.role !== 'string' || !['system', 'user', 'assistant', 'tool'].includes(messageRecord.role as string)) {
     throw new Error(
-      `[OllamaProvider] Field "message.role" missing or invalid: expected 'system' | 'user' | 'assistant', received ${typeof messageRecord.role}`
+      `[OllamaProvider] Field "message.role" missing or invalid: expected 'system' | 'user' | 'assistant' | 'tool', received ${typeof messageRecord.role}`
     );
   }
 
+  // content pode ser string vazia desde que tool_calls esteja presente
+  const hasToolCalls = Array.isArray(messageRecord.tool_calls);
   if (typeof messageRecord.content !== 'string') {
     throw new Error(
       `[OllamaProvider] Field "message.content" missing or invalid: expected string, received ${typeof messageRecord.content}`
     );
   }
 
+  if (messageRecord.content === '' && !hasToolCalls) {
+    throw new Error(
+      `[OllamaProvider] Field "message.content" is empty and no tool_calls provided`
+    );
+  }
+
+  // Valida tool_calls se presente
+  let validatedToolCalls: Array<{ function: { name: string; arguments: Record<string, any> } }> | undefined;
+  if (hasToolCalls) {
+    validatedToolCalls = [];
+    for (const tc of messageRecord.tool_calls as Array<unknown>) {
+      if (tc === null || tc === undefined || typeof tc !== 'object') {
+        throw new Error(`[OllamaProvider] Invalid tool_call entry: expected object`);
+      }
+      const tcRecord = tc as Record<string, unknown>;
+      if (tcRecord.function === null || tcRecord.function === undefined || typeof tcRecord.function !== 'object') {
+        throw new Error(`[OllamaProvider] Invalid tool_call.function: expected object`);
+      }
+      const fnRecord = tcRecord.function as Record<string, unknown>;
+      if (typeof fnRecord.name !== 'string') {
+        throw new Error(`[OllamaProvider] Invalid tool_call.function.name: expected string`);
+      }
+      if (typeof fnRecord.arguments !== 'object' || fnRecord.arguments === null) {
+        throw new Error(`[OllamaProvider] Invalid tool_call.function.arguments: expected object`);
+      }
+      validatedToolCalls.push({
+        function: {
+          name: fnRecord.name,
+          arguments: fnRecord.arguments as Record<string, any>,
+        },
+      });
+    }
+  }
+
   return {
     model: record.model,
     created_at: record.created_at,
     message: {
-      role: messageRecord.role as 'system' | 'user' | 'assistant',
+      role: messageRecord.role as 'system' | 'user' | 'assistant' | 'tool',
       content: messageRecord.content,
       images: Array.isArray(messageRecord.images) ? (messageRecord.images as string[]) : undefined,
+      tool_calls: validatedToolCalls,
     },
     done: record.done,
     total_duration: typeof record.total_duration === 'number' ? record.total_duration : undefined,
@@ -3132,19 +3325,26 @@ export class OllamaProvider extends IMotorCognitivo {
    * Utiliza exclusivamente o fetch nativo do Node.js (sem dependências externas).
    * Implementa retry automático (máximo configurável) para erros de conexão.
    * Implementa timeout via AbortController em cada tentativa.
+   * Suporta Tool Calling opcional (Fase 6).
    *
    * @param mensagens - Array de mensagens no formato ChatMessage[].
-   * @returns A resposta gerada pelo modelo (content da mensagem assistant).
+   * @param tools - Array opcional de definições de ferramentas para tool calling.
+   * @returns A mensagem completa de resposta (ChatMessage).
    * @throws {Error} Se após todas as tentativas a comunicação falhar.
    */
-  async gerarResposta(mensagens: ChatMessage[]): Promise<string> {
+  async gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage> {
     const url = `${this.baseUrl}/api/chat`;
 
-    const payload = {
+    const payload: Record<string, any> = {
       model: this.model,
       messages: mensagens,
       stream: false,
     };
+
+    // Inclui tools no payload se for fornecido
+    if (tools && tools.length > 0) {
+      payload.tools = tools;
+    }
 
     let lastError: Error | null = null;
 
@@ -3157,7 +3357,8 @@ export class OllamaProvider extends IMotorCognitivo {
 
       try {
         this.logger.info(
-          `[OllamaProvider] Attempt ${attempt}/${this.maxRetries} - Sending messages to model "${this.model}"`
+          `[OllamaProvider] Attempt ${attempt}/${this.maxRetries} - Sending messages to model "${this.model}"` +
+          (tools ? ` with ${tools.length} tool(s) defined` : '')
         );
 
         // Configura timeout para esta tentativa
@@ -3215,7 +3416,14 @@ export class OllamaProvider extends IMotorCognitivo {
 
         const data: OllamaChatResponse = await this.circuitBreaker.execute(executeFetch);
 
-        return data.message.content;
+        // Converte a resposta validada para ChatMessage
+        const resposta: ChatMessage = {
+          role: data.message.role,
+          content: data.message.content,
+          tool_calls: data.message.tool_calls,
+        };
+
+        return resposta;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
@@ -3433,7 +3641,7 @@ declare module 'node:assert' {
 <file path="README.md">
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.5.0 — Fase 5 (Gerenciamento de Contexto - Sessões + RAG)
+**Versão:** 0.6.0 — Fase 6 (Sistema de Agentes e Ferramentas)
 
 ## Stack
 
@@ -3452,14 +3660,15 @@ declare module 'node:assert' {
 src/
 ├── core/              # Contratos e lógica de negócio pura ("A Alma")
 │   ├── ILogger.ts             # Abstração de logging + LogLevel enum
-│   ├── IMotorCognitivo.ts     # Abstração do motor cognitivo (LLM) + ChatMessage
+│   ├── IMotorCognitivo.ts     # Abstração do motor cognitivo (LLM) + ChatMessage + IToolDefinition
 │   ├── ICircuitBreaker.ts     # Abstração do Circuit Breaker
 │   ├── IHttpServer.ts         # Abstração do servidor HTTP
 │   ├── ISensor.ts             # Abstração genérica de sensor (T)
 │   ├── IEmbeddings.ts         # Contrato para geração de embeddings vetoriais
 │   ├── IVectorStore.ts        # Contrato para armazenamento e busca vetorial
 │   ├── ISessionManager.ts     # Contrato para gestão de sessões de conversa
-│   └── IConversationManager.ts # Contrato do Maestro (orquestração multi-turno)
+│   ├── IConversationManager.ts # Contrato do Maestro (orquestração multi-turno)
+│   └── ITool.ts                # Contrato genérico de ferramenta (Tool Calling)
 ├── infra/             # Implementações técnicas ("Os Músculos")
 │   ├── ConsoleLogger.ts            # Logger concreto (stdout)
 │   ├── ConsoleLogger.test.ts
@@ -3496,12 +3705,12 @@ src/
 | Logging estruturado com níveis (DEBUG, INFO, WARN, ERROR) | ✅ |
 | Filtragem por nível mínimo de log | ✅ |
 | Comunicação com Ollama via REST (fetch nativo) — endpoint /api/chat | ✅ |
-| Interface ChatMessage (role: system/user/assistant, content) | ✅ |
+| Interface ChatMessage (role: system/user/assistant/tool, content, tool_calls, tool_call_id) | ✅ |
 | Retry automático com backoff progressivo | ✅ |
 | Circuit Breaker (CLOSED / OPEN / HALF_OPEN) | ✅ |
 | Timeout global (120s) via `AbortSignal.timeout` | ✅ |
 | Graceful shutdown (SIGINT/SIGTERM) | ✅ |
-| Validação de schema em runtime da resposta da API | ✅ |
+| Validação de schema em runtime da resposta da API (incluindo tool_calls) | ✅ |
 | Testes unitários com `node:test` e `mock.method` | ✅ |
 | Sensor de arquivo (FileSensor) com `node:fs/promises` | ✅ Estabilizada |
 | Contrato genérico ISensor\<T\> (preparação para novos sensores) | ✅ |
@@ -3515,6 +3724,11 @@ src/
 | ConversationManager — pipeline: salva → RAG → funde contexto → envia → salva resposta | ✅ |
 | Embedding Heurístico — vetor de 10 dimensões sem dependência externa | ✅ |
 | Demonstração integrada no main.ts (2 turnos de conversa com sessão) | ✅ |
+| Interface IToolDefinition para definição de ferramentas no request /api/chat | ✅ |
+| Contrato ITool — interface genérica para ferramentas executáveis (getDefinition, execute) | ✅ |
+| OllamaProvider envia tools[] no payload de /api/chat quando fornecido | ✅ |
+| Retorno de ChatMessage completo de gerarResposta (permite processar tool_calls) | ✅ |
+| validação de respostas com tool_calls (content vazio permitido se houver tool_calls) | ✅ |
 
 ## Como Executar
 
@@ -3546,7 +3760,7 @@ npm run typecheck
 | **3** | Memória — Embeddings + Vector Store (RAG Tradicional) | ✅ **Concluída** |
 | **4** | Qualidade de Teste e Determinismo — timeouts mínimos, mock.fn, assertions de retry | ✅ **Concluída** |
 | **5** | Gerenciamento de contexto e sessões multi-turno | ✅ **Concluída** |
-| **6** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
+| **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
 | **7** | Web UI (React) + WebSocket | ⏳ Planejada |
 
 ## Contratos do Core
@@ -3567,14 +3781,27 @@ abstract class ILogger {
 ### `IMotorCognitivo`
 
 ```typescript
+interface IToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, any>;
+  };
+}
+
 interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  tool_calls?: Array<{
+    function: { name: string; arguments: Record<string, any> };
+  }>;
+  tool_call_id?: string;
 }
 
 abstract class IMotorCognitivo {
   abstract setAbortSignal(signal: AbortSignal): void;
-  abstract gerarResposta(mensagens: ChatMessage[]): Promise<string>;
+  abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
 }
 ```
 
@@ -3596,6 +3823,18 @@ abstract class ICircuitBreaker {
 ```typescript
 abstract class ISensor<T> {
   abstract ler(target: string, signal?: AbortSignal): Promise<T>;
+}
+```
+
+### `ITool`
+
+```typescript
+abstract class ITool {
+  abstract readonly name: string;
+  abstract readonly description: string;
+  abstract readonly parametersSchema: Record<string, any>;
+  abstract execute(args: Record<string, any>): Promise<any>;
+  abstract getDefinition(): IToolDefinition;
 }
 ```
 
@@ -3763,10 +4002,10 @@ async function bootstrap(): Promise<void> {
     logger.info('[main] Sending messages to cognitive engine...');
     logger.info('[main] Messages: ' + JSON.stringify(mensagens));
 
-    const resposta = await motor.gerarResposta(mensagens);
+    const respostaMessage = await motor.gerarResposta(mensagens);
 
     logger.info('[main] === RESPOSTA DO MOTOR COGNITIVO ===');
-    logger.info(resposta);
+    logger.info(respostaMessage.content);
     logger.info('[main] Test completed successfully.');
 
     // TESTE DO FILE SENSOR (Fase 2)

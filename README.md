@@ -88,6 +88,12 @@ src/
 | OllamaProvider envia tools[] no payload de /api/chat quando fornecido | ✅ |
 | Retorno de ChatMessage completo de gerarResposta (permite processar tool_calls) | ✅ |
 | validação de respostas com tool_calls (content vazio permitido se houver tool_calls) | ✅ |
+| Contrato IToolRegistry — registro e consulta de ferramentas | ✅ |
+| ToolRegistry — implementação concreta com Map<string, ITool> | ✅ |
+| SystemTimeTool — ferramenta concreta que retorna data/hora ISO 8601 | ✅ |
+| ReAct/Tool Calling Loop no ConversationManager (até 3 iterações, segurança anti-loop) | ✅ |
+| Detecção e execução de tool_calls com guarda de contexto no SessionManager | ✅ |
+| Tratamento de erros: ferramenta não encontrada, falha de execução, sem registry | ✅ |
 
 ## Como Executar
 
@@ -182,6 +188,16 @@ abstract class ICircuitBreaker {
 ```typescript
 abstract class ISensor<T> {
   abstract ler(target: string, signal?: AbortSignal): Promise<T>;
+}
+```
+
+### `IToolRegistry`
+
+```typescript
+abstract class IToolRegistry {
+  abstract registrar(tool: ITool): void;
+  abstract obter(nome: string): ITool | undefined;
+  abstract obterTodas(): ITool[];
 }
 ```
 

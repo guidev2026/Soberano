@@ -31,6 +31,9 @@ import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
 import { ISessionManager } from './core/ISessionManager.ts';
 import { ConversationManager } from './infra/ConversationManager.ts';
 import { IConversationManager } from './core/IConversationManager.ts';
+import { ToolRegistry } from './infra/ToolRegistry.ts';
+import { IToolRegistry } from './core/IToolRegistry.ts';
+import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
 
 let isShuttingDown = false;
 
@@ -176,11 +179,18 @@ async function bootstrap(): Promise<void> {
       maxMessagesPerSession: 20,
     });
 
+    // --- Tool Registry (Fase 6) ---
+    const toolRegistry: IToolRegistry = new ToolRegistry({ logger });
+    const systemTimeTool = new SystemTimeTool();
+    toolRegistry.registrar(systemTimeTool);
+    logger.info('[main] SystemTimeTool registered in ToolRegistry.');
+
     const conversationManager: IConversationManager = new ConversationManager({
       logger,
       motor,
       sessionManager,
       vectorStore,
+      toolRegistry,
     });
 
     const sessionId = 'demo-sprint-5.3';
@@ -198,6 +208,14 @@ async function bootstrap(): Promise<void> {
     const resposta2 = await conversationManager.conversar(sessionId, input2);
     logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 2 ===');
     logger.info(resposta2);
+
+    // Turno 3 - Força o uso da ferramenta get_system_time
+    const input3 = 'Que horas sao exatamente agora?';
+    logger.info('[main] CONVERSATION - Turno 3/3 (Tool Calling): "' + input3 + '"');
+    const resposta3 = await conversationManager.conversar(sessionId, input3);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 3 (Tool Calling) ===');
+    logger.info(resposta3);
+    logger.info('[main] === Tool Call test completed successfully. ===');
 
     // Verificacao da memoria de sessao
     const historicoFinal = await sessionManager.obterHistorico(sessionId);
