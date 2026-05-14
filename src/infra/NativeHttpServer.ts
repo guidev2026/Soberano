@@ -28,6 +28,13 @@ export class NativeHttpServer extends IHttpServer {
   private readonly logger: ILogger;
   private readonly abortSignal?: AbortSignal;
   private abortListener: (() => void) | null = null;
+  private actualPort: number | null = null;
+  /** Flag de idempotência para stop(). Evita múltiplas chamadas simultâneas a close(). */
+  private stopping: boolean = false;
+  /** Flag que indica se a Promise de start() já foi resolvida.
+   *  Quando false, erros do server rejeitam a Promise.
+   *  Quando true, erros são apenas logados (runtime errors). */
+  private startResolved: boolean = false;
 
   constructor(options: NativeHttpServerOptions) {
     super();
@@ -35,8 +42,18 @@ export class NativeHttpServer extends IHttpServer {
     this.abortSignal = options.abortSignal;
   }
 
+  /**
+   * Retorna a porta real em que o servidor está escutando,
+   * ou null se o servidor não foi iniciado.
+   */
+  get port(): number | null {
+    return this.actualPort;
+  }
+
   async start(port: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      this.startResolved = false;
+
       this.server = createServer((req, res) => {
         // Rota de health-check
         if (req.url === '/healthz' && req.method === 'GET') {
@@ -61,37 +78,63 @@ export class NativeHttpServer extends IHttpServer {
         this.abortSignal.addEventListener('abort', this.abortListener);
       }
 
-      this.server.listen(port, () => {
-        this.logger.info(`[NativeHttpServer] HTTP server listening on port ${port}`);
-        resolve();
+      // Listener de erro do server.
+      // Se a Promise ainda não foi resolvida, rejeita (erro de start).
+      // Se já foi resolvida, apenas loga (erro de runtime).
+      this.server.on('error', (err: unknown) => {
+        if (!this.startResolved) {
+          reject(err);
+        } else {
+          this.logger.error(`[NativeHttpServer] Runtime error: ${err instanceof Error ? err.message : String(err)}`);
+        }
       });
 
-      // Se o listen falhar (porta ocupada, etc.), rejeita a promise
-      this.server.on('error', reject);
+      this.server.listen(port, () => {
+        const addr = this.server!.address();
+        this.actualPort = typeof addr === 'object' && addr ? (addr as { port: number }).port : port;
+        this.logger.info(`[NativeHttpServer] HTTP server listening on port ${this.actualPort}`);
+        this.startResolved = true;
+        resolve();
+      });
     });
   }
 
   async stop(): Promise<void> {
+    // Idempotente: se já está parando ou servidor é null, resolve imediatamente
+    if (this.stopping || !this.server) {
+      return;
+    }
+
+    this.stopping = true;
+
+    // Remove o listener de abort para não causar loop
+    if (this.abortSignal && this.abortListener) {
+      this.abortSignal.removeEventListener('abort', this.abortListener);
+      this.abortListener = null;
+    }
+
     return new Promise<void>((resolve, reject) => {
-      if (!this.server) {
-        resolve();
-        return;
-      }
-
-      // Remove o listener de abort para não causar loop
-      if (this.abortSignal && this.abortListener) {
-        this.abortSignal.removeEventListener('abort', this.abortListener);
-        this.abortListener = null;
-      }
-
-      this.server.close((err) => {
+      this.server!.close((err) => {
         if (err) {
+          // Se o servidor já não estava ouvindo (ENOTCONN), trata como sucesso
+          if ((err as Error & { code?: string }).code === 'ENOTCONN') {
+            this.logger.info('[NativeHttpServer] Server was already not listening.');
+            this.server = null;
+            this.actualPort = null;
+            this.stopping = false;
+            resolve();
+            return;
+          }
+
           this.logger.error(`[NativeHttpServer] Error closing server: ${err.message}`);
+          this.stopping = false;
           reject(err);
           return;
         }
         this.logger.info('[NativeHttpServer] Server closed successfully.');
         this.server = null;
+        this.actualPort = null;
+        this.stopping = false;
         resolve();
       });
     });

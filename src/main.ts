@@ -1,6 +1,6 @@
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Fase 2 (Sensores).
+ * @description Ponto de entrada do sistema SOBERANO - Fase 3 (Memória - RAG Tradicional).
  *              Realiza o wiring manual (Injeção de Dependência) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
@@ -10,6 +10,7 @@
  *              - Inicializa NativeHttpServer para servir rota /healthz
  *              - Executa o teste inicial de comunicação com o motor cognitivo
  *              - Executa o teste do FileSensor (leitura de arquivo local)
+ *              - Demonstra o MockVectorStore (Memória Vetorial - Fase 3)
  */
 
 import { OllamaProvider } from './infra/OllamaProvider.ts';
@@ -21,6 +22,8 @@ import { NativeHttpServer } from './infra/NativeHttpServer.ts';
 import { IHttpServer } from './core/IHttpServer.ts';
 import { FileSensor } from './infra/FileSensor.ts';
 import { ISensor } from './core/ISensor.ts';
+import { MockVectorStore } from './infra/MockVectorStore.ts';
+import { IVectorStore } from './core/IVectorStore.ts';
 
 /**
  * Sinalizador de encerramento usado pelas rotinas de graceful shutdown.
@@ -39,10 +42,12 @@ let isShuttingDown = false;
  *
  * @param logger            - Instância de ILogger para logging
  * @param shutdownController - AbortController global para cancelar operações
+ * @param httpServer        - Servidor HTTP para parar durante o shutdown
  */
 function registerShutdownHandlers(
   logger: ILogger,
-  shutdownController: AbortController
+  shutdownController: AbortController,
+  httpServer: IHttpServer
 ): void {
   const shutdown = async (signal: string) => {
     if (isShuttingDown) {
@@ -63,13 +68,18 @@ function registerShutdownHandlers(
     process.removeAllListeners('SIGINT');
     process.removeAllListeners('SIGTERM');
 
-    // Abort all in-flight operations (OllamaProvider fetch)
+    // 1. Aborta todas as operações em andamento (OllamaProvider fetch)
     shutdownController.abort();
 
-    // 5s timer stays active during cleanup.
-    // If future async cleanup operations lock up,
-    // the timer fires and forces process.exit(1).
+    // 2. Após o abort ter sido propagado, para o servidor HTTP
+    try {
+      await httpServer.stop();
+      logger.info('[main] HTTP server stopped.');
+    } catch (err) {
+      logger.error(`[main] Error stopping HTTP server: ${err}`);
+    }
 
+    // 3. Cleanup concluído
     clearTimeout(forceExitTimer);
     logger.info('[main] Resources released. Goodbye, SOBERANO.');
     process.exit(0);
@@ -87,16 +97,13 @@ async function bootstrap(): Promise<void> {
 
   logger.info(
     '╔══════════════════════════════════════════════════╗\n' +
-    '║       SOBERANO - Fase 2 (Sensores)               ║\n' +
+    '║       SOBERANO - Fase 3 (Memória & Comunicação)  ║\n' +
     '║       Inicializando sistemas...                  ║\n' +
     '╚══════════════════════════════════════════════════╝'
   );
 
   // --- ABORT CONTROLLER GLOBAL PARA GRACEFUL SHUTDOWN ---
   const shutdownController = new AbortController();
-
-  // --- GRACEFUL SHUTDOWN ---
-  registerShutdownHandlers(logger, shutdownController);
 
   // --- CIRCUIT BREAKER ---
   const circuitBreaker = new CircuitBreaker({ logger });
@@ -106,6 +113,9 @@ async function bootstrap(): Promise<void> {
     logger,
     abortSignal: shutdownController.signal,
   });
+
+  // --- GRACEFUL SHUTDOWN (após httpServer criado) ---
+  registerShutdownHandlers(logger, shutdownController, httpServer);
 
   // --- GLOBAL TIMEOUT (fallback para evitar travamento silencioso) ---
   const globalTimeoutSignal = AbortSignal.timeout(120_000);
@@ -125,7 +135,12 @@ async function bootstrap(): Promise<void> {
 
   // --- INICIALIZAÇÃO DO SERVIDOR HTTP ---
   // Aceita porta via 3º argumento da CLI: npm start -- <caminho> <porta>
-  const HTTP_PORT = Number(process.argv[3]) || 3000;
+  const portArg = process.argv[3];
+  const HTTP_PORT = typeof portArg === 'string' ? parseInt(portArg, 10) : NaN;
+  if (Number.isNaN(HTTP_PORT)) {
+    logger.error(`[main] Invalid port argument "${portArg ?? '(undefined)'}". Porta inválida. Encerrando.`);
+    process.exit(1);
+  }
   await httpServer.start(HTTP_PORT);
 
   const promptTeste = 'Olá, Soberano. Confirme que seus sistemas base estão online.';
@@ -174,6 +189,33 @@ async function bootstrap(): Promise<void> {
     } else {
       logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo> [porta]');
     }
+
+    // --- DEMONSTRAÇÃO DO MOCK VECTOR STORE (Fase 3 - Memória Vetorial) ---
+    logger.info(
+      '╔══════════════════════════════════════════════════╗\n' +
+      '║       MOCK VECTOR STORE - Demonstração           ║\n' +
+      '╚══════════════════════════════════════════════════╝'
+    );
+
+    const vectorStore: IVectorStore = new MockVectorStore({ logger });
+
+    // Adiciona 3 vetores de exemplo com metadados
+    await vectorStore.adicionar('doc-1', [0.1, 0.2, 0.3], { texto: 'Gato felino mamífero', fonte: 'enciclopedia' });
+    await vectorStore.adicionar('doc-2', [0.4, 0.5, 0.6], { texto: 'Cachorro canino mamífero', fonte: 'enciclopedia' });
+    await vectorStore.adicionar('doc-3', [0.7, 0.8, 0.9], { texto: 'Águia ave rapina', fonte: 'enciclopedia' });
+
+    logger.info('[main] 3 vectors added to MockVectorStore.');
+
+    // Busca similar ao vetor de doc-2
+    const queryVector = [0.35, 0.45, 0.55];
+    const similar = await vectorStore.buscarSimilares(queryVector, 2);
+
+    logger.info(`[main] Top ${similar.length} similar vectors to query [0.35, 0.45, 0.55]:`);
+    for (const result of similar) {
+      logger.info(`  -> id="${result.id}", score=${result.score.toFixed(4)}, texto="${result.metadata.texto}"`);
+    }
+
+    logger.info('[main] MockVectorStore demonstration completed successfully.');
   } catch (error) {
     // Se o erro foi causado pelo shutdown, não é uma falha real
     if (shutdownController.signal.aborted) {

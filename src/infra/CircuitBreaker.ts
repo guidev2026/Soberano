@@ -27,6 +27,7 @@ export class CircuitBreaker extends ICircuitBreaker {
   private readonly failureThreshold: number;
   private readonly openTimeoutMs: number;
   private readonly logger: ILogger;
+  private isProbeInProgress: boolean = false;
 
   /**
    * @param options - Objeto de configuração seguindo o padrão Options Object.
@@ -39,17 +40,16 @@ export class CircuitBreaker extends ICircuitBreaker {
   }
 
   get state(): CircuitState {
-    // Verifica se o timeout de OPEN expirou para transitar para HALF_OPEN
-    if (this._state === CircuitState.OPEN && this.hasTimeoutElapsed()) {
-      this.transitionTo(CircuitState.HALF_OPEN);
-    }
+    // Getter puro: retorna o estado interno sem efeitos colaterais.
+    // NÃO realiza transições automáticas aqui.
     return this._state;
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
-    const currentState = this.state; // aciona transição OPEN -> HALF_OPEN se necessário
+    // Verifica transições de estado antes de qualquer lógica de decisão
+    this.checkStateTransitions();
 
-    if (currentState === CircuitState.OPEN) {
+    if (this._state === CircuitState.OPEN) {
       this.logger.warn(
         `[CircuitBreaker] Circuit is OPEN. Request rejected immediately.`
       );
@@ -58,7 +58,17 @@ export class CircuitBreaker extends ICircuitBreaker {
       );
     }
 
-    if (currentState === CircuitState.HALF_OPEN) {
+    if (this._state === CircuitState.HALF_OPEN) {
+      // Proteção contra concorrência: apenas a primeira chamada em HALF_OPEN é permitida
+      if (this.isProbeInProgress) {
+        this.logger.warn(
+          `[CircuitBreaker] Probe already in progress. Concurrent HALF_OPEN request rejected.`
+        );
+        throw new Error(
+          '[CircuitBreaker] Circuit is open. Operation not allowed at this time.'
+        );
+      }
+      this.isProbeInProgress = true;
       this.logger.info(
         `[CircuitBreaker] Circuit is HALF_OPEN. Allowing test request.`
       );
@@ -88,6 +98,10 @@ export class CircuitBreaker extends ICircuitBreaker {
     ) {
       this.transitionTo(CircuitState.OPEN);
     } else if (this._state === CircuitState.HALF_OPEN) {
+      // Atualiza lastFailureTime novamente mesmo na transição HALF_OPEN -> OPEN
+      // para garantir que a nova janela de timeout seja respeitada integralmente.
+      this.lastFailureTime = Date.now();
+      this.isProbeInProgress = false;
       this.transitionTo(CircuitState.OPEN);
     }
   }
@@ -95,11 +109,20 @@ export class CircuitBreaker extends ICircuitBreaker {
   reset(): void {
     this.failureCount = 0;
     this.lastFailureTime = 0;
+    this.isProbeInProgress = false;
     this.transitionTo(CircuitState.CLOSED);
+  }
+
+  private checkStateTransitions(): void {
+    // Transição OPEN -> HALF_OPEN se o timeout expirou
+    if (this._state === CircuitState.OPEN && this.hasTimeoutElapsed()) {
+      this.transitionTo(CircuitState.HALF_OPEN);
+    }
   }
 
   private recordSuccess(): void {
     if (this._state === CircuitState.HALF_OPEN) {
+      this.isProbeInProgress = false;
       this.logger.info(
         `[CircuitBreaker] Test request succeeded. Returning to CLOSED state.`
       );

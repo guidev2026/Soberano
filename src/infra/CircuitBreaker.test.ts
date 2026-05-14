@@ -112,33 +112,40 @@ describe('CircuitBreaker', () => {
   describe('Transição OPEN -> HALF_OPEN', () => {
     it('deve transitar para HALF_OPEN após o timeout expirar', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 }); // timeout de 50ms
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 1 }); // timeout mínimo
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
 
       // Aguarda o timeout expirar
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      await new Promise((resolve) => setTimeout(resolve, 5));
 
-      // Ao acessar .state, deve transitar para HALF_OPEN
-      assert.strictEqual(cb.state, CircuitState.HALF_OPEN);
+      // Executa uma função de sucesso - isso aciona checkStateTransitions() internamente,
+      // que deve transitar de OPEN para HALF_OPEN antes da lógica de decisão.
+      const successFn = () => Promise.resolve('recuperado');
+      const result = await cb.execute(successFn);
+      assert.strictEqual(result, 'recuperado');
+
+      // Após sucesso em HALF_OPEN, deve voltar para CLOSED
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
     });
   });
 
   describe('Transição HALF_OPEN -> CLOSED', () => {
     it('deve retornar para CLOSED após sucesso em HALF_OPEN', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 });
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 1 });
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
 
       // Aguarda timeout para HALF_OPEN
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      await new Promise((resolve) => setTimeout(resolve, 5));
 
-      // Executa com sucesso: deve transitar para CLOSED
+      // Executa com sucesso: checkStateTransitions() transita para HALF_OPEN,
+      // depois a função executa com sucesso e volta para CLOSED
       const successFn = () => Promise.resolve('recuperado');
       const result = await cb.execute(successFn);
       assert.strictEqual(result, 'recuperado');
@@ -149,18 +156,64 @@ describe('CircuitBreaker', () => {
   describe('Transição HALF_OPEN -> OPEN', () => {
     it('deve voltar para OPEN após falha em HALF_OPEN', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 });
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 1 });
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
 
       // Aguarda timeout para HALF_OPEN
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      await new Promise((resolve) => setTimeout(resolve, 5));
 
-      // Falha em HALF_OPEN: volta para OPEN
+      // Falha em HALF_OPEN: checkStateTransitions() transita para HALF_OPEN,
+      // a função falha e volta para OPEN
       await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
+    });
+  });
+
+  describe('Proteção de concorrência em HALF_OPEN', () => {
+    it('deve rejeitar chamadas concorrentes quando probe já está em andamento', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 1 });
+
+      // Abre o circuito
+      const failingFn = () => Promise.reject(new Error('Falha'));
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+
+      // Aguarda timeout para HALF_OPEN
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      // Cria uma função que nunca resolve (simula probe em andamento)
+      let resolveProbe: (value: string) => void = () => {};
+      const probePromise = new Promise<string>((resolve) => {
+        resolveProbe = resolve;
+      });
+      const slowFn = () => probePromise;
+
+      // Inicia a primeira chamada (probe) - não await aqui, queremos concorrência
+      const firstCall = cb.execute(slowFn);
+
+      // A segunda chamada concorrente deve ser rejeitada
+      const successFn = () => Promise.resolve('ok');
+      await assert.rejects(
+        () => cb.execute(successFn),
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('Circuit is open'));
+          }
+          return true;
+        }
+      );
+
+      // Finaliza a probe para evitar hanging
+      resolveProbe('done');
+      const result = await firstCall;
+      assert.strictEqual(result, 'done');
+
+      // Após sucesso, deve estar em CLOSED
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
     });
   });
 

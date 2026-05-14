@@ -5,6 +5,13 @@
  *              Apenas o essencial para eliminar erros de TypeScript no VS Code.
  */
 
+// Buffer global (necessário para node:fs/promises overloads)
+declare class Buffer {
+  length: number;
+  static from(data: string, encoding?: string): Buffer;
+  toString(encoding?: string): string;
+}
+
 // Process global
 declare var process: {
   argv: string[];
@@ -45,17 +52,24 @@ declare module 'node:test' {
   }
   export function describe(name: string, fn: () => void): void;
   export function it(name: string, fn: (t: TestContext) => void | Promise<void>): void;
-  interface MockFunction<T extends (...args: unknown[]) => unknown> {
-    (...args: Parameters<T>): ReturnType<T>;
+  interface MockCall {
+    arguments: unknown[];
+    result: unknown;
+    error: unknown | undefined;
   }
-  interface MockMethod<T, K extends keyof T> {
-    mock: {
-      restore: () => void;
-    };
+  interface MockMethodObject {
+    calls: MockCall[];
+    callCount(): number;
+    restore: () => void;
+  }
+  interface MockFunction<T extends (...args: any[]) => any> {
+    (...args: Parameters<T>): ReturnType<T>;
+    mock: MockMethodObject;
   }
   export const mock: {
-    fn: typeof Function;
-    method<T, K extends keyof T>(object: T, method: K, implementation?: (...args: any[]) => any): MockMethod<T, K>;
+    fn<T extends (...args: any[]) => any>(implementation?: T): MockFunction<T>;
+    method<T, K extends keyof T>(object: T, method: K, implementation?: ((...args: any[]) => any) | undefined): T[K] & { mock: MockMethodObject };
+    restoreAll(): void;
   };
   export function before(fn: () => void | Promise<void>): void;
   export function after(fn: () => void | Promise<void>): void;
@@ -79,6 +93,7 @@ declare module 'node:http' {
     listen(port: number, callback?: () => void): void;
     close(callback?: (err?: Error) => void): void;
     on(event: string, listener: (...args: unknown[]) => void): this;
+    address(): { port: number; family?: string; address?: string } | string | null;
   }
   export function createServer(requestListener: RequestListener): Server;
 }
@@ -86,7 +101,8 @@ declare module 'node:http' {
 // node:fs/promises
 declare module 'node:fs/promises' {
   export function readFile(path: string): Promise<Buffer>;
-  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string>;
+  export function readFile(path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
+  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
 }
 
 // node:assert
@@ -94,6 +110,12 @@ declare module 'node:assert' {
   interface Assert {
     ok(value: unknown, message?: string): void;
     strictEqual<T>(actual: T, expected: T, message?: string): void;
+    deepStrictEqual<T>(actual: T, expected: T, message?: string): void;
+    throws(
+      block: () => unknown,
+      error?: RegExp | Function | Object | Error,
+      message?: string
+    ): void;
     rejects(
       block: (() => Promise<unknown>) | Promise<unknown>,
       error?: RegExp | Function | Object | Error,

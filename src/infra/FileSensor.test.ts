@@ -8,7 +8,7 @@
  *   node --experimental-transform-types src/infra/FileSensor.test.ts
  */
 
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { FileSensor } from './FileSensor.ts';
 import { ILogger } from '../core/ILogger.ts';
@@ -139,7 +139,7 @@ describe('FileSensor', () => {
       const logger = new MockLogger();
       const abortError = new Error('ABORT_ERR: the operation was aborted');
       (abortError as Error & { code: string }).code = 'ABORT_ERR';
-      const mockReadFile = async () => { throw abortError; };
+      const mockReadFile = async (_path: string, _options?: { encoding?: string; signal?: AbortSignal }) => { throw abortError; };
 
       const sensor = new FileSensor({ logger, readFile: mockReadFile });
 
@@ -149,6 +149,57 @@ describe('FileSensor', () => {
         logger.logs.some((msg) => msg.includes('WARN') && msg.includes('aborted')),
         'Deve registrar aviso de operação abortada'
       );
+    });
+
+    it('deve repassar o AbortSignal para a função readFile subjacente', async () => {
+      const logger = new MockLogger();
+      const fakeContent = 'conteúdo simulado';
+      let capturedOptions: { encoding?: string; signal?: AbortSignal } | undefined;
+
+      const mockReadFile = async (_path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string> => {
+        capturedOptions = options;
+        return fakeContent;
+      };
+
+      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const controller = new AbortController();
+      const signal = controller.signal;
+
+      await sensor.ler('/test.txt', signal);
+
+      assert.ok(capturedOptions !== undefined, 'readFile deve receber um objeto de opções');
+      assert.strictEqual(capturedOptions!.encoding, 'utf-8', 'deve solicitar encoding utf-8');
+      assert.strictEqual(capturedOptions!.signal, signal, 'o signal recebido deve ser repassado para readFile');
+    });
+
+    it('deve repassar o AbortSignal para readFile (verificado com mock.fn)', async () => {
+      const logger = new MockLogger();
+      const fakeContent = 'conteúdo simulado';
+
+      const mockReadFile = async (_path: string, _options?: { encoding?: string; signal?: AbortSignal }): Promise<string> => {
+        return fakeContent;
+      };
+
+      const mockFn = mock.fn(mockReadFile);
+      const sensor = new FileSensor({ logger, readFile: mockFn as any });
+      const controller = new AbortController();
+      const signal = controller.signal;
+
+      await sensor.ler('/mock-fn-test.txt', signal);
+
+      // Verifica que mock.fn foi chamado exatamente uma vez
+      assert.strictEqual(mockFn.mock.callCount(), 1, 'readFile deve ser chamado exatamente uma vez');
+
+      const firstCall = mockFn.mock.calls[0];
+      assert.ok(firstCall !== undefined, 'Deve haver ao menos uma chamada registrada');
+      const callArgs = firstCall!.arguments;
+      assert.ok(callArgs.length >= 2, 'readFile deve receber path e options');
+      assert.strictEqual(callArgs[0], '/mock-fn-test.txt', 'path deve ser o esperado');
+
+      const options = callArgs[1] as { encoding?: string; signal?: AbortSignal };
+      assert.ok(options !== undefined, 'deve receber objeto de opções');
+      assert.strictEqual(options.encoding, 'utf-8', 'encoding deve ser utf-8');
+      assert.strictEqual(options.signal, signal, 'o AbortSignal deve ser repassado para readFile');
     });
   });
 });

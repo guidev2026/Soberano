@@ -21,13 +21,24 @@ export interface FileSensorOptions {
    * Função de leitura de arquivos injetável.
    * Padrão: readFile nativo de node:fs/promises.
    * Útil para testes com mock.
+   * A assinatura reflete as sobrecargas reais do Node.js:
+   * - Sem encoding → Buffer
+   * - Com encoding → string
    */
-  readFile?: (path: string, options?: { encoding?: string; signal?: AbortSignal }) => Promise<string>;
+  readFile?: {
+    (path: string): Promise<Buffer>;
+    (path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
+    (path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
+  };
 }
 
 export class FileSensor extends ISensor<string> {
   private readonly logger: ILogger;
-  private readonly readFile: (path: string, options?: { encoding?: string; signal?: AbortSignal }) => Promise<string>;
+  private readonly readFile: {
+    (path: string): Promise<Buffer>;
+    (path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
+    (path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
+  };
 
   /**
    * @param options - Objeto de configuração seguindo o padrão Options Object.

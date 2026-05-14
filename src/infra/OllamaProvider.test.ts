@@ -11,6 +11,7 @@ import { describe, it, mock, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { OllamaProvider } from './OllamaProvider.ts';
 import { ILogger } from '../core/ILogger.ts';
+import { ICircuitBreaker, CircuitState } from '../core/ICircuitBreaker.ts';
 
 /**
  * Logger fictício (mock) que estende ILogger sem efeitos colaterais.
@@ -30,6 +31,28 @@ class MockLogger extends ILogger {
   }
   debug(message: string): void {
     this.logs.push(`DEBUG: ${message}`);
+  }
+}
+
+/**
+ * Mock de CircuitBreaker que sempre permite a execução (estado CLOSED).
+ * Usado para satisfazer o requisito DIP nos testes do OllamaProvider.
+ */
+class MockCircuitBreaker extends ICircuitBreaker {
+  get state(): CircuitState {
+    return CircuitState.CLOSED;
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    return fn();
+  }
+
+  recordFailure(): void {
+    // no-op
+  }
+
+  reset(): void {
+    // no-op
   }
 }
 
@@ -62,7 +85,8 @@ describe('OllamaProvider', () => {
         });
       });
 
-      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:11434', model: 'test-model' });
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:11434', model: 'test-model', circuitBreaker: mockCB });
       const resposta = await provider.gerarResposta('Prompt de teste');
 
       // Valida que fetch foi chamado na URL correta
@@ -102,7 +126,8 @@ describe('OllamaProvider', () => {
         });
       });
 
-      const provider = new OllamaProvider({ logger: mockLogger });
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
       await assert.rejects(
         () => provider.gerarResposta('teste'),
         (err: unknown) => {
@@ -122,7 +147,8 @@ describe('OllamaProvider', () => {
         throw new TypeError('fetch failed: connection refused');
       });
 
-      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:99999', model: 'test-model' });
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:99999', model: 'test-model', delayBase: 1, circuitBreaker: mockCB });
       await assert.rejects(
         () => provider.gerarResposta('teste'),
         (err: unknown) => {
@@ -133,15 +159,25 @@ describe('OllamaProvider', () => {
         }
       );
 
-      // Valida que o logger registrou 3 tentativas
-      const retryLogs = mockLogger.logs.filter(
-        (log) => log.includes('Attempt') && log.includes('failed')
-      );
-      assert.strictEqual(retryLogs.length, 2, 'Deve haver 2 logs de falha com retry');
+      // Valida o fluxo exato do loop de retry:
+      // Tentativa 1 → falha → log WARN com retry
+      // Tentativa 2 → falha → log WARN com retry
+      // Tentativa 3 → falha → log ERROR de "All attempts failed"
 
-      const errorLog = mockLogger.logs.find((log) => log.includes('All'));
-      assert.ok(errorLog, 'Deve haver log informando que todas as tentativas falharam');
-      assert.ok(errorLog!.includes('3 attempts failed'));
+      // Logs de retry: WARN com "Attempt X failed" e "Retrying"
+      const retryLogs = mockLogger.logs.filter(
+        (log) => log.startsWith('WARN:') && log.includes('failed') && log.includes('Retrying')
+      );
+      assert.strictEqual(retryLogs.length, 2, 'Deve haver 2 logs WARN de retry (Tentativa 1 e 2)');
+      assert.ok(retryLogs[0]!.includes('Attempt 1'), 'Primeiro retry deve ser da Tentativa 1');
+      assert.ok(retryLogs[1]!.includes('Attempt 2'), 'Segundo retry deve ser da Tentativa 2');
+
+      // Log final de falha: ERROR com "All" e "attempts failed"
+      const finalFailLog = mockLogger.logs.filter(
+        (log) => log.startsWith('ERROR:') && log.includes('All') && log.includes('attempts failed')
+      );
+      assert.strictEqual(finalFailLog.length, 1, 'Deve haver exatamente 1 log de falha final');
+      assert.ok(finalFailLog[0]!.includes('3 attempts failed'), 'Deve mencionar 3 tentativas falhas');
     });
 
     it('NÃO deve fazer retry para erros HTTP 4xx (não recuperáveis)', async () => {
@@ -154,7 +190,8 @@ describe('OllamaProvider', () => {
         return new Response('Bad Request', { status: 400 });
       });
 
-      const provider = new OllamaProvider({ logger: mockLogger });
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
       await assert.rejects(() => provider.gerarResposta('teste'));
       // Deve ter chamado fetch apenas 1 vez (sem retry para 4xx)
       assert.strictEqual(callCount, 1, 'Não deve haver retry para erro HTTP 4xx');

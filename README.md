@@ -1,6 +1,6 @@
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.2.0 — Fase 2 (Sensores: FileSensor)
+**Versão:** 0.3.0 — Fase 3 (Memória - RAG Tradicional)
 
 ## Stack
 
@@ -11,6 +11,8 @@
 | Dependências | **Zero** — PROIBIDO bibliotecas externas |
 | HTTP | `fetch` global nativo |
 
+> **Nota sobre `src/env.d.ts`:** Para manter o compromisso de dependência externa zero, este projeto não utiliza `@types/node`. Em vez disso, o arquivo `src/env.d.ts` declara manualmente apenas os tipos necessários das APIs nativas (HTTP, filesystem, AbortSignal, etc.). Isso elimina a necessidade de instalar um pacote de tipos externo, mantendo o projeto autocontido e leve. Sempre que um novo módulo nativo for utilizado, seus tipos devem ser adicionados a este arquivo.
+
 ## Arquitetura (DIP + SOLID)
 
 ```
@@ -19,7 +21,10 @@ src/
 │   ├── ILogger.ts         # Abstração de logging + LogLevel enum
 │   ├── IMotorCognitivo.ts # Abstração do motor cognitivo (LLM)
 │   ├── ICircuitBreaker.ts # Abstração do Circuit Breaker
-│   └── ISensor.ts         # Abstração genérica de sensor (T)
+│   ├── IHttpServer.ts     # Abstração do servidor HTTP
+│   ├── ISensor.ts         # Abstração genérica de sensor (T)
+│   ├── IEmbeddings.ts     # Contrato para geração de embeddings vetoriais
+│   └── IVectorStore.ts    # Contrato para armazenamento e busca vetorial
 ├── infra/             # Implementações técnicas ("Os Músculos")
 │   ├── ConsoleLogger.ts       # Logger concreto (stdout)
 │   ├── OllamaProvider.ts      # Provider Ollama via fetch nativo
@@ -27,7 +32,10 @@ src/
 │   ├── CircuitBreaker.ts      # Circuit Breaker (3 estados)
 │   ├── CircuitBreaker.test.ts # Testes unitários do CB
 │   ├── FileSensor.ts          # Sensor de arquivo (ISensor<string>)
-│   └── FileSensor.test.ts     # Testes unitários do FileSensor
+│   ├── FileSensor.test.ts     # Testes unitários do FileSensor
+│   ├── NativeHttpServer.ts    # Servidor HTTP nativo (IHttpServer)
+│   ├── NativeHttpServer.test.ts # Testes unitários do NativeHttpServer
+│   └── MockVectorStore.ts     # Vector Store mock (validação sem dependências externas)
 └── main.ts            # Orquestração, wiring manual, ponto de entrada
 ```
 
@@ -54,6 +62,11 @@ src/
 | Testes unitários com `node:test` e `mock.method` | ✅ |
 | Sensor de arquivo (FileSensor) com `node:fs/promises` | ✅ Estabilizada |
 | Contrato genérico ISensor\<T\> (preparação para novos sensores) | ✅ |
+| Servidor HTTP nativo (IHttpServer) com rota /healthz | ✅ |
+| Contrato IEmbeddings para geração de vetores | ✅ |
+| Contrato IVectorStore para armazenamento e busca vetorial | ✅ |
+| MockVectorStore — implementação em memória com similaridade cosseno | ✅ |
+| Demonstração integrada no main.ts (Fase 3) | ✅ |
 
 ## Como Executar
 
@@ -76,6 +89,7 @@ npm test
 npm run test:ollama
 npm run test:circuit
 npm run test:file
+npm run test:http
 
 # Typecheck sem executar
 npm run typecheck
@@ -87,10 +101,11 @@ npm run typecheck
 |------|-----------|--------|
 | **1** | CLI MVP — comunicação básica com Ollama + Circuit Breaker | ✅ **Concluída** |
 | **2** | Sensores — FileSensor (leitura de arquivos locais) | ✅ **Concluída** |
-| **3** | Servidor HTTP (Express-like nativo) + API REST | ⏳ Planejada |
-| **4** | Gerenciamento de contexto e sessões multi-turno | ⏳ Planejada |
-| **5** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
-| **6** | Web UI (React) + WebSocket | ⏳ Planejada |
+| **3** | Memória — Embeddings + Vector Store (RAG Tradicional) | ✅ **Concluída** |
+| **4** | Qualidade de Teste e Determinismo — timeouts mínimos, mock.fn, assertions de retry | ✅ **Concluída** |
+| **5** | Gerenciamento de contexto e sessões multi-turno | ⏳ Planejada |
+| **6** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
+| **7** | Web UI (React) + WebSocket | ⏳ Planejada |
 
 ## Contratos do Core
 
@@ -134,6 +149,25 @@ abstract class ICircuitBreaker {
 ```typescript
 abstract class ISensor<T> {
   abstract ler(target: string, signal?: AbortSignal): Promise<T>;
+}
+```
+
+### `IEmbeddings`
+
+```typescript
+abstract class IEmbeddings {
+  abstract gerarVector(text: string): Promise<number[]>;
+}
+```
+
+### `IVectorStore`
+
+```typescript
+abstract class IVectorStore {
+  abstract adicionar(id: string, vector: number[], metadata: any): Promise<void>;
+  abstract buscarSimilares(vector: number[], limit: number): Promise<
+    { id: string; metadata: any; score: number }[]
+  >;
 }
 ```
 

@@ -102,11 +102,12 @@ export class OllamaProvider extends IMotorCognitivo {
   private readonly maxRetries: number;
   private readonly delayBase: number;
   private readonly timeoutMs: number;
-  private readonly circuitBreaker?: ICircuitBreaker;
+  private readonly circuitBreaker: ICircuitBreaker;
   private externalSignal: AbortSignal | null = null;
 
   /**
    * @param config - Objeto de configuração (OllamaConfig). Apenas `logger` é obrigatório.
+   * @throws {Error} Se circuitBreaker não for fornecido (DIP obrigatório).
    */
   constructor(config: OllamaConfig) {
     super();
@@ -116,6 +117,13 @@ export class OllamaProvider extends IMotorCognitivo {
     this.maxRetries = config.maxRetries ?? 3;
     this.delayBase = config.delayBase ?? 1_000;
     this.timeoutMs = config.timeoutMs ?? 30_000;
+
+    if (!config.circuitBreaker) {
+      throw new Error(
+        '[OllamaProvider] CircuitBreaker is required for DIP compliance. ' +
+        'Provide an instance of ICircuitBreaker in the configuration.'
+      );
+    }
     this.circuitBreaker = config.circuitBreaker;
   }
 
@@ -130,10 +138,29 @@ export class OllamaProvider extends IMotorCognitivo {
 
   /**
    * Aguarda um tempo determinado (ms) usando setTimeout encapsulado em Promise.
-   * Usado entre tentativas de retry.
+   * Aceita um AbortSignal para permitir cancelamento do delay (ex: shutdown).
+   * Rejeita com DOMException('Aborted', 'AbortError') se o sinal for abortado.
    */
-  private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private delay(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      // Se o sinal já estiver abortado, rejeita imediatamente
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        resolve();
+      }, ms);
+
+      // Se um sinal for fornecido, escuta o evento 'abort' para cancelar o delay
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+      }
+    });
   }
 
   /**
@@ -180,7 +207,7 @@ export class OllamaProvider extends IMotorCognitivo {
 
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       const attemptController = new AbortController();
-      let timeoutHandle: ReturnType<typeof setTimeout>;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
       // Função de cleanup que remove o listener externo e limpa o timeout
       let removeExternalListener: (() => void) | null = null;
@@ -243,13 +270,29 @@ export class OllamaProvider extends IMotorCognitivo {
           return validated;
         };
 
-        const data: OllamaGenerateResponse = this.circuitBreaker
-          ? await this.circuitBreaker.execute(executeFetch)
-          : await executeFetch();
+        const data: OllamaGenerateResponse = await this.circuitBreaker.execute(executeFetch);
 
         return data.response;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
+
+        // Verifica se o erro é HTTP 4xx (não recuperável) - gera log claro
+        if (error instanceof Error && /HTTP error [4][0-9]{2}/.test(error.message)) {
+          this.logger.error(
+            `[OllamaProvider] Non-retryable HTTP error in attempt ${attempt}/${this.maxRetries}. ` +
+            `Breaking immediately.\n  Error: ${lastError.message}`
+          );
+          break;
+        }
+
+        // Verifica se o erro é de cancelamento (shutdown/timeout)
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          this.logger.error(
+            `[OllamaProvider] Operation aborted in attempt ${attempt}/${this.maxRetries}. ` +
+            `Breaking immediately.\n  Error: ${lastError.message}`
+          );
+          break;
+        }
 
         if (this.isRetryableError(error) && attempt < this.maxRetries) {
           const delayMs = this.delayBase * attempt; // backoff: 1x, 2x, 3x
@@ -259,13 +302,29 @@ export class OllamaProvider extends IMotorCognitivo {
             `  Error: ${lastError.message}`
           );
           if (this.externalSignal?.aborted) {
+            this.logger.error(
+              `[OllamaProvider] External signal aborted during retry delay. Breaking.`
+            );
             break;
           }
-          await this.delay(delayMs);
+          // Aguarda o delay com suporte a abort signal para interromper imediatamente no shutdown
+          try {
+            await this.delay(delayMs, this.externalSignal ?? undefined);
+          } catch (delayError) {
+            this.logger.error(
+              `[OllamaProvider] Retry delay aborted by external signal. Breaking.`
+            );
+            break;
+          }
           continue;
         }
 
-        // Se não for retryável ou acabaram as tentativas, propaga o erro
+        // Erro não recuperável sem ser 4xx (ex: erro interno, falha final)
+        this.logger.error(
+          `[OllamaProvider] Unrecoverable error in attempt ${attempt}/${this.maxRetries}. ` +
+          `Breaking.\n  Error: ${lastError.message}`
+        );
+
         if (attempt >= this.maxRetries) {
           this.logger.error(
             `[OllamaProvider] All ${this.maxRetries} attempts failed. ` +
@@ -274,7 +333,9 @@ export class OllamaProvider extends IMotorCognitivo {
         }
         break;
       } finally {
-        clearTimeout(timeoutHandle);
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
+        }
         if (removeExternalListener) {
           removeExternalListener();
         }
