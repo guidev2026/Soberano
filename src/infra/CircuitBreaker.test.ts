@@ -34,7 +34,7 @@ describe('CircuitBreaker', () => {
   describe('Estado inicial', () => {
     it('deve iniciar em CLOSED', () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger);
+      const cb = new CircuitBreaker({ logger });
       assert.strictEqual(cb.state, CircuitState.CLOSED);
     });
   });
@@ -42,7 +42,7 @@ describe('CircuitBreaker', () => {
   describe('Transição CLOSED -> OPEN', () => {
     it('deve abrir após N falhas consecutivas (padrão: 3)', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 3, 30_000);
+      const cb = new CircuitBreaker({ logger, failureThreshold: 3, openTimeoutMs: 30_000 });
 
       const failingFn = () => Promise.reject(new Error('Falha simulada'));
 
@@ -61,7 +61,7 @@ describe('CircuitBreaker', () => {
 
     it('deve abrir com threshold customizado', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 1, 30_000); // abre na primeira falha
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 30_000 }); // abre na primeira falha
 
       const failingFn = () => Promise.reject(new Error('Falha simulada'));
 
@@ -73,7 +73,7 @@ describe('CircuitBreaker', () => {
   describe('Estado OPEN', () => {
     it('deve rejeitar chamadas imediatamente com erro', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 1, 30_000); // abre na 1ª falha
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 30_000 }); // abre na 1ª falha
 
       const failingFn = () => Promise.reject(new Error('Falha simulada'));
       await assert.rejects(() => cb.execute(failingFn)); // abre
@@ -93,7 +93,7 @@ describe('CircuitBreaker', () => {
 
     it('deve registrar log de circuito aberto', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 1, 30_000);
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 30_000 });
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
@@ -112,7 +112,7 @@ describe('CircuitBreaker', () => {
   describe('Transição OPEN -> HALF_OPEN', () => {
     it('deve transitar para HALF_OPEN após o timeout expirar', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 1, 50); // timeout de 50ms
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 }); // timeout de 50ms
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
@@ -129,7 +129,7 @@ describe('CircuitBreaker', () => {
   describe('Transição HALF_OPEN -> CLOSED', () => {
     it('deve retornar para CLOSED após sucesso em HALF_OPEN', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 1, 50);
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 });
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
@@ -149,7 +149,7 @@ describe('CircuitBreaker', () => {
   describe('Transição HALF_OPEN -> OPEN', () => {
     it('deve voltar para OPEN após falha em HALF_OPEN', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 1, 50);
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 });
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
@@ -167,7 +167,7 @@ describe('CircuitBreaker', () => {
   describe('recordFailure e reset', () => {
     it('recordFailure deve incrementar contagem e abrir ao atingir threshold', () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 2, 30_000);
+      const cb = new CircuitBreaker({ logger, failureThreshold: 2, openTimeoutMs: 30_000 });
 
       cb.recordFailure();
       assert.strictEqual(cb.state, CircuitState.CLOSED);
@@ -178,7 +178,7 @@ describe('CircuitBreaker', () => {
 
     it('reset deve voltar ao estado CLOSED', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker(logger, 1, 30_000);
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 30_000 });
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));

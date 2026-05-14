@@ -60,6 +60,26 @@ declare module 'node:test' {
   export function afterEach(fn: () => void | Promise<void>): void;
 }
 
+// node:http
+declare module 'node:http' {
+  interface IncomingMessage {
+    url?: string | undefined;
+    method?: string | undefined;
+    on(event: string, listener: (...args: unknown[]) => void): this;
+  }
+  interface ServerResponse {
+    writeHead(statusCode: number, headers?: Record<string, string>): void;
+    end(data?: string): void;
+  }
+  type RequestListener = (req: IncomingMessage, res: ServerResponse) => void;
+  interface Server {
+    listen(port: number, callback?: () => void): void;
+    close(callback?: (err?: Error) => void): void;
+    on(event: string, listener: (...args: unknown[]) => void): this;
+  }
+  export function createServer(requestListener: RequestListener): Server;
+}
+
 // node:fs/promises
 declare module 'node:fs/promises' {
   export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string>;

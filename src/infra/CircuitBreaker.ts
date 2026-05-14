@@ -11,6 +11,15 @@
 import { ICircuitBreaker, CircuitState } from '../core/ICircuitBreaker.ts';
 import { ILogger } from '../core/ILogger.ts';
 
+export interface CircuitBreakerOptions {
+  /** Instância de ILogger para logging estruturado */
+  logger: ILogger;
+  /** Número de falhas consecutivas para abrir o circuito (padrão: 3) */
+  failureThreshold?: number;
+  /** Tempo em ms para permanecer em OPEN antes de HALF_OPEN (padrão: 30000) */
+  openTimeoutMs?: number;
+}
+
 export class CircuitBreaker extends ICircuitBreaker {
   private _state: CircuitState = CircuitState.CLOSED;
   private failureCount: number = 0;
@@ -20,19 +29,13 @@ export class CircuitBreaker extends ICircuitBreaker {
   private readonly logger: ILogger;
 
   /**
-   * @param logger          - Instância de ILogger para logging estruturado
-   * @param failureThreshold - Número de falhas consecutivas para abrir o circuito (padrão: 3)
-   * @param openTimeoutMs    - Tempo em ms para permanecer em OPEN antes de HALF_OPEN (padrão: 30000)
+   * @param options - Objeto de configuração seguindo o padrão Options Object.
    */
-  constructor(
-    logger: ILogger,
-    failureThreshold: number = 3,
-    openTimeoutMs: number = 30_000
-  ) {
+  constructor(options: CircuitBreakerOptions) {
     super();
-    this.logger = logger;
-    this.failureThreshold = failureThreshold;
-    this.openTimeoutMs = openTimeoutMs;
+    this.logger = options.logger;
+    this.failureThreshold = options.failureThreshold ?? 3;
+    this.openTimeoutMs = options.openTimeoutMs ?? 30_000;
   }
 
   get state(): CircuitState {

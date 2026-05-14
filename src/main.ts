@@ -1,13 +1,15 @@
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Fase 2 (Sensores).
+ * @description Ponto de entrada do sistema SOBERANO - Fase 3 (Comunicação).
  *              Realiza o wiring manual (Injeção de Dependência) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
  *              - Cria AbortController global para graceful shutdown
  *              - Injeta AbortSignal no OllamaProvider para cancelar fetch em andamento
  *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
+ *              - Inicializa NativeHttpServer para servir rota /healthz
  *              - Executa o teste inicial de comunicação com o motor cognitivo
+ *              - Executa o teste do FileSensor (leitura de arquivo local)
  */
 
 import { OllamaProvider } from './infra/OllamaProvider.ts';
@@ -15,6 +17,8 @@ import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
 import { ConsoleLogger } from './infra/ConsoleLogger.ts';
 import { ILogger } from './core/ILogger.ts';
 import { CircuitBreaker } from './infra/CircuitBreaker.ts';
+import { NativeHttpServer } from './infra/NativeHttpServer.ts';
+import { IHttpServer } from './core/IHttpServer.ts';
 import { FileSensor } from './infra/FileSensor.ts';
 import { ISensor } from './core/ISensor.ts';
 
@@ -83,7 +87,7 @@ async function bootstrap(): Promise<void> {
 
   logger.info(
     '╔══════════════════════════════════════════════════╗\n' +
-    '║       SOBERANO - Fase 2 (Sensores)               ║\n' +
+    '║       SOBERANO - Fase 3 (Comunicação)            ║\n' +
     '║       Inicializando sistemas...                  ║\n' +
     '╚══════════════════════════════════════════════════╝'
   );
@@ -95,7 +99,13 @@ async function bootstrap(): Promise<void> {
   registerShutdownHandlers(logger, shutdownController);
 
   // --- CIRCUIT BREAKER ---
-  const circuitBreaker = new CircuitBreaker(logger);
+  const circuitBreaker = new CircuitBreaker({ logger });
+
+  // --- HTTP SERVER (Fase 3 - Comunicação) ---
+  const httpServer: IHttpServer = new NativeHttpServer({
+    logger,
+    abortSignal: shutdownController.signal,
+  });
 
   // --- GLOBAL TIMEOUT (fallback para evitar travamento silencioso) ---
   const globalTimeoutSignal = AbortSignal.timeout(120_000);
@@ -112,6 +122,11 @@ async function bootstrap(): Promise<void> {
 
   // A partir daqui, usa-se a abstração IMotorCognitivo
   const motor: IMotorCognitivo = provider;
+
+  // --- INICIALIZAÇÃO DO SERVIDOR HTTP ---
+  // Aceita porta via 3º argumento da CLI: npm start -- <caminho> <porta>
+  const HTTP_PORT = Number(process.argv[3]) || 3000;
+  await httpServer.start(HTTP_PORT);
 
   const promptTeste = 'Olá, Soberano. Confirme que seus sistemas base estão online.';
 
@@ -131,7 +146,7 @@ async function bootstrap(): Promise<void> {
 
     // --- TESTE DO FILE SENSOR (Fase 2) ---
     // Aceita caminho de arquivo via argumento de linha de comando.
-    // Uso: npm start -- <caminho>
+    // Uso: npm start -- <caminho> [porta]
     const filePath = process.argv[2];
 
     if (filePath) {
@@ -157,7 +172,7 @@ async function bootstrap(): Promise<void> {
         }
       }
     } else {
-      logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo>');
+      logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo> [porta]');
     }
   } catch (error) {
     // Se o erro foi causado pelo shutdown, não é uma falha real
@@ -183,6 +198,11 @@ async function bootstrap(): Promise<void> {
 
     // Exit with code 1 (error) without depending on @types/node
     process.exit(1);
+  } finally {
+    // Garante que o servidor HTTP seja parado ao finalizar (sucesso, erro ou shutdown)
+    await httpServer.stop().catch((err) => {
+      logger.error(`[main] Error stopping HTTP server: ${err}`);
+    });
   }
 }
 
