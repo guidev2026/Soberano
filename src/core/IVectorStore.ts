@@ -8,16 +8,16 @@
  *              não de implementações concretas (MockVectorStore, ChromaDB, etc.).
  */
 
-export abstract class IVectorStore {
+export abstract class IVectorStore<M = any> {
   /**
    * Adiciona um vetor ao armazenamento com seu ID e metadados associados.
    *
    * @param id       - Identificador único do vetor (ex: hash do documento)
    * @param vector   - Vetor numérico representando o embedding semântico
-   * @param metadata - Metadados arbitrários associados ao vetor (ex: texto original, fonte)
-   * @throws {Error} Se o ID já existir ou se houver falha no armazenamento
+   * @param metadata - Metadados associados ao vetor (ex: texto original, fonte)
+   * @throws {Error} Se o ID já existir (fail-fast) ou se houver falha no armazenamento
    */
-  abstract adicionar(id: string, vector: number[], metadata: any): Promise<void>;
+  abstract adicionar(id: string, vector: number[], metadata: M): Promise<void>;
 
   /**
    * Busca os N vetores mais similares ao vetor de consulta fornecido,
@@ -29,6 +29,6 @@ export abstract class IVectorStore {
    * @throws {Error} Se não houver vetores armazenados
    */
   abstract buscarSimilares(vector: number[], limit: number): Promise<
-    { id: string; metadata: any; score: number }[]
+    { id: string; metadata: M; score: number }[]
   >;
 }

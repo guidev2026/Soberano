@@ -282,6 +282,10 @@ export class OllamaProvider extends IMotorCognitivo {
             `[OllamaProvider] Non-retryable HTTP error in attempt ${attempt}/${this.maxRetries}. ` +
             `Breaking immediately.\n  Error: ${lastError.message}`
           );
+          this.logger.error(
+            `[OllamaProvider] All ${this.maxRetries} attempts failed. ` +
+            `Last error: ${lastError.message}`
+          );
           break;
         }
 
@@ -290,6 +294,10 @@ export class OllamaProvider extends IMotorCognitivo {
           this.logger.error(
             `[OllamaProvider] Operation aborted in attempt ${attempt}/${this.maxRetries}. ` +
             `Breaking immediately.\n  Error: ${lastError.message}`
+          );
+          this.logger.error(
+            `[OllamaProvider] All ${this.maxRetries} attempts failed. ` +
+            `Last error: ${lastError.message}`
           );
           break;
         }

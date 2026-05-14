@@ -17,13 +17,13 @@ export interface MockVectorStoreOptions {
   logger: ILogger;
 }
 
-interface VectorEntry {
+interface VectorEntry<M = any> {
   vector: number[];
-  metadata: any;
+  metadata: M;
 }
 
-export class MockVectorStore extends IVectorStore {
-  private readonly store: Map<string, VectorEntry> = new Map();
+export class MockVectorStore<M = any> extends IVectorStore<M> {
+  private readonly store: Map<string, VectorEntry<M>> = new Map();
   private readonly logger: ILogger;
 
   /**
@@ -43,7 +43,7 @@ export class MockVectorStore extends IVectorStore {
    * @param metadata - Metadados associados ao vetor
    * @throws {Error} Se o ID já existir no armazenamento
    */
-  async adicionar(id: string, vector: number[], metadata: any): Promise<void> {
+  async adicionar(id: string, vector: number[], metadata: M): Promise<void> {
     if (this.store.has(id)) {
       throw new Error(`[MockVectorStore] Vector with id '${id}' already exists.`);
     }
@@ -51,7 +51,7 @@ export class MockVectorStore extends IVectorStore {
     this.store.set(id, { vector, metadata });
 
     this.logger.debug(
-      `[MockVectorStore] Vector added. id="${id}", vectorLength=${vector.length}, metadataKeys=${Object.keys(metadata).join(',')}`
+      `[MockVectorStore] Vector added. id="${id}", vectorLength=${vector.length}, metadataKeys=${Object.keys(metadata as object).join(',')}`
     );
   }
 
@@ -66,7 +66,7 @@ export class MockVectorStore extends IVectorStore {
   async buscarSimilares(
     vector: number[],
     limit: number
-  ): Promise<{ id: string; metadata: any; score: number }[]> {
+  ): Promise<{ id: string; metadata: M; score: number }[]> {
     if (this.store.size === 0) {
       this.logger.debug('[MockVectorStore] No vectors stored. Returning empty result.');
       return [];

@@ -160,13 +160,13 @@ abstract class IEmbeddings {
 }
 ```
 
-### `IVectorStore`
+### `IVectorStore<M>`
 
 ```typescript
-abstract class IVectorStore {
-  abstract adicionar(id: string, vector: number[], metadata: any): Promise<void>;
+abstract class IVectorStore<M = any> {
+  abstract adicionar(id: string, vector: number[], metadata: M): Promise<void>;
   abstract buscarSimilares(vector: number[], limit: number): Promise<
-    { id: string; metadata: any; score: number }[]
+    { id: string; metadata: M; score: number }[]
   >;
 }
 ```

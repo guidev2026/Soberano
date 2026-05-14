@@ -74,6 +74,46 @@ tsconfig.json
 <files>
 This section contains the contents of the repository's files.
 
+<file path="src/core/ICircuitBreaker.ts">
+/**
+ * @file ICircuitBreaker.ts
+ * @description Contrato de abstração para o padrão Circuit Breaker.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ *
+ *              Estados: CLOSED (normal), OPEN (falhando), HALF_OPEN (teste).
+ */
+
+export enum CircuitState {
+  CLOSED = 'CLOSED',
+  OPEN = 'OPEN',
+  HALF_OPEN = 'HALF_OPEN',
+}
+
+export abstract class ICircuitBreaker {
+  /** Estado atual do circuit breaker */
+  abstract get state(): CircuitState;
+
+  /**
+   * Executa uma operação respeitando o estado do circuit breaker.
+   * - CLOSED: executa normalmente, registra sucesso/falha
+   * - OPEN: lança erro imediatamente (a menos que o timeout tenha expirado para HALF_OPEN)
+   * - HALF_OPEN: permite 1 chamada de teste; sucesso volta para CLOSED, falha volta para OPEN
+   *
+   * @param fn - Função assíncrona a ser protegida
+   * @returns O resultado da função
+   * @throws {Error} Se o circuit breaker estiver OPEN e o timeout não tiver expirado
+   */
+  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
+
+  /** Registra uma falha manualmente (para uso externo) */
+  abstract recordFailure(): void;
+
+  /** Reseta o circuit breaker para o estado CLOSED */
+  abstract reset(): void;
+}
+</file>
+
 <file path="src/core/IEmbeddings.ts">
 /**
  * @file IEmbeddings.ts
@@ -99,6 +139,31 @@ export abstract class IEmbeddings {
 }
 </file>
 
+<file path="src/core/IHttpServer.ts">
+/**
+ * @file IHttpServer.ts
+ * @description Contrato de abstração para servidor HTTP nativo do SOBERANO.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ *
+ *              Suporta start/stop para integração com graceful shutdown.
+ */
+
+export abstract class IHttpServer {
+  /**
+   * Inicia o servidor HTTP na porta especificada.
+   * @param port - Número da porta para escutar (ex: 3000)
+   */
+  abstract start(port: number): Promise<void>;
+
+  /**
+   * Para o servidor HTTP de forma limpa.
+   * Fecha todas as conexões ativas e libera a porta.
+   */
+  abstract stop(): Promise<void>;
+}
+</file>
+
 <file path="src/core/IVectorStore.ts">
 /**
  * @file IVectorStore.ts
@@ -110,16 +175,16 @@ export abstract class IEmbeddings {
  *              não de implementações concretas (MockVectorStore, ChromaDB, etc.).
  */
 
-export abstract class IVectorStore {
+export abstract class IVectorStore<M = any> {
   /**
    * Adiciona um vetor ao armazenamento com seu ID e metadados associados.
    *
    * @param id       - Identificador único do vetor (ex: hash do documento)
    * @param vector   - Vetor numérico representando o embedding semântico
-   * @param metadata - Metadados arbitrários associados ao vetor (ex: texto original, fonte)
-   * @throws {Error} Se o ID já existir ou se houver falha no armazenamento
+   * @param metadata - Metadados associados ao vetor (ex: texto original, fonte)
+   * @throws {Error} Se o ID já existir (fail-fast) ou se houver falha no armazenamento
    */
-  abstract adicionar(id: string, vector: number[], metadata: any): Promise<void>;
+  abstract adicionar(id: string, vector: number[], metadata: M): Promise<void>;
 
   /**
    * Busca os N vetores mais similares ao vetor de consulta fornecido,
@@ -131,7 +196,7 @@ export abstract class IVectorStore {
    * @throws {Error} Se não houver vetores armazenados
    */
   abstract buscarSimilares(vector: number[], limit: number): Promise<
-    { id: string; metadata: any; score: number }[]
+    { id: string; metadata: M; score: number }[]
   >;
 }
 </file>
@@ -307,13 +372,13 @@ export interface MockVectorStoreOptions {
   logger: ILogger;
 }
 
-interface VectorEntry {
+interface VectorEntry<M = any> {
   vector: number[];
-  metadata: any;
+  metadata: M;
 }
 
-export class MockVectorStore extends IVectorStore {
-  private readonly store: Map<string, VectorEntry> = new Map();
+export class MockVectorStore<M = any> extends IVectorStore<M> {
+  private readonly store: Map<string, VectorEntry<M>> = new Map();
   private readonly logger: ILogger;
 
   /**
@@ -333,7 +398,7 @@ export class MockVectorStore extends IVectorStore {
    * @param metadata - Metadados associados ao vetor
    * @throws {Error} Se o ID já existir no armazenamento
    */
-  async adicionar(id: string, vector: number[], metadata: any): Promise<void> {
+  async adicionar(id: string, vector: number[], metadata: M): Promise<void> {
     if (this.store.has(id)) {
       throw new Error(`[MockVectorStore] Vector with id '${id}' already exists.`);
     }
@@ -341,7 +406,7 @@ export class MockVectorStore extends IVectorStore {
     this.store.set(id, { vector, metadata });
 
     this.logger.debug(
-      `[MockVectorStore] Vector added. id="${id}", vectorLength=${vector.length}, metadataKeys=${Object.keys(metadata).join(',')}`
+      `[MockVectorStore] Vector added. id="${id}", vectorLength=${vector.length}, metadataKeys=${Object.keys(metadata as object).join(',')}`
     );
   }
 
@@ -356,7 +421,7 @@ export class MockVectorStore extends IVectorStore {
   async buscarSimilares(
     vector: number[],
     limit: number
-  ): Promise<{ id: string; metadata: any; score: number }[]> {
+  ): Promise<{ id: string; metadata: M; score: number }[]> {
     if (this.store.size === 0) {
       this.logger.debug('[MockVectorStore] No vectors stored. Returning empty result.');
       return [];
@@ -641,71 +706,6 @@ describe('validateOllamaResponse (função pura)', () => {
 });
 </file>
 
-<file path="src/core/ICircuitBreaker.ts">
-/**
- * @file ICircuitBreaker.ts
- * @description Contrato de abstração para o padrão Circuit Breaker.
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas.
- *
- *              Estados: CLOSED (normal), OPEN (falhando), HALF_OPEN (teste).
- */
-
-export enum CircuitState {
-  CLOSED = 'CLOSED',
-  OPEN = 'OPEN',
-  HALF_OPEN = 'HALF_OPEN',
-}
-
-export abstract class ICircuitBreaker {
-  /** Estado atual do circuit breaker */
-  abstract get state(): CircuitState;
-
-  /**
-   * Executa uma operação respeitando o estado do circuit breaker.
-   * - CLOSED: executa normalmente, registra sucesso/falha
-   * - OPEN: lança erro imediatamente (a menos que o timeout tenha expirado para HALF_OPEN)
-   * - HALF_OPEN: permite 1 chamada de teste; sucesso volta para CLOSED, falha volta para OPEN
-   *
-   * @param fn - Função assíncrona a ser protegida
-   * @returns O resultado da função
-   * @throws {Error} Se o circuit breaker estiver OPEN e o timeout não tiver expirado
-   */
-  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
-
-  /** Registra uma falha manualmente (para uso externo) */
-  abstract recordFailure(): void;
-
-  /** Reseta o circuit breaker para o estado CLOSED */
-  abstract reset(): void;
-}
-</file>
-
-<file path="src/core/IHttpServer.ts">
-/**
- * @file IHttpServer.ts
- * @description Contrato de abstração para servidor HTTP nativo do SOBERANO.
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas.
- *
- *              Suporta start/stop para integração com graceful shutdown.
- */
-
-export abstract class IHttpServer {
-  /**
-   * Inicia o servidor HTTP na porta especificada.
-   * @param port - Número da porta para escutar (ex: 3000)
-   */
-  abstract start(port: number): Promise<void>;
-
-  /**
-   * Para o servidor HTTP de forma limpa.
-   * Fecha todas as conexões ativas e libera a porta.
-   */
-  abstract stop(): Promise<void>;
-}
-</file>
-
 <file path=".gitignore">
 # Dependências
 node_modules/
@@ -787,6 +787,114 @@ export abstract class ISensor<T> {
 }
 </file>
 
+<file path=".clinerules">
+# Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
+
+## 1. Stack e Restrições Rígidas
+- Linguagem: TypeScript (Node.js nativo).
+- Dependências: PROIBIDO o uso de bibliotecas externas (ex: axios, jest, dotenv).
+- Utilizar exclusivamente módulos nativos (fs, path, node:test, node:assert, fetch global).
+
+## 2. Arquitetura e SOLID (DIP)
+- [cite_start]Abstração Primeiro: Sempre defina uma Interface/Classe Abstrata em `src/core` antes da implementação[cite: 167].
+- Inversão de Dependência: Módulos de alto nível dependem de abstrações. [cite_start]Injeção de dependência via construtor é obrigatória[cite: 168].
+- [cite_start]Padrão de Construtor: Para classes com múltiplas configurações, utilize um objeto de configuração (Options Object) em vez de parâmetros posicionais[cite: 412].
+- [cite_start]Desacoplamento: Detalhes técnicos nunca vazam para o Core[cite: 161].
+
+## 3. Robustez, Confiabilidade e Observabilidade
+- [cite_start]Testes Unitários: Use o `node:test` nativo com `mock.method()` para garantir isolamento e restore automático.
+- [cite_start]Resiliência: Implementar Política de Retry, Circuit Breaker e AbortSignal.timeout() global no bootstrap.
+- Log Standardization: Padronize logs e erros internos em Inglês. [cite_start]Mensagens de interface com o usuário devem ser em PT-BR.
+- [cite_start]Controle de Log: O sistema de logging deve suportar níveis (DEBUG, INFO, WARN, ERROR) e filtragem de nível mínimo[cite: 412].
+- [cite_start]Estabilidade: Implementar 'Graceful Shutdown' (SIGINT/SIGTERM) com cancelamento de operações pendentes[cite: 273].
+
+## 4. Documentação e Evolução
+- [cite_start]Manutenção de Contexto: O arquivo `README.md` deve ser atualizado obrigatoriamente pelo Cline sempre que uma Fase do Roadmap for concluída ou um Contrato (Core) for alterado.
+- [cite_start]Alinhamento de Roadmap: Mantenha o status das fases atualizado conforme o progresso real[cite: 422].
+
+## 5. Estrutura de Pastas
+- [cite_start]src/core: Contratos, interfaces e lógica de negócio pura (A "Alma")[cite: 161].
+- [cite_start]src/infra: Implementações técnicas, provedores e drivers (Os "Músculos")[cite: 161].
+- [cite_start]src/main.ts: Orquestração, Wiring manual e ponto de entrada[cite: 162].
+</file>
+
+<file path="src/core/ILogger.ts">
+/**
+ * @file ILogger.ts
+ * @description Contrato de abstração para o sistema de logging.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ */
+
+export enum LogLevel {
+  DEBUG = 0,
+  INFO = 1,
+  WARN = 2,
+  ERROR = 3,
+}
+
+export abstract class ILogger {
+  /** Informational message */
+  abstract info(message: string): void;
+  /** Warning that does not halt execution */
+  abstract warn(message: string): void;
+  /** Operational or critical error */
+  abstract error(message: string): void;
+  /** Debug message (development only) */
+  abstract debug(message: string): void;
+}
+</file>
+
+<file path="src/infra/ConsoleLogger.ts">
+/**
+ * @file ConsoleLogger.ts
+ * @description Implementação concreta de ILogger utilizando console do Node.js.
+ *              Depende da abstração ILogger, não o contrário.
+ */
+
+import { ILogger, LogLevel } from '../core/ILogger.ts';
+
+export class ConsoleLogger extends ILogger {
+  private readonly prefix: string;
+  private readonly level: LogLevel;
+
+  constructor(prefix: string = 'SOBERANO', minLevel: LogLevel = LogLevel.INFO) {
+    super();
+    this.prefix = prefix;
+    this.level = minLevel;
+  }
+
+  private formatMessage(level: string, message: string): string {
+    const timestamp = new Date().toISOString();
+    return `[${timestamp}] [${this.prefix}] [${level}] ${message}`;
+  }
+
+  info(message: string): void {
+    if (this.level <= LogLevel.INFO) {
+      console.log(this.formatMessage('INFO', message));
+    }
+  }
+
+  warn(message: string): void {
+    if (this.level <= LogLevel.WARN) {
+      console.warn(this.formatMessage('WARN', message));
+    }
+  }
+
+  error(message: string): void {
+    if (this.level <= LogLevel.ERROR) {
+      console.error(this.formatMessage('ERROR', message));
+    }
+  }
+
+  debug(message: string): void {
+    if (this.level <= LogLevel.DEBUG) {
+      console.log(this.formatMessage('DEBUG', message));
+    }
+  }
+}
+</file>
+
 <file path="src/infra/FileSensor.test.ts">
 /**
  * @file FileSensor.test.ts
@@ -798,7 +906,7 @@ export abstract class ISensor<T> {
  *   node --experimental-transform-types src/infra/FileSensor.test.ts
  */
 
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { FileSensor } from './FileSensor.ts';
 import { ILogger } from '../core/ILogger.ts';
@@ -929,7 +1037,7 @@ describe('FileSensor', () => {
       const logger = new MockLogger();
       const abortError = new Error('ABORT_ERR: the operation was aborted');
       (abortError as Error & { code: string }).code = 'ABORT_ERR';
-      const mockReadFile = async () => { throw abortError; };
+      const mockReadFile = async (_path: string, _options?: { encoding?: string; signal?: AbortSignal }) => { throw abortError; };
 
       const sensor = new FileSensor({ logger, readFile: mockReadFile });
 
@@ -939,6 +1047,57 @@ describe('FileSensor', () => {
         logger.logs.some((msg) => msg.includes('WARN') && msg.includes('aborted')),
         'Deve registrar aviso de operação abortada'
       );
+    });
+
+    it('deve repassar o AbortSignal para a função readFile subjacente', async () => {
+      const logger = new MockLogger();
+      const fakeContent = 'conteúdo simulado';
+      let capturedOptions: { encoding?: string; signal?: AbortSignal } | undefined;
+
+      const mockReadFile = async (_path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string> => {
+        capturedOptions = options;
+        return fakeContent;
+      };
+
+      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const controller = new AbortController();
+      const signal = controller.signal;
+
+      await sensor.ler('/test.txt', signal);
+
+      assert.ok(capturedOptions !== undefined, 'readFile deve receber um objeto de opções');
+      assert.strictEqual(capturedOptions!.encoding, 'utf-8', 'deve solicitar encoding utf-8');
+      assert.strictEqual(capturedOptions!.signal, signal, 'o signal recebido deve ser repassado para readFile');
+    });
+
+    it('deve repassar o AbortSignal para readFile (verificado com mock.fn)', async () => {
+      const logger = new MockLogger();
+      const fakeContent = 'conteúdo simulado';
+
+      const mockReadFile = async (_path: string, _options?: { encoding?: string; signal?: AbortSignal }): Promise<string> => {
+        return fakeContent;
+      };
+
+      const mockFn = mock.fn(mockReadFile);
+      const sensor = new FileSensor({ logger, readFile: mockFn as any });
+      const controller = new AbortController();
+      const signal = controller.signal;
+
+      await sensor.ler('/mock-fn-test.txt', signal);
+
+      // Verifica que mock.fn foi chamado exatamente uma vez
+      assert.strictEqual(mockFn.mock.callCount(), 1, 'readFile deve ser chamado exatamente uma vez');
+
+      const firstCall = mockFn.mock.calls[0];
+      assert.ok(firstCall !== undefined, 'Deve haver ao menos uma chamada registrada');
+      const callArgs = firstCall!.arguments;
+      assert.ok(callArgs.length >= 2, 'readFile deve receber path e options');
+      assert.strictEqual(callArgs[0], '/mock-fn-test.txt', 'path deve ser o esperado');
+
+      const options = callArgs[1] as { encoding?: string; signal?: AbortSignal };
+      assert.ok(options !== undefined, 'deve receber objeto de opções');
+      assert.strictEqual(options.encoding, 'utf-8', 'encoding deve ser utf-8');
+      assert.strictEqual(options.signal, signal, 'o AbortSignal deve ser repassado para readFile');
     });
   });
 });
@@ -968,13 +1127,24 @@ export interface FileSensorOptions {
    * Função de leitura de arquivos injetável.
    * Padrão: readFile nativo de node:fs/promises.
    * Útil para testes com mock.
+   * A assinatura reflete as sobrecargas reais do Node.js:
+   * - Sem encoding → Buffer
+   * - Com encoding → string
    */
-  readFile?: (path: string, options?: { encoding?: string; signal?: AbortSignal }) => Promise<string>;
+  readFile?: {
+    (path: string): Promise<Buffer>;
+    (path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
+    (path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
+  };
 }
 
 export class FileSensor extends ISensor<string> {
   private readonly logger: ILogger;
-  private readonly readFile: (path: string, options?: { encoding?: string; signal?: AbortSignal }) => Promise<string>;
+  private readonly readFile: {
+    (path: string): Promise<Buffer>;
+    (path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
+    (path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
+  };
 
   /**
    * @param options - Objeto de configuração seguindo o padrão Options Object.
@@ -1114,6 +1284,28 @@ describe('NativeHttpServer', () => {
       await server.stop();
       assert.ok(true, 'stop() sem start() não lançou exceção');
     });
+
+    it('deve ser idempotente: múltiplas chamadas a stop() resolvem imediatamente', async () => {
+      const logger = new MockLogger();
+      const server = new NativeHttpServer({ logger });
+      servers.push(server);
+
+      await server.start(0);
+      assert.ok(logger.logs.some((log) => log.includes('listening')));
+
+      // Primeira chamada: fecha de fato
+      await server.stop();
+      const closeLogs = logger.logs.filter((log) => log.includes('closed')).length;
+      assert.ok(closeLogs >= 1, 'Deve haver ao menos um log de closed');
+
+      // Segunda chamada: deve resolver imediatamente sem lançar
+      await server.stop();
+      assert.ok(true, 'Segunda chamada a stop() não lançou exceção');
+
+      // Terceira chamada: também deve resolver
+      await server.stop();
+      assert.ok(true, 'Terceira chamada a stop() não lançou exceção');
+    });
   });
 
   describe('Integração com AbortSignal', () => {
@@ -1233,6 +1425,12 @@ export class NativeHttpServer extends IHttpServer {
   private readonly abortSignal?: AbortSignal;
   private abortListener: (() => void) | null = null;
   private actualPort: number | null = null;
+  /** Flag de idempotência para stop(). Evita múltiplas chamadas simultâneas a close(). */
+  private stopping: boolean = false;
+  /** Flag que indica se a Promise de start() já foi resolvida.
+   *  Quando false, erros do server rejeitam a Promise.
+   *  Quando true, erros são apenas logados (runtime errors). */
+  private startResolved: boolean = false;
 
   constructor(options: NativeHttpServerOptions) {
     super();
@@ -1250,6 +1448,8 @@ export class NativeHttpServer extends IHttpServer {
 
   async start(port: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      this.startResolved = false;
+
       this.server = createServer((req, res) => {
         // Rota de health-check
         if (req.url === '/healthz' && req.method === 'GET') {
@@ -1274,40 +1474,63 @@ export class NativeHttpServer extends IHttpServer {
         this.abortSignal.addEventListener('abort', this.abortListener);
       }
 
-      this.server.listen(port, () => {
-        const addr = this.server!.address();
-        this.actualPort = typeof addr === 'object' && addr ? addr.port : port;
-        this.logger.info(`[NativeHttpServer] HTTP server listening on port ${this.actualPort}`);
-        resolve();
+      // Listener de erro do server.
+      // Se a Promise ainda não foi resolvida, rejeita (erro de start).
+      // Se já foi resolvida, apenas loga (erro de runtime).
+      this.server.on('error', (err: unknown) => {
+        if (!this.startResolved) {
+          reject(err);
+        } else {
+          this.logger.error(`[NativeHttpServer] Runtime error: ${err instanceof Error ? err.message : String(err)}`);
+        }
       });
 
-      // Se o listen falhar (porta ocupada, etc.), rejeita a promise
-      this.server.on('error', reject);
+      this.server.listen(port, () => {
+        const addr = this.server!.address();
+        this.actualPort = typeof addr === 'object' && addr ? (addr as { port: number }).port : port;
+        this.logger.info(`[NativeHttpServer] HTTP server listening on port ${this.actualPort}`);
+        this.startResolved = true;
+        resolve();
+      });
     });
   }
 
   async stop(): Promise<void> {
+    // Idempotente: se já está parando ou servidor é null, resolve imediatamente
+    if (this.stopping || !this.server) {
+      return;
+    }
+
+    this.stopping = true;
+
+    // Remove o listener de abort para não causar loop
+    if (this.abortSignal && this.abortListener) {
+      this.abortSignal.removeEventListener('abort', this.abortListener);
+      this.abortListener = null;
+    }
+
     return new Promise<void>((resolve, reject) => {
-      if (!this.server) {
-        resolve();
-        return;
-      }
-
-      // Remove o listener de abort para não causar loop
-      if (this.abortSignal && this.abortListener) {
-        this.abortSignal.removeEventListener('abort', this.abortListener);
-        this.abortListener = null;
-      }
-
-      this.server.close((err) => {
+      this.server!.close((err) => {
         if (err) {
+          // Se o servidor já não estava ouvindo (ENOTCONN), trata como sucesso
+          if ((err as Error & { code?: string }).code === 'ENOTCONN') {
+            this.logger.info('[NativeHttpServer] Server was already not listening.');
+            this.server = null;
+            this.actualPort = null;
+            this.stopping = false;
+            resolve();
+            return;
+          }
+
           this.logger.error(`[NativeHttpServer] Error closing server: ${err.message}`);
+          this.stopping = false;
           reject(err);
           return;
         }
         this.logger.info('[NativeHttpServer] Server closed successfully.');
         this.server = null;
         this.actualPort = null;
+        this.stopping = false;
         resolve();
       });
     });
@@ -1315,61 +1538,24 @@ export class NativeHttpServer extends IHttpServer {
 }
 </file>
 
-<file path=".clinerules">
-# Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
-
-## 1. Stack e Restrições Rígidas
-- Linguagem: TypeScript (Node.js nativo).
-- Dependências: PROIBIDO o uso de bibliotecas externas (ex: axios, jest, dotenv).
-- Utilizar exclusivamente módulos nativos (fs, path, node:test, node:assert, fetch global).
-
-## 2. Arquitetura e SOLID (DIP)
-- [cite_start]Abstração Primeiro: Sempre defina uma Interface/Classe Abstrata em `src/core` antes da implementação[cite: 167].
-- Inversão de Dependência: Módulos de alto nível dependem de abstrações. [cite_start]Injeção de dependência via construtor é obrigatória[cite: 168].
-- [cite_start]Padrão de Construtor: Para classes com múltiplas configurações, utilize um objeto de configuração (Options Object) em vez de parâmetros posicionais[cite: 412].
-- [cite_start]Desacoplamento: Detalhes técnicos nunca vazam para o Core[cite: 161].
-
-## 3. Robustez, Confiabilidade e Observabilidade
-- [cite_start]Testes Unitários: Use o `node:test` nativo com `mock.method()` para garantir isolamento e restore automático.
-- [cite_start]Resiliência: Implementar Política de Retry, Circuit Breaker e AbortSignal.timeout() global no bootstrap.
-- Log Standardization: Padronize logs e erros internos em Inglês. [cite_start]Mensagens de interface com o usuário devem ser em PT-BR.
-- [cite_start]Controle de Log: O sistema de logging deve suportar níveis (DEBUG, INFO, WARN, ERROR) e filtragem de nível mínimo[cite: 412].
-- [cite_start]Estabilidade: Implementar 'Graceful Shutdown' (SIGINT/SIGTERM) com cancelamento de operações pendentes[cite: 273].
-
-## 4. Documentação e Evolução
-- [cite_start]Manutenção de Contexto: O arquivo `README.md` deve ser atualizado obrigatoriamente pelo Cline sempre que uma Fase do Roadmap for concluída ou um Contrato (Core) for alterado.
-- [cite_start]Alinhamento de Roadmap: Mantenha o status das fases atualizado conforme o progresso real[cite: 422].
-
-## 5. Estrutura de Pastas
-- [cite_start]src/core: Contratos, interfaces e lógica de negócio pura (A "Alma")[cite: 161].
-- [cite_start]src/infra: Implementações técnicas, provedores e drivers (Os "Músculos")[cite: 161].
-- [cite_start]src/main.ts: Orquestração, Wiring manual e ponto de entrada[cite: 162].
-</file>
-
-<file path="src/core/ILogger.ts">
-/**
- * @file ILogger.ts
- * @description Contrato de abstração para o sistema de logging.
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas.
- */
-
-export enum LogLevel {
-  DEBUG = 0,
-  INFO = 1,
-  WARN = 2,
-  ERROR = 3,
-}
-
-export abstract class ILogger {
-  /** Informational message */
-  abstract info(message: string): void;
-  /** Warning that does not halt execution */
-  abstract warn(message: string): void;
-  /** Operational or critical error */
-  abstract error(message: string): void;
-  /** Debug message (development only) */
-  abstract debug(message: string): void;
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "outDir": "dist/",
+    "rootDir": "src/",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
 }
 </file>
 
@@ -1403,6 +1589,7 @@ export class CircuitBreaker extends ICircuitBreaker {
   private readonly failureThreshold: number;
   private readonly openTimeoutMs: number;
   private readonly logger: ILogger;
+  private isProbeInProgress: boolean = false;
 
   /**
    * @param options - Objeto de configuração seguindo o padrão Options Object.
@@ -1415,17 +1602,16 @@ export class CircuitBreaker extends ICircuitBreaker {
   }
 
   get state(): CircuitState {
-    // Verifica se o timeout de OPEN expirou para transitar para HALF_OPEN
-    if (this._state === CircuitState.OPEN && this.hasTimeoutElapsed()) {
-      this.transitionTo(CircuitState.HALF_OPEN);
-    }
+    // Getter puro: retorna o estado interno sem efeitos colaterais.
+    // NÃO realiza transições automáticas aqui.
     return this._state;
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
-    const currentState = this.state; // aciona transição OPEN -> HALF_OPEN se necessário
+    // Verifica transições de estado antes de qualquer lógica de decisão
+    this.checkStateTransitions();
 
-    if (currentState === CircuitState.OPEN) {
+    if (this._state === CircuitState.OPEN) {
       this.logger.warn(
         `[CircuitBreaker] Circuit is OPEN. Request rejected immediately.`
       );
@@ -1434,7 +1620,17 @@ export class CircuitBreaker extends ICircuitBreaker {
       );
     }
 
-    if (currentState === CircuitState.HALF_OPEN) {
+    if (this._state === CircuitState.HALF_OPEN) {
+      // Proteção contra concorrência: apenas a primeira chamada em HALF_OPEN é permitida
+      if (this.isProbeInProgress) {
+        this.logger.warn(
+          `[CircuitBreaker] Probe already in progress. Concurrent HALF_OPEN request rejected.`
+        );
+        throw new Error(
+          '[CircuitBreaker] Circuit is open. Operation not allowed at this time.'
+        );
+      }
+      this.isProbeInProgress = true;
       this.logger.info(
         `[CircuitBreaker] Circuit is HALF_OPEN. Allowing test request.`
       );
@@ -1464,6 +1660,10 @@ export class CircuitBreaker extends ICircuitBreaker {
     ) {
       this.transitionTo(CircuitState.OPEN);
     } else if (this._state === CircuitState.HALF_OPEN) {
+      // Atualiza lastFailureTime novamente mesmo na transição HALF_OPEN -> OPEN
+      // para garantir que a nova janela de timeout seja respeitada integralmente.
+      this.lastFailureTime = Date.now();
+      this.isProbeInProgress = false;
       this.transitionTo(CircuitState.OPEN);
     }
   }
@@ -1471,11 +1671,20 @@ export class CircuitBreaker extends ICircuitBreaker {
   reset(): void {
     this.failureCount = 0;
     this.lastFailureTime = 0;
+    this.isProbeInProgress = false;
     this.transitionTo(CircuitState.CLOSED);
+  }
+
+  private checkStateTransitions(): void {
+    // Transição OPEN -> HALF_OPEN se o timeout expirou
+    if (this._state === CircuitState.OPEN && this.hasTimeoutElapsed()) {
+      this.transitionTo(CircuitState.HALF_OPEN);
+    }
   }
 
   private recordSuccess(): void {
     if (this._state === CircuitState.HALF_OPEN) {
+      this.isProbeInProgress = false;
       this.logger.info(
         `[CircuitBreaker] Test request succeeded. Returning to CLOSED state.`
       );
@@ -1504,56 +1713,6 @@ export class CircuitBreaker extends ICircuitBreaker {
 }
 </file>
 
-<file path="src/infra/ConsoleLogger.ts">
-/**
- * @file ConsoleLogger.ts
- * @description Implementação concreta de ILogger utilizando console do Node.js.
- *              Depende da abstração ILogger, não o contrário.
- */
-
-import { ILogger, LogLevel } from '../core/ILogger.ts';
-
-export class ConsoleLogger extends ILogger {
-  private readonly prefix: string;
-  private readonly level: LogLevel;
-
-  constructor(prefix: string = 'SOBERANO', minLevel: LogLevel = LogLevel.INFO) {
-    super();
-    this.prefix = prefix;
-    this.level = minLevel;
-  }
-
-  private formatMessage(level: string, message: string): string {
-    const timestamp = new Date().toISOString();
-    return `[${timestamp}] [${this.prefix}] [${level}] ${message}`;
-  }
-
-  info(message: string): void {
-    if (this.level <= LogLevel.INFO) {
-      console.log(this.formatMessage('INFO', message));
-    }
-  }
-
-  warn(message: string): void {
-    if (this.level <= LogLevel.WARN) {
-      console.warn(this.formatMessage('WARN', message));
-    }
-  }
-
-  error(message: string): void {
-    if (this.level <= LogLevel.ERROR) {
-      console.error(this.formatMessage('ERROR', message));
-    }
-  }
-
-  debug(message: string): void {
-    if (this.level <= LogLevel.DEBUG) {
-      console.log(this.formatMessage('DEBUG', message));
-    }
-  }
-}
-</file>
-
 <file path="src/infra/OllamaProvider.test.ts">
 /**
  * @file OllamaProvider.test.ts
@@ -1568,6 +1727,7 @@ import { describe, it, mock, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { OllamaProvider } from './OllamaProvider.ts';
 import { ILogger } from '../core/ILogger.ts';
+import { ICircuitBreaker, CircuitState } from '../core/ICircuitBreaker.ts';
 
 /**
  * Logger fictício (mock) que estende ILogger sem efeitos colaterais.
@@ -1587,6 +1747,28 @@ class MockLogger extends ILogger {
   }
   debug(message: string): void {
     this.logs.push(`DEBUG: ${message}`);
+  }
+}
+
+/**
+ * Mock de CircuitBreaker que sempre permite a execução (estado CLOSED).
+ * Usado para satisfazer o requisito DIP nos testes do OllamaProvider.
+ */
+class MockCircuitBreaker extends ICircuitBreaker {
+  get state(): CircuitState {
+    return CircuitState.CLOSED;
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    return fn();
+  }
+
+  recordFailure(): void {
+    // no-op
+  }
+
+  reset(): void {
+    // no-op
   }
 }
 
@@ -1619,7 +1801,8 @@ describe('OllamaProvider', () => {
         });
       });
 
-      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:11434', model: 'test-model' });
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:11434', model: 'test-model', circuitBreaker: mockCB });
       const resposta = await provider.gerarResposta('Prompt de teste');
 
       // Valida que fetch foi chamado na URL correta
@@ -1659,7 +1842,8 @@ describe('OllamaProvider', () => {
         });
       });
 
-      const provider = new OllamaProvider({ logger: mockLogger });
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
       await assert.rejects(
         () => provider.gerarResposta('teste'),
         (err: unknown) => {
@@ -1679,7 +1863,8 @@ describe('OllamaProvider', () => {
         throw new TypeError('fetch failed: connection refused');
       });
 
-      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:99999', model: 'test-model' });
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:99999', model: 'test-model', delayBase: 1, circuitBreaker: mockCB });
       await assert.rejects(
         () => provider.gerarResposta('teste'),
         (err: unknown) => {
@@ -1690,15 +1875,25 @@ describe('OllamaProvider', () => {
         }
       );
 
-      // Valida que o logger registrou 3 tentativas
-      const retryLogs = mockLogger.logs.filter(
-        (log) => log.includes('Attempt') && log.includes('failed')
-      );
-      assert.strictEqual(retryLogs.length, 2, 'Deve haver 2 logs de falha com retry');
+      // Valida o fluxo exato do loop de retry:
+      // Tentativa 1 → falha → log WARN com retry
+      // Tentativa 2 → falha → log WARN com retry
+      // Tentativa 3 → falha → log ERROR de "All attempts failed"
 
-      const errorLog = mockLogger.logs.find((log) => log.includes('All'));
-      assert.ok(errorLog, 'Deve haver log informando que todas as tentativas falharam');
-      assert.ok(errorLog!.includes('3 attempts failed'));
+      // Logs de retry: WARN com "Attempt X failed" e "Retrying"
+      const retryLogs = mockLogger.logs.filter(
+        (log) => log.startsWith('WARN:') && log.includes('failed') && log.includes('Retrying')
+      );
+      assert.strictEqual(retryLogs.length, 2, 'Deve haver 2 logs WARN de retry (Tentativa 1 e 2)');
+      assert.ok(retryLogs[0]!.includes('Attempt 1'), 'Primeiro retry deve ser da Tentativa 1');
+      assert.ok(retryLogs[1]!.includes('Attempt 2'), 'Segundo retry deve ser da Tentativa 2');
+
+      // Log final de falha: ERROR com "All" e "attempts failed"
+      const finalFailLog = mockLogger.logs.filter(
+        (log) => log.startsWith('ERROR:') && log.includes('All') && log.includes('attempts failed')
+      );
+      assert.strictEqual(finalFailLog.length, 1, 'Deve haver exatamente 1 log de falha final');
+      assert.ok(finalFailLog[0]!.includes('3 attempts failed'), 'Deve mencionar 3 tentativas falhas');
     });
 
     it('NÃO deve fazer retry para erros HTTP 4xx (não recuperáveis)', async () => {
@@ -1711,34 +1906,14 @@ describe('OllamaProvider', () => {
         return new Response('Bad Request', { status: 400 });
       });
 
-      const provider = new OllamaProvider({ logger: mockLogger });
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
       await assert.rejects(() => provider.gerarResposta('teste'));
       // Deve ter chamado fetch apenas 1 vez (sem retry para 4xx)
       assert.strictEqual(callCount, 1, 'Não deve haver retry para erro HTTP 4xx');
     });
   });
 });
-</file>
-
-<file path="tsconfig.json">
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "outDir": "dist/",
-    "rootDir": "src/",
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "allowImportingTsExtensions": true,
-    "noEmit": true
-  },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist"]
-}
 </file>
 
 <file path="src/infra/CircuitBreaker.test.ts">
@@ -1856,33 +2031,40 @@ describe('CircuitBreaker', () => {
   describe('Transição OPEN -> HALF_OPEN', () => {
     it('deve transitar para HALF_OPEN após o timeout expirar', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 }); // timeout de 50ms
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 1 }); // timeout mínimo
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
 
       // Aguarda o timeout expirar
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      await new Promise((resolve) => setTimeout(resolve, 5));
 
-      // Ao acessar .state, deve transitar para HALF_OPEN
-      assert.strictEqual(cb.state, CircuitState.HALF_OPEN);
+      // Executa uma função de sucesso - isso aciona checkStateTransitions() internamente,
+      // que deve transitar de OPEN para HALF_OPEN antes da lógica de decisão.
+      const successFn = () => Promise.resolve('recuperado');
+      const result = await cb.execute(successFn);
+      assert.strictEqual(result, 'recuperado');
+
+      // Após sucesso em HALF_OPEN, deve voltar para CLOSED
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
     });
   });
 
   describe('Transição HALF_OPEN -> CLOSED', () => {
     it('deve retornar para CLOSED após sucesso em HALF_OPEN', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 });
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 1 });
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
 
       // Aguarda timeout para HALF_OPEN
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      await new Promise((resolve) => setTimeout(resolve, 5));
 
-      // Executa com sucesso: deve transitar para CLOSED
+      // Executa com sucesso: checkStateTransitions() transita para HALF_OPEN,
+      // depois a função executa com sucesso e volta para CLOSED
       const successFn = () => Promise.resolve('recuperado');
       const result = await cb.execute(successFn);
       assert.strictEqual(result, 'recuperado');
@@ -1893,18 +2075,64 @@ describe('CircuitBreaker', () => {
   describe('Transição HALF_OPEN -> OPEN', () => {
     it('deve voltar para OPEN após falha em HALF_OPEN', async () => {
       const logger = new MockLogger();
-      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 50 });
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 1 });
 
       const failingFn = () => Promise.reject(new Error('Falha'));
       await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
 
       // Aguarda timeout para HALF_OPEN
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      await new Promise((resolve) => setTimeout(resolve, 5));
 
-      // Falha em HALF_OPEN: volta para OPEN
+      // Falha em HALF_OPEN: checkStateTransitions() transita para HALF_OPEN,
+      // a função falha e volta para OPEN
       await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
+    });
+  });
+
+  describe('Proteção de concorrência em HALF_OPEN', () => {
+    it('deve rejeitar chamadas concorrentes quando probe já está em andamento', async () => {
+      const logger = new MockLogger();
+      const cb = new CircuitBreaker({ logger, failureThreshold: 1, openTimeoutMs: 1 });
+
+      // Abre o circuito
+      const failingFn = () => Promise.reject(new Error('Falha'));
+      await assert.rejects(() => cb.execute(failingFn));
+      assert.strictEqual(cb.state, CircuitState.OPEN);
+
+      // Aguarda timeout para HALF_OPEN
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      // Cria uma função que nunca resolve (simula probe em andamento)
+      let resolveProbe: (value: string) => void = () => {};
+      const probePromise = new Promise<string>((resolve) => {
+        resolveProbe = resolve;
+      });
+      const slowFn = () => probePromise;
+
+      // Inicia a primeira chamada (probe) - não await aqui, queremos concorrência
+      const firstCall = cb.execute(slowFn);
+
+      // A segunda chamada concorrente deve ser rejeitada
+      const successFn = () => Promise.resolve('ok');
+      await assert.rejects(
+        () => cb.execute(successFn),
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('Circuit is open'));
+          }
+          return true;
+        }
+      );
+
+      // Finaliza a probe para evitar hanging
+      resolveProbe('done');
+      const result = await firstCall;
+      assert.strictEqual(result, 'done');
+
+      // Após sucesso, deve estar em CLOSED
+      assert.strictEqual(cb.state, CircuitState.CLOSED);
     });
   });
 
@@ -2045,11 +2273,12 @@ export class OllamaProvider extends IMotorCognitivo {
   private readonly maxRetries: number;
   private readonly delayBase: number;
   private readonly timeoutMs: number;
-  private readonly circuitBreaker?: ICircuitBreaker;
+  private readonly circuitBreaker: ICircuitBreaker;
   private externalSignal: AbortSignal | null = null;
 
   /**
    * @param config - Objeto de configuração (OllamaConfig). Apenas `logger` é obrigatório.
+   * @throws {Error} Se circuitBreaker não for fornecido (DIP obrigatório).
    */
   constructor(config: OllamaConfig) {
     super();
@@ -2059,6 +2288,13 @@ export class OllamaProvider extends IMotorCognitivo {
     this.maxRetries = config.maxRetries ?? 3;
     this.delayBase = config.delayBase ?? 1_000;
     this.timeoutMs = config.timeoutMs ?? 30_000;
+
+    if (!config.circuitBreaker) {
+      throw new Error(
+        '[OllamaProvider] CircuitBreaker is required for DIP compliance. ' +
+        'Provide an instance of ICircuitBreaker in the configuration.'
+      );
+    }
     this.circuitBreaker = config.circuitBreaker;
   }
 
@@ -2073,10 +2309,29 @@ export class OllamaProvider extends IMotorCognitivo {
 
   /**
    * Aguarda um tempo determinado (ms) usando setTimeout encapsulado em Promise.
-   * Usado entre tentativas de retry.
+   * Aceita um AbortSignal para permitir cancelamento do delay (ex: shutdown).
+   * Rejeita com DOMException('Aborted', 'AbortError') se o sinal for abortado.
    */
-  private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private delay(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      // Se o sinal já estiver abortado, rejeita imediatamente
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        resolve();
+      }, ms);
+
+      // Se um sinal for fornecido, escuta o evento 'abort' para cancelar o delay
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+      }
+    });
   }
 
   /**
@@ -2123,7 +2378,7 @@ export class OllamaProvider extends IMotorCognitivo {
 
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       const attemptController = new AbortController();
-      let timeoutHandle: ReturnType<typeof setTimeout>;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
       // Função de cleanup que remove o listener externo e limpa o timeout
       let removeExternalListener: (() => void) | null = null;
@@ -2186,13 +2441,37 @@ export class OllamaProvider extends IMotorCognitivo {
           return validated;
         };
 
-        const data: OllamaGenerateResponse = this.circuitBreaker
-          ? await this.circuitBreaker.execute(executeFetch)
-          : await executeFetch();
+        const data: OllamaGenerateResponse = await this.circuitBreaker.execute(executeFetch);
 
         return data.response;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
+
+        // Verifica se o erro é HTTP 4xx (não recuperável) - gera log claro
+        if (error instanceof Error && /HTTP error [4][0-9]{2}/.test(error.message)) {
+          this.logger.error(
+            `[OllamaProvider] Non-retryable HTTP error in attempt ${attempt}/${this.maxRetries}. ` +
+            `Breaking immediately.\n  Error: ${lastError.message}`
+          );
+          this.logger.error(
+            `[OllamaProvider] All ${this.maxRetries} attempts failed. ` +
+            `Last error: ${lastError.message}`
+          );
+          break;
+        }
+
+        // Verifica se o erro é de cancelamento (shutdown/timeout)
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          this.logger.error(
+            `[OllamaProvider] Operation aborted in attempt ${attempt}/${this.maxRetries}. ` +
+            `Breaking immediately.\n  Error: ${lastError.message}`
+          );
+          this.logger.error(
+            `[OllamaProvider] All ${this.maxRetries} attempts failed. ` +
+            `Last error: ${lastError.message}`
+          );
+          break;
+        }
 
         if (this.isRetryableError(error) && attempt < this.maxRetries) {
           const delayMs = this.delayBase * attempt; // backoff: 1x, 2x, 3x
@@ -2202,13 +2481,29 @@ export class OllamaProvider extends IMotorCognitivo {
             `  Error: ${lastError.message}`
           );
           if (this.externalSignal?.aborted) {
+            this.logger.error(
+              `[OllamaProvider] External signal aborted during retry delay. Breaking.`
+            );
             break;
           }
-          await this.delay(delayMs);
+          // Aguarda o delay com suporte a abort signal para interromper imediatamente no shutdown
+          try {
+            await this.delay(delayMs, this.externalSignal ?? undefined);
+          } catch (delayError) {
+            this.logger.error(
+              `[OllamaProvider] Retry delay aborted by external signal. Breaking.`
+            );
+            break;
+          }
           continue;
         }
 
-        // Se não for retryável ou acabaram as tentativas, propaga o erro
+        // Erro não recuperável sem ser 4xx (ex: erro interno, falha final)
+        this.logger.error(
+          `[OllamaProvider] Unrecoverable error in attempt ${attempt}/${this.maxRetries}. ` +
+          `Breaking.\n  Error: ${lastError.message}`
+        );
+
         if (attempt >= this.maxRetries) {
           this.logger.error(
             `[OllamaProvider] All ${this.maxRetries} attempts failed. ` +
@@ -2217,7 +2512,9 @@ export class OllamaProvider extends IMotorCognitivo {
         }
         break;
       } finally {
-        clearTimeout(timeoutHandle);
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
+        }
         if (removeExternalListener) {
           removeExternalListener();
         }
@@ -2361,10 +2658,11 @@ npm run typecheck
 |------|-----------|--------|
 | **1** | CLI MVP — comunicação básica com Ollama + Circuit Breaker | ✅ **Concluída** |
 | **2** | Sensores — FileSensor (leitura de arquivos locais) | ✅ **Concluída** |
-| **3** | Memória — Embeddings + Vector Store (RAG Tradicional) | 🔄 **Em andamento** |
-| **4** | Gerenciamento de contexto e sessões multi-turno | ⏳ Planejada |
-| **5** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
-| **6** | Web UI (React) + WebSocket | ⏳ Planejada |
+| **3** | Memória — Embeddings + Vector Store (RAG Tradicional) | ✅ **Concluída** |
+| **4** | Qualidade de Teste e Determinismo — timeouts mínimos, mock.fn, assertions de retry | ✅ **Concluída** |
+| **5** | Gerenciamento de contexto e sessões multi-turno | ⏳ Planejada |
+| **6** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
+| **7** | Web UI (React) + WebSocket | ⏳ Planejada |
 
 ## Contratos do Core
 
@@ -2419,13 +2717,13 @@ abstract class IEmbeddings {
 }
 ```
 
-### `IVectorStore`
+### `IVectorStore<M>`
 
 ```typescript
-abstract class IVectorStore {
-  abstract adicionar(id: string, vector: number[], metadata: any): Promise<void>;
+abstract class IVectorStore<M = any> {
+  abstract adicionar(id: string, vector: number[], metadata: M): Promise<void>;
   abstract buscarSimilares(vector: number[], limit: number): Promise<
-    { id: string; metadata: any; score: number }[]
+    { id: string; metadata: M; score: number }[]
   >;
 }
 ```
@@ -2445,6 +2743,13 @@ abstract class IVectorStore {
  *              Necessário porque não podemos instalar @types/node (zero dependências externas).
  *              Apenas o essencial para eliminar erros de TypeScript no VS Code.
  */
+
+// Buffer global (necessário para node:fs/promises overloads)
+declare class Buffer {
+  length: number;
+  static from(data: string, encoding?: string): Buffer;
+  toString(encoding?: string): string;
+}
 
 // Process global
 declare var process: {
@@ -2493,11 +2798,15 @@ declare module 'node:test' {
   }
   interface MockMethodObject {
     calls: MockCall[];
-    callCount: number;
+    callCount(): number;
     restore: () => void;
   }
+  interface MockFunction<T extends (...args: any[]) => any> {
+    (...args: Parameters<T>): ReturnType<T>;
+    mock: MockMethodObject;
+  }
   export const mock: {
-    fn: typeof Function;
+    fn<T extends (...args: any[]) => any>(implementation?: T): MockFunction<T>;
     method<T, K extends keyof T>(object: T, method: K, implementation?: ((...args: any[]) => any) | undefined): T[K] & { mock: MockMethodObject };
     restoreAll(): void;
   };
@@ -2531,7 +2840,8 @@ declare module 'node:http' {
 // node:fs/promises
 declare module 'node:fs/promises' {
   export function readFile(path: string): Promise<Buffer>;
-  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string>;
+  export function readFile(path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
+  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
 }
 
 // node:assert
@@ -2602,10 +2912,12 @@ let isShuttingDown = false;
  *
  * @param logger            - Instância de ILogger para logging
  * @param shutdownController - AbortController global para cancelar operações
+ * @param httpServer        - Servidor HTTP para parar durante o shutdown
  */
 function registerShutdownHandlers(
   logger: ILogger,
-  shutdownController: AbortController
+  shutdownController: AbortController,
+  httpServer: IHttpServer
 ): void {
   const shutdown = async (signal: string) => {
     if (isShuttingDown) {
@@ -2626,13 +2938,18 @@ function registerShutdownHandlers(
     process.removeAllListeners('SIGINT');
     process.removeAllListeners('SIGTERM');
 
-    // Abort all in-flight operations (OllamaProvider fetch)
+    // 1. Aborta todas as operações em andamento (OllamaProvider fetch)
     shutdownController.abort();
 
-    // 5s timer stays active during cleanup.
-    // If future async cleanup operations lock up,
-    // the timer fires and forces process.exit(1).
+    // 2. Após o abort ter sido propagado, para o servidor HTTP
+    try {
+      await httpServer.stop();
+      logger.info('[main] HTTP server stopped.');
+    } catch (err) {
+      logger.error(`[main] Error stopping HTTP server: ${err}`);
+    }
 
+    // 3. Cleanup concluído
     clearTimeout(forceExitTimer);
     logger.info('[main] Resources released. Goodbye, SOBERANO.');
     process.exit(0);
@@ -2658,9 +2975,6 @@ async function bootstrap(): Promise<void> {
   // --- ABORT CONTROLLER GLOBAL PARA GRACEFUL SHUTDOWN ---
   const shutdownController = new AbortController();
 
-  // --- GRACEFUL SHUTDOWN ---
-  registerShutdownHandlers(logger, shutdownController);
-
   // --- CIRCUIT BREAKER ---
   const circuitBreaker = new CircuitBreaker({ logger });
 
@@ -2669,6 +2983,9 @@ async function bootstrap(): Promise<void> {
     logger,
     abortSignal: shutdownController.signal,
   });
+
+  // --- GRACEFUL SHUTDOWN (após httpServer criado) ---
+  registerShutdownHandlers(logger, shutdownController, httpServer);
 
   // --- GLOBAL TIMEOUT (fallback para evitar travamento silencioso) ---
   const globalTimeoutSignal = AbortSignal.timeout(120_000);
@@ -2688,7 +3005,16 @@ async function bootstrap(): Promise<void> {
 
   // --- INICIALIZAÇÃO DO SERVIDOR HTTP ---
   // Aceita porta via 3º argumento da CLI: npm start -- <caminho> <porta>
-  const HTTP_PORT = Number(process.argv[3]) || 3000;
+  // Se nenhum argumento for passado, usa porta padrão 3000
+  const portArg = process.argv[3];
+  let HTTP_PORT = 3000;
+  if (portArg !== undefined) {
+    HTTP_PORT = parseInt(portArg, 10);
+    if (Number.isNaN(HTTP_PORT)) {
+      logger.error(`[main] Invalid port argument "${portArg}". Porta inválida. Encerrando.`);
+      process.exit(1);
+    }
+  }
   await httpServer.start(HTTP_PORT);
 
   const promptTeste = 'Olá, Soberano. Confirme que seus sistemas base estão online.';

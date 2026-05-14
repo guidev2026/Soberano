@@ -135,11 +135,15 @@ async function bootstrap(): Promise<void> {
 
   // --- INICIALIZAÇÃO DO SERVIDOR HTTP ---
   // Aceita porta via 3º argumento da CLI: npm start -- <caminho> <porta>
+  // Se nenhum argumento for passado, usa porta padrão 3000
   const portArg = process.argv[3];
-  const HTTP_PORT = typeof portArg === 'string' ? parseInt(portArg, 10) : NaN;
-  if (Number.isNaN(HTTP_PORT)) {
-    logger.error(`[main] Invalid port argument "${portArg ?? '(undefined)'}". Porta inválida. Encerrando.`);
-    process.exit(1);
+  let HTTP_PORT = 3000;
+  if (portArg !== undefined) {
+    HTTP_PORT = parseInt(portArg, 10);
+    if (Number.isNaN(HTTP_PORT)) {
+      logger.error(`[main] Invalid port argument "${portArg}". Porta inválida. Encerrando.`);
+      process.exit(1);
+    }
   }
   await httpServer.start(HTTP_PORT);
 
