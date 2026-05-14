@@ -68,6 +68,19 @@ describe('NativeHttpServer', () => {
   });
 
   describe('Integração com AbortSignal', () => {
+    /**
+     * Helper que aguarda até que uma condição seja satisfeita,
+     * com polling assíncrono em vez de um timeout fixo.
+     */
+    async function waitForCondition(condition: () => boolean, timeoutMs = 500): Promise<void> {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        if (condition()) return;
+        await new Promise<void>((resolve) => queueMicrotask(resolve));
+      }
+      throw new Error('Timeout: condição não foi satisfeita dentro do prazo');
+    }
+
     it('deve parar o servidor quando o AbortSignal é disparado', async () => {
       const logger = new MockLogger();
       const controller = new AbortController();
@@ -79,8 +92,10 @@ describe('NativeHttpServer', () => {
       // Dispara o sinal de aborto
       controller.abort();
 
-      // Aguarda um tick para o listener processar
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Aguarda até que o servidor tenha sido fechado (baseado em eventos/estados)
+      await waitForCondition(() =>
+        logger.logs.some((log) => log.includes('closed') || log.includes('AbortSignal'))
+      );
 
       // O servidor deve ter sido fechado (stop chamado internamente)
       assert.ok(

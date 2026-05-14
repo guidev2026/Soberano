@@ -45,14 +45,14 @@ src/
 |----------------|--------|
 | Logging estruturado com níveis (DEBUG, INFO, WARN, ERROR) | ✅ |
 | Filtragem por nível mínimo de log | ✅ |
-| Comunicação com Ollama via REST (fetch nativo) | ✅ |
+| Comunicação com Ollama via REST (fetch nativo) | ✅ Estabilizada |
 | Retry automático com backoff progressivo | ✅ |
 | Circuit Breaker (CLOSED / OPEN / HALF_OPEN) | ✅ |
 | Timeout global (120s) via `AbortSignal.timeout` | ✅ |
 | Graceful shutdown (SIGINT/SIGTERM) | ✅ |
 | Validação de schema em runtime da resposta da API | ✅ |
 | Testes unitários com `node:test` e `mock.method` | ✅ |
-| Sensor de arquivo (FileSensor) com `node:fs/promises` | ✅ |
+| Sensor de arquivo (FileSensor) com `node:fs/promises` | ✅ Estabilizada |
 | Contrato genérico ISensor\<T\> (preparação para novos sensores) | ✅ |
 
 ## Como Executar

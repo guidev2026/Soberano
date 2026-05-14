@@ -27,6 +27,9 @@ declare class AbortSignal {
   static any(signals: AbortSignal[]): AbortSignal;
 }
 
+// queueMicrotask
+declare function queueMicrotask(callback: () => void): void;
+
 // setTimeout e clearTimeout
 declare function setTimeout(
   callback: (...args: unknown[]) => void,
@@ -82,8 +85,8 @@ declare module 'node:http' {
 
 // node:fs/promises
 declare module 'node:fs/promises' {
+  export function readFile(path: string): Promise<Buffer>;
   export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string>;
-  export function readFile(path: string, options: { encoding: null; signal?: AbortSignal }): Promise<Buffer>;
 }
 
 // node:assert

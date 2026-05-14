@@ -1,6 +1,6 @@
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Fase 3 (Comunicação).
+ * @description Ponto de entrada do sistema SOBERANO - Fase 2 (Sensores).
  *              Realiza o wiring manual (Injeção de Dependência) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
@@ -87,7 +87,7 @@ async function bootstrap(): Promise<void> {
 
   logger.info(
     '╔══════════════════════════════════════════════════╗\n' +
-    '║       SOBERANO - Fase 3 (Comunicação)            ║\n' +
+    '║       SOBERANO - Fase 2 (Sensores)               ║\n' +
     '║       Inicializando sistemas...                  ║\n' +
     '╚══════════════════════════════════════════════════╝'
   );

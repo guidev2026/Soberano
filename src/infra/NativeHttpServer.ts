@@ -10,7 +10,7 @@
  *              - Integra-se ao AbortSignal global para graceful shutdown
  */
 
-import http from 'node:http';
+import { createServer, Server } from 'node:http';
 import { IHttpServer } from '../core/IHttpServer.ts';
 import { ILogger } from '../core/ILogger.ts';
 
@@ -24,7 +24,7 @@ export interface NativeHttpServerOptions {
 }
 
 export class NativeHttpServer extends IHttpServer {
-  private server: http.Server | null = null;
+  private server: Server | null = null;
   private readonly logger: ILogger;
   private readonly abortSignal?: AbortSignal;
   private abortListener: (() => void) | null = null;
@@ -37,7 +37,7 @@ export class NativeHttpServer extends IHttpServer {
 
   async start(port: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      this.server = http.createServer((req, res) => {
+      this.server = createServer((req, res) => {
         // Rota de health-check
         if (req.url === '/healthz' && req.method === 'GET') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
