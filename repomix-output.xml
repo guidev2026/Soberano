@@ -1,0 +1,687 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/**/*, .clinerules
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  core/
+    ILogger.ts
+    IMotorCognitivo.ts
+  infra/
+    ConsoleLogger.ts
+    OllamaProvider.test.ts
+    OllamaProvider.ts
+  env.d.ts
+  main.ts
+.clinerules
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/core/ILogger.ts">
+/**
+ * @file ILogger.ts
+ * @description Contrato de abstração para o sistema de logging.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ */
+
+export abstract class ILogger {
+  /** Mensagem informativa padrão */
+  abstract info(message: string): void;
+  /** Aviso que não impede a execução mas merece atenção */
+  abstract warn(message: string): void;
+  /** Erro operacional recuperável ou crítico */
+  abstract error(message: string): void;
+  /** Mensagem de depuração (desenvolvimento) */
+  abstract debug(message: string): void;
+}
+</file>
+
+<file path="src/core/IMotorCognitivo.ts">
+/**
+ * @file IMotorCognitivo.ts
+ * @description Contrato de abstração para o motor cognitivo (LLM).
+ *              Módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas (DIP).
+ *              Classe abstrata em vez de interface para preservar
+ *              a estrutura em runtime com --experimental-transform-types.
+ */
+
+export abstract class IMotorCognitivo {
+  /**
+   * Envia um prompt ao motor cognitivo e retorna a resposta gerada.
+   * @param prompt - O texto de entrada para o modelo de linguagem.
+   * @returns A resposta gerada pelo modelo.
+   */
+  abstract gerarResposta(prompt: string): Promise<string>;
+}
+</file>
+
+<file path="src/infra/ConsoleLogger.ts">
+/**
+ * @file ConsoleLogger.ts
+ * @description Implementação concreta de ILogger utilizando console do Node.js.
+ *              Depende da abstração ILogger, não o contrário.
+ */
+
+import { ILogger } from '../core/ILogger.ts';
+
+export class ConsoleLogger extends ILogger {
+  private readonly prefix: string;
+
+  constructor(prefix: string = 'SOBERANO') {
+    super();
+    this.prefix = prefix;
+  }
+
+  private formatMessage(level: string, message: string): string {
+    const timestamp = new Date().toISOString();
+    return `[${timestamp}] [${this.prefix}] [${level}] ${message}`;
+  }
+
+  info(message: string): void {
+    console.log(this.formatMessage('INFO', message));
+  }
+
+  warn(message: string): void {
+    console.warn(this.formatMessage('WARN', message));
+  }
+
+  error(message: string): void {
+    console.error(this.formatMessage('ERROR', message));
+  }
+
+  debug(message: string): void {
+    console.log(this.formatMessage('DEBUG', message));
+  }
+}
+</file>
+
+<file path="src/infra/OllamaProvider.test.ts">
+/**
+ * @file OllamaProvider.test.ts
+ * @description Testes unitários para OllamaProvider utilizando
+ *              node:test e node:assert (zero dependências externas).
+ *
+ * Como executar:
+ *   node --experimental-transform-types src/infra/OllamaProvider.test.ts
+ */
+
+import { describe, it, mock } from 'node:test';
+import assert from 'node:assert';
+import { OllamaProvider } from './OllamaProvider.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+/**
+ * Logger fictício (mock) que estende ILogger sem efeitos colaterais.
+ * Usado para isolar os testes do sistema de logging real.
+ */
+class MockLogger extends ILogger {
+  public logs: string[] = [];
+
+  constructor() {
+    super();
+  }
+
+  info(message: string): void {
+    this.logs.push(`INFO: ${message}`);
+  }
+  warn(message: string): void {
+    this.logs.push(`WARN: ${message}`);
+  }
+  error(message: string): void {
+    this.logs.push(`ERROR: ${message}`);
+  }
+  debug(message: string): void {
+    this.logs.push(`DEBUG: ${message}`);
+  }
+}
+
+describe('OllamaProvider', () => {
+  describe('Chamada fetch - gerarResposta', () => {
+    it('deve chamar fetch com a URL e payload corretos', async () => {
+      const mockLogger = new MockLogger();
+
+      // Mock global fetch que captura a chamada e retorna resposta simulada
+      const originalFetch = globalThis.fetch;
+      let capturedUrl: string | undefined;
+      let capturedOptions: RequestInit | undefined;
+
+      globalThis.fetch = async (url: RequestInfo | URL, options?: RequestInit) => {
+        capturedUrl = typeof url === 'string' ? url : url.toString();
+        capturedOptions = options;
+
+        return new Response(JSON.stringify({
+          model: 'test-model',
+          created_at: new Date().toISOString(),
+          response: 'Resposta de teste do SOBERANO.',
+          done: true,
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      try {
+        const provider = new OllamaProvider(mockLogger, 'http://localhost:11434', 'test-model');
+        const resposta = await provider.gerarResposta('Prompt de teste');
+
+        // Valida que fetch foi chamado na URL correta
+        assert.strictEqual(capturedUrl, 'http://localhost:11434/api/generate');
+
+        // Valida que o payload foi enviado corretamente
+        assert.ok(capturedOptions, 'fetch deve ter sido chamado com options');
+        assert.strictEqual(capturedOptions!.method, 'POST');
+        assert.strictEqual((capturedOptions!.headers as Record<string, string>)?.['Content-Type'], 'application/json');
+
+        const sentBody = JSON.parse(capturedOptions!.body as string);
+        assert.strictEqual(sentBody.model, 'test-model');
+        assert.strictEqual(sentBody.prompt, 'Prompt de teste');
+        assert.strictEqual(sentBody.stream, false);
+
+        // Valida que a resposta foi processada corretamente
+        assert.strictEqual(resposta, 'Resposta de teste do SOBERANO.');
+
+        // Valida que o logger registrou a operação
+        assert.ok(
+          mockLogger.logs.some((log) => log.includes('Tentativa 1/3')),
+          'Logger deve registrar a tentativa de envio'
+        );
+        assert.ok(
+          mockLogger.logs.some((log) => log.includes('bem-sucedida')),
+          'Logger deve registrar sucesso'
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('deve lançar erro HTTP quando resposta não for ok', async () => {
+      const mockLogger = new MockLogger();
+      const originalFetch = globalThis.fetch;
+
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify({ error: 'Model not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      try {
+        const provider = new OllamaProvider(mockLogger);
+        await assert.rejects(
+          () => provider.gerarResposta('teste'),
+          (err: unknown) => {
+            if (err instanceof Error) {
+              assert.ok(err.message.includes('Erro HTTP 404'));
+            }
+            return true;
+          }
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('deve fazer retry em caso de erro de conexão e falhar após 3 tentativas', async () => {
+      const mockLogger = new MockLogger();
+      const originalFetch = globalThis.fetch;
+
+      // Fetch que sempre falha com TypeError (erro de conexão)
+      globalThis.fetch = async () => {
+        throw new TypeError('fetch failed: connection refused');
+      };
+
+      try {
+        const provider = new OllamaProvider(mockLogger, 'http://localhost:99999', 'test-model');
+        await assert.rejects(
+          () => provider.gerarResposta('teste'),
+          (err: unknown) => {
+            if (err instanceof Error) {
+              assert.ok(err.message.includes('fetch failed'));
+            }
+            return true;
+          }
+        );
+
+        // Valida que o logger registrou 3 tentativas
+        const retryLogs = mockLogger.logs.filter(
+          (log) => log.includes('Tentativa') && log.includes('falhou')
+        );
+        assert.strictEqual(retryLogs.length, 2, 'Deve haver 2 logs de falha com retry');
+
+        const errorLog = mockLogger.logs.find((log) => log.includes('Todas as'));
+        assert.ok(errorLog, 'Deve haver log informando que todas as tentativas falharam');
+        assert.ok(errorLog!.includes('3 tentativas falharam'));
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('NÃO deve fazer retry para erros HTTP 4xx (não recuperáveis)', async () => {
+      const mockLogger = new MockLogger();
+      const originalFetch = globalThis.fetch;
+
+      let callCount = 0;
+
+      globalThis.fetch = async () => {
+        callCount++;
+        return new Response('Bad Request', { status: 400 });
+      };
+
+      try {
+        const provider = new OllamaProvider(mockLogger);
+        await assert.rejects(() => provider.gerarResposta('teste'));
+        // Deve ter chamado fetch apenas 1 vez (sem retry para 4xx)
+        assert.strictEqual(callCount, 1, 'Não deve haver retry para erro HTTP 4xx');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  });
+});
+</file>
+
+<file path="src/infra/OllamaProvider.ts">
+/**
+ * @file OllamaProvider.ts
+ * @description Implementação concreta de IMotorCognitivo que se comunica
+ *              com o servidor local Ollama via API REST (fetch nativo).
+ *              - Depende da abstração IMotorCognitivo, não o contrário (DIP).
+ *              - Retry automático (3 tentativas) para erros de conexão.
+ *              - Logger injetado via construtor.
+ */
+
+import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+interface OllamaGenerateResponse {
+  model: string;
+  created_at: string;
+  response: string;
+  done: boolean;
+  context?: number[];
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
+  eval_count?: number;
+  eval_duration?: number;
+}
+
+export class OllamaProvider extends IMotorCognitivo {
+  private readonly baseUrl: string;
+  private readonly model: string;
+  private readonly logger: ILogger;
+  private readonly maxRetries: number = 3;
+
+  /**
+   * @param logger  - Instância de ILogger para logging estruturado
+   * @param baseUrl - URL base do servidor Ollama (padrão: http://localhost:11434)
+   * @param model   - Nome do modelo a ser utilizado (padrão: qwen2.5-coder:3b)
+   */
+  constructor(
+    logger: ILogger,
+    baseUrl: string = 'http://localhost:11434',
+    model: string = 'qwen2.5-coder:3b'
+  ) {
+    super();
+    this.logger = logger;
+    this.baseUrl = baseUrl;
+    this.model = model;
+  }
+
+  /**
+   * Aguarda um tempo determinado (ms) usando setTimeout encapsulado em Promise.
+   * Usado entre tentativas de retry.
+   */
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Determina se um erro é recuperável (conexão/temporário) para retry.
+   */
+  private isRetryableError(error: unknown): boolean {
+    if (error instanceof TypeError && error.message.includes('fetch')) {
+      return true;
+    }
+    if (error instanceof Error) {
+      // Erros de rede/DNS/ECONNREFUSED geralmente disparam TypeError no fetch
+      const msg = error.message.toLowerCase();
+      return (
+        msg.includes('econnrefused') ||
+        msg.includes('socket hang up') ||
+        msg.includes('network') ||
+        msg.includes('timeout') ||
+        msg.includes('fetch failed')
+      );
+    }
+    return false;
+  }
+
+  /**
+   * Envia um prompt ao modelo Ollama e retorna a resposta gerada.
+   * Utiliza exclusivamente o fetch nativo do Node.js (sem dependências externas).
+   * Implementa retry automático (máximo de 3 tentativas) para erros de conexão.
+   *
+   * @param prompt - O texto de entrada para o modelo.
+   * @returns A resposta gerada pelo modelo.
+   * @throws {Error} Se após todas as tentativas a comunicação falhar.
+   */
+  async gerarResposta(prompt: string): Promise<string> {
+    const url = `${this.baseUrl}/api/generate`;
+
+    const payload = {
+      model: this.model,
+      prompt,
+      stream: false,
+    };
+
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        this.logger.info(
+          `[OllamaProvider] Tentativa ${attempt}/${this.maxRetries} - Enviando prompt ao modelo "${this.model}"`
+        );
+
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          const errorBody = await response.text().catch(() => 'Sem corpo de erro disponível');
+          throw new Error(
+            `[OllamaProvider] Erro HTTP ${response.status} ao comunicar com o motor cognitivo.\n` +
+            `  URL: ${url}\n` +
+            `  Modelo: ${this.model}\n` +
+            `  Detalhes: ${errorBody}`
+          );
+        }
+
+        const data = (await response.json()) as OllamaGenerateResponse;
+
+        if (data.response === undefined || data.response === null) {
+          throw new Error(
+            `[OllamaProvider] Resposta inesperada do motor cognitivo: campo "response" ausente.\n` +
+            `  Corpo recebido: ${JSON.stringify(data)}`
+          );
+        }
+
+        this.logger.info(
+          `[OllamaProvider] Tentativa ${attempt} bem-sucedida. Resposta recebida (${data.response.length} caracteres).`
+        );
+
+        return data.response;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (this.isRetryableError(error) && attempt < this.maxRetries) {
+          const delayMs = 1000 * attempt; // backoff: 1s, 2s, 3s
+          this.logger.warn(
+            `[OllamaProvider] Tentativa ${attempt} falhou (erro de conexão). ` +
+            `Nova tentativa em ${delayMs}ms...\n` +
+            `  Erro: ${lastError.message}`
+          );
+          await this.delay(delayMs);
+          continue;
+        }
+
+        // Se não for retryável ou acabaram as tentativas, propaga o erro
+        if (attempt >= this.maxRetries) {
+          this.logger.error(
+            `[OllamaProvider] Todas as ${this.maxRetries} tentativas falharam. ` +
+            `Desistindo.\n  Último erro: ${lastError.message}`
+          );
+        }
+        break;
+      }
+    }
+
+    // Se chegou aqui, todas as tentativas falharam
+    throw lastError ?? new Error('[OllamaProvider] Falha desconhecida após retry');
+  }
+}
+</file>
+
+<file path="src/env.d.ts">
+/**
+ * @file env.d.ts
+ * @description Declarações de tipos mínimas para APIs nativas do Node.js.
+ *              Necessário porque não podemos instalar @types/node (zero dependências externas).
+ *              Apenas o essencial para eliminar erros de TypeScript no VS Code.
+ */
+
+// Process global
+declare var process: {
+  exit(code?: number): never;
+  on(event: string, listener: (...args: unknown[]) => void): void;
+  removeAllListeners(event?: string): void;
+};
+
+// node:test
+declare module 'node:test' {
+  interface TestContext {
+    diagnostic(message: string): void;
+  }
+  export function describe(name: string, fn: () => void): void;
+  export function it(name: string, fn: (t: TestContext) => void | Promise<void>): void;
+  export const mock: {
+    fn: typeof Function;
+  };
+  export function before(fn: () => void | Promise<void>): void;
+  export function after(fn: () => void | Promise<void>): void;
+}
+
+// node:assert
+declare module 'node:assert' {
+  interface Assert {
+    ok(value: unknown, message?: string): void;
+    strictEqual<T>(actual: T, expected: T, message?: string): void;
+    rejects(
+      block: (() => Promise<unknown>) | Promise<unknown>,
+      error?: RegExp | Function | Object | Error,
+      message?: string
+    ): Promise<void>;
+    fail(message?: string): never;
+  }
+  const assert: Assert;
+  export default assert;
+}
+</file>
+
+<file path="src/main.ts">
+/**
+ * @file main.ts
+ * @description Ponto de entrada do sistema SOBERANO - Fase 1 (CLI MVP).
+ *              Realiza o wiring manual (Injeção de Dependência) seguindo o DIP:
+ *              - Instancia ConsoleLogger para logging estruturado
+ *              - Instancia OllamaProvider com Logger injetado via construtor
+ *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
+ *              - Executa o teste inicial de comunicação com o motor cognitivo
+ */
+
+import { OllamaProvider } from './infra/OllamaProvider.ts';
+import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
+import { ConsoleLogger } from './infra/ConsoleLogger.ts';
+import { ILogger } from './core/ILogger.ts';
+
+/**
+ * Sinalizador de encerramento usado pelas rotinas de graceful shutdown.
+ * Quando true, o processo deve abortar qualquer operação em andamento
+ * e finalizar o mais rápido possível.
+ */
+let isShuttingDown = false;
+
+/**
+ * Registra os handlers para sinais do sistema operacional.
+ * SIGINT  -> Ctrl+C no terminal
+ * SIGTERM -> kill padrão do sistema
+ *
+ * O encerramento é feito de forma limpa: mensagem de log,
+ * sinalizador ligado e processo finalizado com código 0.
+ */
+function registerShutdownHandlers(logger: ILogger): void {
+  const shutdown = (signal: string) => {
+    if (isShuttingDown) {
+      logger.warn(`[main] Sinal ${signal} recebido novamente. Forçando saída.`);
+      process.exit(1);
+    }
+
+    isShuttingDown = true;
+    logger.info(`[main] Sinal ${signal} recebido. Iniciando encerramento gracioso...`);
+
+    // Tempo limite para não travar o processo caso algo emperre
+    const forceExitTimer = setTimeout(() => {
+      logger.error('[main] Tempo limite de encerramento excedido. Forçando saída.');
+      process.exit(1);
+    }, 5_000);
+
+    // Desregistra os handlers para evitar loop
+    process.removeAllListeners('SIGINT');
+    process.removeAllListeners('SIGTERM');
+
+    // Operações de limpeza podem ser adicionadas aqui no futuro
+    // (ex: fechar conexões HTTP, liberar recursos, etc.)
+
+    clearTimeout(forceExitTimer);
+    logger.info('[main] Recursos liberados. Até logo, SOBERANO.');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  logger.info('[main] Handlers de graceful shutdown registrados (SIGINT/SIGTERM).');
+}
+
+async function bootstrap(): Promise<void> {
+  // --- LOGGING ESTRUTURADO ---
+  const logger: ILogger = new ConsoleLogger('SOBERANO');
+
+  logger.info(
+    '╔══════════════════════════════════════════════════╗\n' +
+    '║       SOBERANO - Fase 1 (CLI MVP)               ║\n' +
+    '║       Inicializando sistemas...                  ║\n' +
+    '╚══════════════════════════════════════════════════╝'
+  );
+
+  // --- GRACEFUL SHUTDOWN ---
+  registerShutdownHandlers(logger);
+
+  // --- WIRING MANUAL (Injeção de Dependência) ---
+  // A variável "motor" é tipada como IMotorCognitivo (abstração).
+  // O módulo de alto nível (main.ts) depende da abstração, não da implementação concreta.
+  // O Logger é injetado via construtor em ambas as dependências.
+  const motor: IMotorCognitivo = new OllamaProvider(logger);
+
+  const promptTeste = 'Olá, Soberano. Confirme que seus sistemas base estão online.';
+
+  logger.info(`[main] Enviando prompt ao motor cognitivo...`);
+  logger.info(`[main] Prompt: "${promptTeste}"`);
+
+  try {
+    const resposta = await motor.gerarResposta(promptTeste);
+
+    logger.info(
+      '╔══════════════════════════════════════════════════╗\n' +
+      '║       RESPOSTA DO MOTOR COGNITIVO               ║\n' +
+      '╚══════════════════════════════════════════════════╝'
+    );
+    logger.info(resposta);
+    logger.info('[main] Teste concluído com sucesso.');
+  } catch (error) {
+    logger.error(
+      '╔══════════════════════════════════════════════════╗\n' +
+      '║       ERRO NA COMUNICAÇÃO COM O MOTOR           ║\n' +
+      '╚══════════════════════════════════════════════════╝'
+    );
+
+    if (error instanceof Error) {
+      logger.error(error.message);
+    } else {
+      logger.error(`[main] Erro desconhecido: ${String(error)}`);
+    }
+
+    logger.error('[main] O sistema não pôde se comunicar com o motor cognitivo.');
+    logger.error('[main] Verifique se o servidor Ollama está em execução: ollama serve');
+
+    // Encerra o processo com código 1 (erro) sem depender de @types/node
+    process.exit(1);
+  }
+}
+
+bootstrap();
+</file>
+
+<file path=".clinerules">
+# Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
+
+## 1. Stack e Restrições Rígidas
+- [cite_start]Linguagem: TypeScript (Node.js nativo).
+- [cite_start]Dependências: PROIBIDO o uso de bibliotecas externas (ex: axios, jest, dotenv).
+- [cite_start]Utilizar exclusivamente módulos nativos (fs, path, node:test, node:assert, fetch global).
+
+## 2. Arquitetura e SOLID (DIP)
+- [cite_start]Abstração Primeiro: Sempre defina uma Interface/Classe Abstrata em `src/core` antes da implementação.
+- Inversão de Dependência: Módulos de alto nível dependem de abstrações. [cite_start]Injeção de dependência via construtor é obrigatória.
+- [cite_start]Desacoplamento de Infraestrutura: Detalhes técnicos (APIs, Banco de Dados) nunca vazam para o Core.
+## 3. Robustez e Confiabilidade (Padrões Industriais)
+- [cite_start]Testes Unitários: Toda nova funcionalidade de infraestrutura deve ter testes usando o `node:test` nativo.
+- [cite_start]Resiliência: Implementar Política de Retry (Retentativas) e Circuit Breaker para integrações com LLMs.
+- [cite_start]Observabilidade: Todo componente deve injetar uma interface `ILogger` para registro de eventos.
+- [cite_start]Estabilidade: Implementar 'Graceful Shutdown' para sinais SIGINT/SIGTERM no ponto de entrada.
+- [cite_start]Validação: Respostas de serviços externos devem passar por validação rigorosa de schema.
+
+## 4. Estrutura de Pastas
+- [cite_start]src/core: Contratos, interfaces e lógica de negócio pura (A "Alma").
+- [cite_start]src/infra: Implementações técnicas, provedores e drivers (Os "Músculos").
+- [cite_start]src/main.ts: Orquestração, Wiring manual e tratamento de sinais do sistema.
+</file>
+
+</files>

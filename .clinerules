@@ -1,0 +1,22 @@
+# Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
+
+## 1. Stack e Restrições Rígidas
+- [cite_start]Linguagem: TypeScript (Node.js nativo).
+- [cite_start]Dependências: PROIBIDO o uso de bibliotecas externas (ex: axios, jest, dotenv).
+- [cite_start]Utilizar exclusivamente módulos nativos (fs, path, node:test, node:assert, fetch global).
+
+## 2. Arquitetura e SOLID (DIP)
+- [cite_start]Abstração Primeiro: Sempre defina uma Interface/Classe Abstrata em `src/core` antes da implementação.
+- Inversão de Dependência: Módulos de alto nível dependem de abstrações. [cite_start]Injeção de dependência via construtor é obrigatória.
+- [cite_start]Desacoplamento de Infraestrutura: Detalhes técnicos (APIs, Banco de Dados) nunca vazam para o Core.
+## 3. Robustez e Confiabilidade (Padrões Industriais)
+- [cite_start]Testes Unitários: Toda nova funcionalidade de infraestrutura deve ter testes usando o `node:test` nativo.
+- [cite_start]Resiliência: Implementar Política de Retry (Retentativas) e Circuit Breaker para integrações com LLMs.
+- [cite_start]Observabilidade: Todo componente deve injetar uma interface `ILogger` para registro de eventos.
+- [cite_start]Estabilidade: Implementar 'Graceful Shutdown' para sinais SIGINT/SIGTERM no ponto de entrada.
+- [cite_start]Validação: Respostas de serviços externos devem passar por validação rigorosa de schema.
+
+## 4. Estrutura de Pastas
+- [cite_start]src/core: Contratos, interfaces e lógica de negócio pura (A "Alma").
+- [cite_start]src/infra: Implementações técnicas, provedores e drivers (Os "Músculos").
+- [cite_start]src/main.ts: Orquestração, Wiring manual e tratamento de sinais do sistema.
