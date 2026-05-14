@@ -57,6 +57,13 @@ export class InMemorySessionManager extends ISessionManager {
           `[InMemorySessionManager] Session "${sessionId}" reached max limit. ` +
           `Removed oldest non-system message.`
         );
+      } else {
+        // Se todas as mensagens são system, remove a mais antiga (índice 0)
+        historico.shift();
+        this.logger.debug(
+          `[InMemorySessionManager] Session "${sessionId}" reached max limit. ` +
+          `All messages are system. Removed oldest message.`
+        );
       }
     }
 
@@ -76,7 +83,7 @@ export class InMemorySessionManager extends ISessionManager {
    * @param sessionId - Identificador único da sessão.
    * @returns Array de mensagens no formato ChatMessage[].
    */
-  async obterHistorico(sessionId: string): Promise<ChatMessage[]> {
+  async obterHistorico(sessionId: string): Promise<ReadonlyArray<ChatMessage>> {
     const historico = this.sessions.get(sessionId);
     if (!historico) {
       this.logger.debug(
@@ -84,7 +91,7 @@ export class InMemorySessionManager extends ISessionManager {
       );
       return [];
     }
-    return [...historico]; // retorna uma cópia para evitar mutação externa
+    return historico; // retorna a referência direta; imutabilidade garantida pelo TypeScript (ReadonlyArray)
   }
 
   /**

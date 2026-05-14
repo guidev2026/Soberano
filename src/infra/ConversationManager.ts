@@ -134,9 +134,10 @@ export class ConversationManager extends IConversationManager {
           this.logger.debug('[ConversationManager] RAG: No similar documents found.');
         }
       } catch (ragError) {
-        this.logger.warn(
-          `[ConversationManager] RAG query failed (non-fatal): ${ragError}`
+        this.logger.error(
+          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
         );
+        throw ragError;
       }
     } else {
       this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
@@ -164,8 +165,11 @@ export class ConversationManager extends IConversationManager {
 
     const systemMessage: ChatMessage = { role: 'system', content: systemContent };
 
+    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
+    const historicoFiltrado = historico.filter(m => m.role !== 'system');
+
     // --- Passo 5: Monta array final e envia ao motor cognitivo ---
-    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historico];
+    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
 
     this.logger.info(
       `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +

@@ -21,9 +21,9 @@ export abstract class ISessionManager {
    * Recupera o histórico completo de mensagens de uma sessão,
    * na ordem em que foram adicionadas (da mais antiga para a mais recente).
    * @param sessionId - Identificador único da sessão.
-   * @returns Array de mensagens no formato ChatMessage[].
+   * @returns Array de mensagens no formato ReadonlyArray<ChatMessage>.
    */
-  abstract obterHistorico(sessionId: string): Promise<ChatMessage[]>;
+  abstract obterHistorico(sessionId: string): Promise<ReadonlyArray<ChatMessage>>;
 
   /**
    * Remove todo o histórico de uma sessão, liberando a memória.
