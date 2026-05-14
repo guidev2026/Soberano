@@ -12,6 +12,7 @@
 
 import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
 import { ILogger } from '../core/ILogger.ts';
+import { ICircuitBreaker } from '../core/ICircuitBreaker.ts';
 
 export interface OllamaGenerateResponse {
   model: string;
@@ -91,15 +92,17 @@ export class OllamaProvider extends IMotorCognitivo {
   private readonly maxRetries: number;
   private readonly delayBase: number;
   private readonly timeoutMs: number;
+  private readonly circuitBreaker?: ICircuitBreaker;
   private externalSignal: AbortSignal | null = null;
 
   /**
-   * @param logger     - Instância de ILogger para logging estruturado
-   * @param baseUrl    - URL base do servidor Ollama (padrão: http://localhost:11434)
-   * @param model      - Nome do modelo a ser utilizado (padrão: qwen2.5-coder:3b)
-   * @param maxRetries - Número máximo de tentativas em caso de erro retryable (padrão: 3)
-   * @param delayBase  - Base do delay entre tentativas em ms (padrão: 1000)
-   * @param timeoutMs  - Timeout em ms para cada requisição fetch (padrão: 30000)
+   * @param logger         - Instância de ILogger para logging estruturado
+   * @param baseUrl        - URL base do servidor Ollama (padrão: http://localhost:11434)
+   * @param model          - Nome do modelo a ser utilizado (padrão: qwen2.5-coder:3b)
+   * @param maxRetries     - Número máximo de tentativas em caso de erro retryable (padrão: 3)
+   * @param delayBase      - Base do delay entre tentativas em ms (padrão: 1000)
+   * @param timeoutMs      - Timeout em ms para cada requisição fetch (padrão: 30000)
+   * @param circuitBreaker - (Opcional) Instância de ICircuitBreaker para proteger chamadas ao Ollama
    */
   constructor(
     logger: ILogger,
@@ -107,7 +110,8 @@ export class OllamaProvider extends IMotorCognitivo {
     model: string = 'qwen2.5-coder:3b',
     maxRetries: number = 3,
     delayBase: number = 1_000,
-    timeoutMs: number = 30_000
+    timeoutMs: number = 30_000,
+    circuitBreaker?: ICircuitBreaker
   ) {
     super();
     this.logger = logger;
@@ -116,6 +120,7 @@ export class OllamaProvider extends IMotorCognitivo {
     this.maxRetries = maxRetries;
     this.delayBase = delayBase;
     this.timeoutMs = timeoutMs;
+    this.circuitBreaker = circuitBreaker;
   }
 
   /**
@@ -150,10 +155,8 @@ export class OllamaProvider extends IMotorCognitivo {
         msg.includes('socket hang up') ||
         msg.includes('network') ||
         msg.includes('timeout') ||
-        msg.includes('fetch failed') ||
-        msg.includes('aborted') ||
-        msg.includes('abort')
-      );
+        msg.includes('fetch failed')
+    );
     }
     return false;
   }
@@ -212,33 +215,41 @@ export class OllamaProvider extends IMotorCognitivo {
           }
         }
 
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-          signal: attemptController.signal,
-        });
+        const executeFetch = async (): Promise<OllamaGenerateResponse> => {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+            signal: attemptController.signal,
+          });
 
-        if (!response.ok) {
-          const errorBody = await response.text().catch(() => 'Sem corpo de erro disponível');
-          throw new Error(
-            `[OllamaProvider] Erro HTTP ${response.status} ao comunicar com o motor cognitivo.\n` +
-            `  URL: ${url}\n` +
-            `  Modelo: ${this.model}\n` +
-            `  Detalhes: ${errorBody}`
+          if (!response.ok) {
+            const errorBody = await response.text().catch(() => 'Sem corpo de erro disponível');
+            throw new Error(
+              `[OllamaProvider] Erro HTTP ${response.status} ao comunicar com o motor cognitivo.\n` +
+              `  URL: ${url}\n` +
+              `  Modelo: ${this.model}\n` +
+              `  Detalhes: ${errorBody}`
+            );
+          }
+
+          const rawData: unknown = await response.json();
+
+          // Validação rigorosa de schema em runtime
+          const validated = validateOllamaResponse(rawData);
+
+          this.logger.info(
+            `[OllamaProvider] Tentativa ${attempt} bem-sucedida. Resposta recebida (${validated.response.length} caracteres).`
           );
-        }
 
-        const rawData: unknown = await response.json();
+          return validated;
+        };
 
-        // Validação rigorosa de schema em runtime
-        const data = validateOllamaResponse(rawData);
-
-        this.logger.info(
-          `[OllamaProvider] Tentativa ${attempt} bem-sucedida. Resposta recebida (${data.response.length} caracteres).`
-        );
+        const data: OllamaGenerateResponse = this.circuitBreaker
+          ? await this.circuitBreaker.execute(executeFetch)
+          : await executeFetch();
 
         return data.response;
       } catch (error) {
@@ -251,6 +262,9 @@ export class OllamaProvider extends IMotorCognitivo {
             `Nova tentativa em ${delayMs}ms...\n` +
             `  Erro: ${lastError.message}`
           );
+          if (this.externalSignal?.aborted) {
+            break;
+          }
           await this.delay(delayMs);
           continue;
         }

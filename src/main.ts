@@ -14,6 +14,7 @@ import { OllamaProvider } from './infra/OllamaProvider.ts';
 import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
 import { ConsoleLogger } from './infra/ConsoleLogger.ts';
 import { ILogger } from './core/ILogger.ts';
+import { CircuitBreaker } from './infra/CircuitBreaker.ts';
 
 /**
  * Sinalizador de encerramento usado pelas rotinas de graceful shutdown.
@@ -61,10 +62,10 @@ function registerShutdownHandlers(
 
     // Pequena pausa para permitir que as operações abortadas propaguem
     await new Promise<void>((resolve) => {
-      // Aguarda um ciclo de event loop para os handlers de abort processarem
-      setTimeout(() => resolve(), 0);
+      setTimeout(() => resolve(), 100);
     });
 
+    // Só cancela o timer se a limpeza terminou dentro do prazo de 5s
     clearTimeout(forceExitTimer);
     logger.info('[main] Recursos liberados. Até logo, SOBERANO.');
     process.exit(0);
@@ -93,14 +94,20 @@ async function bootstrap(): Promise<void> {
   // --- GRACEFUL SHUTDOWN ---
   registerShutdownHandlers(logger, shutdownController);
 
+  // --- CIRCUIT BREAKER ---
+  const circuitBreaker = new CircuitBreaker(logger);
+
   // --- WIRING MANUAL (Injeção de Dependência) ---
   // A variável "motor" é tipada como IMotorCognitivo (abstração).
   // O módulo de alto nível (main.ts) depende da abstração, não da implementação concreta.
   // O Logger é injetado via construtor em ambas as dependências.
-  const motor = new OllamaProvider(logger);
+  const provider = new OllamaProvider(logger, undefined, undefined, undefined, undefined, undefined, circuitBreaker);
 
   // Injeta o sinal de abort para graceful shutdown
-  motor.setAbortSignal(shutdownController.signal);
+  provider.setAbortSignal(shutdownController.signal);
+
+  // A partir daqui, usa-se a abstração IMotorCognitivo
+  const motor: IMotorCognitivo = provider;
 
   const promptTeste = 'Olá, Soberano. Confirme que seus sistemas base estão online.';
 

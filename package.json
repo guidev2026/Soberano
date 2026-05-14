@@ -8,7 +8,7 @@
     "test": "node --experimental-transform-types --test src/infra/*.test.ts",
     "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
     "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
-    "build": "tsc"
+    "typecheck": "tsc --noEmit"
   },
   "keywords": ["soberano", "llm", "ollama"],
   "license": "MIT"
