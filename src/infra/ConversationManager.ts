@@ -176,18 +176,19 @@ export class ConversationManager extends IConversationManager {
       `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'}).`
     );
 
-    const resposta = await this.motor.gerarResposta(mensagensParaMotor);
+    const respostaMessage = await this.motor.gerarResposta(mensagensParaMotor);
 
     // --- Passo 6: Guarda a resposta (assistant) na sessão ---
-    const mensagemAssistant: ChatMessage = { role: 'assistant', content: resposta };
+    const respostaContent = respostaMessage.content;
+    const mensagemAssistant: ChatMessage = { role: 'assistant', content: respostaContent };
     await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
 
     this.logger.info(
       `[ConversationManager] Assistant response saved to session "${sessionId}". ` +
-      `Response length: ${resposta.length} chars.`
+      `Response length: ${respostaContent.length} chars.`
     );
 
     // --- Passo 7: Retorna a resposta ---
-    return resposta;
+    return respostaContent;
   }
 }

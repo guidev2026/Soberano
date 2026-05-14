@@ -1,6 +1,6 @@
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.5.0 — Fase 5 (Gerenciamento de Contexto - Sessões + RAG)
+**Versão:** 0.6.0 — Fase 6 (Sistema de Agentes e Ferramentas)
 
 ## Stack
 
@@ -19,14 +19,15 @@
 src/
 ├── core/              # Contratos e lógica de negócio pura ("A Alma")
 │   ├── ILogger.ts             # Abstração de logging + LogLevel enum
-│   ├── IMotorCognitivo.ts     # Abstração do motor cognitivo (LLM) + ChatMessage
+│   ├── IMotorCognitivo.ts     # Abstração do motor cognitivo (LLM) + ChatMessage + IToolDefinition
 │   ├── ICircuitBreaker.ts     # Abstração do Circuit Breaker
 │   ├── IHttpServer.ts         # Abstração do servidor HTTP
 │   ├── ISensor.ts             # Abstração genérica de sensor (T)
 │   ├── IEmbeddings.ts         # Contrato para geração de embeddings vetoriais
 │   ├── IVectorStore.ts        # Contrato para armazenamento e busca vetorial
 │   ├── ISessionManager.ts     # Contrato para gestão de sessões de conversa
-│   └── IConversationManager.ts # Contrato do Maestro (orquestração multi-turno)
+│   ├── IConversationManager.ts # Contrato do Maestro (orquestração multi-turno)
+│   └── ITool.ts                # Contrato genérico de ferramenta (Tool Calling)
 ├── infra/             # Implementações técnicas ("Os Músculos")
 │   ├── ConsoleLogger.ts            # Logger concreto (stdout)
 │   ├── ConsoleLogger.test.ts
@@ -63,12 +64,12 @@ src/
 | Logging estruturado com níveis (DEBUG, INFO, WARN, ERROR) | ✅ |
 | Filtragem por nível mínimo de log | ✅ |
 | Comunicação com Ollama via REST (fetch nativo) — endpoint /api/chat | ✅ |
-| Interface ChatMessage (role: system/user/assistant, content) | ✅ |
+| Interface ChatMessage (role: system/user/assistant/tool, content, tool_calls, tool_call_id) | ✅ |
 | Retry automático com backoff progressivo | ✅ |
 | Circuit Breaker (CLOSED / OPEN / HALF_OPEN) | ✅ |
 | Timeout global (120s) via `AbortSignal.timeout` | ✅ |
 | Graceful shutdown (SIGINT/SIGTERM) | ✅ |
-| Validação de schema em runtime da resposta da API | ✅ |
+| Validação de schema em runtime da resposta da API (incluindo tool_calls) | ✅ |
 | Testes unitários com `node:test` e `mock.method` | ✅ |
 | Sensor de arquivo (FileSensor) com `node:fs/promises` | ✅ Estabilizada |
 | Contrato genérico ISensor\<T\> (preparação para novos sensores) | ✅ |
@@ -82,6 +83,11 @@ src/
 | ConversationManager — pipeline: salva → RAG → funde contexto → envia → salva resposta | ✅ |
 | Embedding Heurístico — vetor de 10 dimensões sem dependência externa | ✅ |
 | Demonstração integrada no main.ts (2 turnos de conversa com sessão) | ✅ |
+| Interface IToolDefinition para definição de ferramentas no request /api/chat | ✅ |
+| Contrato ITool — interface genérica para ferramentas executáveis (getDefinition, execute) | ✅ |
+| OllamaProvider envia tools[] no payload de /api/chat quando fornecido | ✅ |
+| Retorno de ChatMessage completo de gerarResposta (permite processar tool_calls) | ✅ |
+| validação de respostas com tool_calls (content vazio permitido se houver tool_calls) | ✅ |
 
 ## Como Executar
 
@@ -113,7 +119,7 @@ npm run typecheck
 | **3** | Memória — Embeddings + Vector Store (RAG Tradicional) | ✅ **Concluída** |
 | **4** | Qualidade de Teste e Determinismo — timeouts mínimos, mock.fn, assertions de retry | ✅ **Concluída** |
 | **5** | Gerenciamento de contexto e sessões multi-turno | ✅ **Concluída** |
-| **6** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
+| **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
 | **7** | Web UI (React) + WebSocket | ⏳ Planejada |
 
 ## Contratos do Core
@@ -134,14 +140,27 @@ abstract class ILogger {
 ### `IMotorCognitivo`
 
 ```typescript
+interface IToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, any>;
+  };
+}
+
 interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  tool_calls?: Array<{
+    function: { name: string; arguments: Record<string, any> };
+  }>;
+  tool_call_id?: string;
 }
 
 abstract class IMotorCognitivo {
   abstract setAbortSignal(signal: AbortSignal): void;
-  abstract gerarResposta(mensagens: ChatMessage[]): Promise<string>;
+  abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
 }
 ```
 
@@ -163,6 +182,18 @@ abstract class ICircuitBreaker {
 ```typescript
 abstract class ISensor<T> {
   abstract ler(target: string, signal?: AbortSignal): Promise<T>;
+}
+```
+
+### `ITool`
+
+```typescript
+abstract class ITool {
+  abstract readonly name: string;
+  abstract readonly description: string;
+  abstract readonly parametersSchema: Record<string, any>;
+  abstract execute(args: Record<string, any>): Promise<any>;
+  abstract getDefinition(): IToolDefinition;
 }
 ```
 

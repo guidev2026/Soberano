@@ -108,8 +108,9 @@ describe('OllamaProvider', () => {
       assert.deepStrictEqual(sentBody.messages, [{ role: 'user', content: 'Prompt de teste' }]);
       assert.strictEqual(sentBody.stream, false);
 
-      // Valida que a resposta foi processada corretamente
-      assert.strictEqual(resposta, 'Resposta de teste do SOBERANO.');
+      // Valida que a resposta foi processada corretamente (agora retorna ChatMessage)
+      assert.strictEqual(resposta.role, 'assistant');
+      assert.strictEqual(resposta.content, 'Resposta de teste do SOBERANO.');
 
       // Valida que o logger registrou a operação
       assert.ok(

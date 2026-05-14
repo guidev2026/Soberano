@@ -8,10 +8,11 @@
  *              - Aceita AbortSignal externo para graceful shutdown.
  *              - Validação rigorosa de schema da resposta.
  *              - Logger injetado via construtor.
+ *              - Suporte a Tool Calling (Fase 6).
  */
 
 import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
-import type { ChatMessage } from '../core/IMotorCognitivo.ts';
+import type { ChatMessage, IToolDefinition } from '../core/IMotorCognitivo.ts';
 import { ILogger } from '../core/ILogger.ts';
 import { ICircuitBreaker } from '../core/ICircuitBreaker.ts';
 
@@ -26,9 +27,10 @@ export interface OllamaConfig {
 }
 
 export interface OllamaChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   images?: string[];
+  tool_calls?: Array<{ function: { name: string; arguments: Record<string, any> } }>;
 }
 
 export interface OllamaChatResponse {
@@ -47,6 +49,7 @@ export interface OllamaChatResponse {
 /**
  * Valida em runtime se um valor desconhecido é um OllamaChatResponse válido.
  * Lança erro descritivo se algum campo obrigatório estiver ausente ou com tipo incorreto.
+ * Agora suporta tool_calls: message.content pode ser string vazia se tool_calls estiver presente.
  *
  * @param data - Dado desconhecido a ser validado
  * @returns O dado tipado como OllamaChatResponse
@@ -88,25 +91,62 @@ export function validateOllamaResponse(data: unknown): OllamaChatResponse {
 
   const messageRecord = record.message as Record<string, unknown>;
 
-  if (typeof messageRecord.role !== 'string' || !['system', 'user', 'assistant'].includes(messageRecord.role as string)) {
+  if (typeof messageRecord.role !== 'string' || !['system', 'user', 'assistant', 'tool'].includes(messageRecord.role as string)) {
     throw new Error(
-      `[OllamaProvider] Field "message.role" missing or invalid: expected 'system' | 'user' | 'assistant', received ${typeof messageRecord.role}`
+      `[OllamaProvider] Field "message.role" missing or invalid: expected 'system' | 'user' | 'assistant' | 'tool', received ${typeof messageRecord.role}`
     );
   }
 
+  // content pode ser string vazia desde que tool_calls esteja presente
+  const hasToolCalls = Array.isArray(messageRecord.tool_calls);
   if (typeof messageRecord.content !== 'string') {
     throw new Error(
       `[OllamaProvider] Field "message.content" missing or invalid: expected string, received ${typeof messageRecord.content}`
     );
   }
 
+  if (messageRecord.content === '' && !hasToolCalls) {
+    throw new Error(
+      `[OllamaProvider] Field "message.content" is empty and no tool_calls provided`
+    );
+  }
+
+  // Valida tool_calls se presente
+  let validatedToolCalls: Array<{ function: { name: string; arguments: Record<string, any> } }> | undefined;
+  if (hasToolCalls) {
+    validatedToolCalls = [];
+    for (const tc of messageRecord.tool_calls as Array<unknown>) {
+      if (tc === null || tc === undefined || typeof tc !== 'object') {
+        throw new Error(`[OllamaProvider] Invalid tool_call entry: expected object`);
+      }
+      const tcRecord = tc as Record<string, unknown>;
+      if (tcRecord.function === null || tcRecord.function === undefined || typeof tcRecord.function !== 'object') {
+        throw new Error(`[OllamaProvider] Invalid tool_call.function: expected object`);
+      }
+      const fnRecord = tcRecord.function as Record<string, unknown>;
+      if (typeof fnRecord.name !== 'string') {
+        throw new Error(`[OllamaProvider] Invalid tool_call.function.name: expected string`);
+      }
+      if (typeof fnRecord.arguments !== 'object' || fnRecord.arguments === null) {
+        throw new Error(`[OllamaProvider] Invalid tool_call.function.arguments: expected object`);
+      }
+      validatedToolCalls.push({
+        function: {
+          name: fnRecord.name,
+          arguments: fnRecord.arguments as Record<string, any>,
+        },
+      });
+    }
+  }
+
   return {
     model: record.model,
     created_at: record.created_at,
     message: {
-      role: messageRecord.role as 'system' | 'user' | 'assistant',
+      role: messageRecord.role as 'system' | 'user' | 'assistant' | 'tool',
       content: messageRecord.content,
       images: Array.isArray(messageRecord.images) ? (messageRecord.images as string[]) : undefined,
+      tool_calls: validatedToolCalls,
     },
     done: record.done,
     total_duration: typeof record.total_duration === 'number' ? record.total_duration : undefined,
@@ -213,19 +253,26 @@ export class OllamaProvider extends IMotorCognitivo {
    * Utiliza exclusivamente o fetch nativo do Node.js (sem dependências externas).
    * Implementa retry automático (máximo configurável) para erros de conexão.
    * Implementa timeout via AbortController em cada tentativa.
+   * Suporta Tool Calling opcional (Fase 6).
    *
    * @param mensagens - Array de mensagens no formato ChatMessage[].
-   * @returns A resposta gerada pelo modelo (content da mensagem assistant).
+   * @param tools - Array opcional de definições de ferramentas para tool calling.
+   * @returns A mensagem completa de resposta (ChatMessage).
    * @throws {Error} Se após todas as tentativas a comunicação falhar.
    */
-  async gerarResposta(mensagens: ChatMessage[]): Promise<string> {
+  async gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage> {
     const url = `${this.baseUrl}/api/chat`;
 
-    const payload = {
+    const payload: Record<string, any> = {
       model: this.model,
       messages: mensagens,
       stream: false,
     };
+
+    // Inclui tools no payload se for fornecido
+    if (tools && tools.length > 0) {
+      payload.tools = tools;
+    }
 
     let lastError: Error | null = null;
 
@@ -238,7 +285,8 @@ export class OllamaProvider extends IMotorCognitivo {
 
       try {
         this.logger.info(
-          `[OllamaProvider] Attempt ${attempt}/${this.maxRetries} - Sending messages to model "${this.model}"`
+          `[OllamaProvider] Attempt ${attempt}/${this.maxRetries} - Sending messages to model "${this.model}"` +
+          (tools ? ` with ${tools.length} tool(s) defined` : '')
         );
 
         // Configura timeout para esta tentativa
@@ -296,7 +344,14 @@ export class OllamaProvider extends IMotorCognitivo {
 
         const data: OllamaChatResponse = await this.circuitBreaker.execute(executeFetch);
 
-        return data.message.content;
+        // Converte a resposta validada para ChatMessage
+        const resposta: ChatMessage = {
+          role: data.message.role,
+          content: data.message.content,
+          tool_calls: data.message.tool_calls,
+        };
+
+        return resposta;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 

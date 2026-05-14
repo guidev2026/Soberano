@@ -290,5 +290,82 @@ describe('validateOllamaResponse (função pura) - /api/chat', () => {
 
       assert.deepStrictEqual(result.message.images, ['base64data']);
     });
+
+    it('NÃO deve falhar quando content é vazio mas tool_calls está presente', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              function: {
+                name: 'get_weather',
+                arguments: { city: 'São Paulo' },
+              },
+            },
+          ],
+        },
+        done: true,
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.strictEqual(result.message.content, '');
+      assert.ok(result.message.tool_calls, 'tool_calls deve estar presente');
+      assert.strictEqual(result.message.tool_calls!.length, 1);
+      assert.strictEqual(result.message.tool_calls![0]!.function.name, 'get_weather');
+      assert.deepStrictEqual(result.message.tool_calls![0]!.function.arguments, { city: 'São Paulo' });
+    });
+
+    it('deve lançar erro quando content é vazio e não há tool_calls', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: '',
+        },
+        done: true,
+      };
+
+      assert.throws(
+        () => validateOllamaResponse(input),
+        /empty and no tool_calls/
+      );
+    });
+
+    it('deve validar tool_calls com múltiplas ferramentas', () => {
+      const input = {
+        model: 'qwen2.5-coder:3b',
+        created_at: '2024-05-14T16:00:00Z',
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              function: {
+                name: 'get_weather',
+                arguments: { city: 'São Paulo' },
+              },
+            },
+            {
+              function: {
+                name: 'get_time',
+                arguments: { timezone: 'America/Sao_Paulo' },
+              },
+            },
+          ],
+        },
+        done: true,
+      };
+
+      const result = validateOllamaResponse(input);
+
+      assert.strictEqual(result.message.tool_calls!.length, 2);
+      assert.strictEqual(result.message.tool_calls![0]!.function.name, 'get_weather');
+      assert.strictEqual(result.message.tool_calls![1]!.function.name, 'get_time');
+    });
   });
 });

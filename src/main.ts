@@ -116,10 +116,10 @@ async function bootstrap(): Promise<void> {
     logger.info('[main] Sending messages to cognitive engine...');
     logger.info('[main] Messages: ' + JSON.stringify(mensagens));
 
-    const resposta = await motor.gerarResposta(mensagens);
+    const respostaMessage = await motor.gerarResposta(mensagens);
 
     logger.info('[main] === RESPOSTA DO MOTOR COGNITIVO ===');
-    logger.info(resposta);
+    logger.info(respostaMessage.content);
     logger.info('[main] Test completed successfully.');
 
     // TESTE DO FILE SENSOR (Fase 2)

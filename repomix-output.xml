@@ -1,3 +1,44 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
 <directory_structure>
 src/
   core/
@@ -38,6 +79,46 @@ tsconfig.json
 <files>
 This section contains the contents of the repository's files.
 
+<file path="src/core/ICircuitBreaker.ts">
+/**
+ * @file ICircuitBreaker.ts
+ * @description Contrato de abstração para o padrão Circuit Breaker.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ *
+ *              Estados: CLOSED (normal), OPEN (falhando), HALF_OPEN (teste).
+ */
+
+export enum CircuitState {
+  CLOSED = 'CLOSED',
+  OPEN = 'OPEN',
+  HALF_OPEN = 'HALF_OPEN',
+}
+
+export abstract class ICircuitBreaker {
+  /** Estado atual do circuit breaker */
+  abstract get state(): CircuitState;
+
+  /**
+   * Executa uma operação respeitando o estado do circuit breaker.
+   * - CLOSED: executa normalmente, registra sucesso/falha
+   * - OPEN: lança erro imediatamente (a menos que o timeout tenha expirado para HALF_OPEN)
+   * - HALF_OPEN: permite 1 chamada de teste; sucesso volta para CLOSED, falha volta para OPEN
+   *
+   * @param fn - Função assíncrona a ser protegida
+   * @returns O resultado da função
+   * @throws {Error} Se o circuit breaker estiver OPEN e o timeout não tiver expirado
+   */
+  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
+
+  /** Registra uma falha manualmente (para uso externo) */
+  abstract recordFailure(): void;
+
+  /** Reseta o circuit breaker para o estado CLOSED */
+  abstract reset(): void;
+}
+</file>
+
 <file path="src/core/IConversationManager.ts">
 /**
  * @file IConversationManager.ts
@@ -65,232 +146,205 @@ export abstract class IConversationManager {
 }
 </file>
 
-<file path="src/core/ISessionManager.ts">
+<file path="src/core/IEmbeddings.ts">
 /**
- * @file ISessionManager.ts
- * @description Contrato de abstração para o gerenciador de sessões de chat.
- *              Responsável por armazenar e recuperar o histórico de mensagens
- *              de uma sessão multi-turno. Segue o DIP: módulos de alto nível
- *              dependem desta abstração, não de implementações concretas.
+ * @file IEmbeddings.ts
+ * @description Contrato de abstração para o serviço de embeddings vetoriais.
+ *              Responsável por transformar texto em vetores numéricos (embeddings)
+ *              que representam o significado semântico do conteúdo.
+ *
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas (OllamaEmbeddings, OpenAI, etc.).
  */
 
-import type { ChatMessage } from './IMotorCognitivo.ts';
-
-export abstract class ISessionManager {
+export abstract class IEmbeddings {
   /**
-   * Adiciona uma mensagem ao histórico de uma sessão.
-   * Se a sessão não existir, ela é criada automaticamente.
-   * @param sessionId - Identificador único da sessão.
-   * @param mensagem  - Mensagem no formato ChatMessage a ser adicionada.
+   * Gera um vetor de números (embedding) a partir de um texto de entrada.
+   * O vetor resultante pode ser usado para busca semântica, similaridade,
+   * classificação ou clustering.
+   *
+   * @param text - Texto a ser convertido em embedding
+   * @returns Promise com um array de números representando o embedding
+   * @throws {Error} Se o serviço de embeddings falhar ou retornar dados inválidos
    */
-  abstract adicionarMensagem(sessionId: string, mensagem: ChatMessage): Promise<void>;
-
-  /**
-   * Recupera o histórico completo de mensagens de uma sessão,
-   * na ordem em que foram adicionadas (da mais antiga para a mais recente).
-   * @param sessionId - Identificador único da sessão.
-   * @returns Array de mensagens no formato ChatMessage[].
-   */
-  abstract obterHistorico(sessionId: string): Promise<ChatMessage[]>;
-
-  /**
-   * Remove todo o histórico de uma sessão, liberando a memória.
-   * @param sessionId - Identificador único da sessão a ser limpa.
-   */
-  abstract limparSessao(sessionId: string): Promise<void>;
+  abstract gerarVector(text: string): Promise<number[]>;
 }
 </file>
 
-<file path="src/infra/ConversationManager.ts">
+<file path="src/core/IHttpServer.ts">
 /**
- * @file ConversationManager.ts
- * @description Implementação do Maestro — orquestrador central que concretiza
- *              a Sprint 5.3 (Fusão de Contexto). Une a Memória Vetorial (RAG)
- *              e a Memória de Curto Prazo (Sessões) em um único fluxo.
+ * @file IHttpServer.ts
+ * @description Contrato de abstração para servidor HTTP nativo do SOBERANO.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
  *
- *              Depende de abstrações (DIP): ILogger, IMotorCognitivo,
- *              ISessionManager e opcionalmente IVectorStore.
- *
- *              Fluxo do método conversar():
- *              1. Guarda inputUsuario no SessionManager (role: user).
- *              2. Se IVectorStore existir, gera um embedding heurístico simples
- *                 (baseado no comprimento do texto) para buscar contextos similares.
- *              3. Obtém o histórico atualizado do SessionManager.
- *              4. Constrói mensagem system fundindo regras do SOBERANO
- *                 com os documentos recuperados do VectorStore (Context Fusion).
- *              5. Envia [SystemMessage, ...Historico] para IMotorCognitivo.gerarResposta().
- *              6. Guarda resposta (role: assistant) no SessionManager.
- *              7. Retorna resposta ao chamador.
+ *              Suporta start/stop para integração com graceful shutdown.
  */
 
-import { IConversationManager } from '../core/IConversationManager.ts';
-import type { ChatMessage } from '../core/IMotorCognitivo.ts';
-import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
-import { ISessionManager } from '../core/ISessionManager.ts';
-import { IVectorStore } from '../core/IVectorStore.ts';
-import { ILogger } from '../core/ILogger.ts';
+export abstract class IHttpServer {
+  /**
+   * Inicia o servidor HTTP na porta especificada.
+   * @param port - Número da porta para escutar (ex: 3000)
+   */
+  abstract start(port: number): Promise<void>;
 
-export interface ConversationManagerOptions {
-  /** Instância obrigatória de ILogger para logging estruturado */
-  logger: ILogger;
-  /** Instância obrigatória do motor cognitivo (LLM) */
-  motor: IMotorCognitivo;
-  /** Instância obrigatória do gerenciador de sessões */
-  sessionManager: ISessionManager;
-  /** Instância opcional do Vector Store para RAG (Memória Vetorial).
-   *  Se não fornecida, o RAG é desabilitado. */
-  vectorStore?: IVectorStore;
-  /** Nome do sistema SOBERANO para a mensagem de system prompt */
-  systemName?: string;
+  /**
+   * Para o servidor HTTP de forma limpa.
+   * Fecha todas as conexões ativas e libera a porta.
+   */
+  abstract stop(): Promise<void>;
 }
+</file>
 
-export class ConversationManager extends IConversationManager {
-  private readonly logger: ILogger;
-  private readonly motor: IMotorCognitivo;
-  private readonly sessionManager: ISessionManager;
-  private readonly vectorStore?: IVectorStore;
-  private readonly systemName: string;
+<file path="src/infra/ConsoleLogger.test.ts">
+/**
+ * @file ConsoleLogger.test.ts
+ * @description Testes unitários para ConsoleLogger utilizando mock.method
+ *              do node:test para capturar chamadas a console.log, console.warn
+ *              e console.error.
+ *
+ * Como executar:
+ *   node --experimental-transform-types --test src/infra/ConsoleLogger.test.ts
+ */
 
-  /**
-   * @param options - Options Object (ConversationManagerOptions).
-   *                  Apenas `logger`, `motor` e `sessionManager` são obrigatórios.
-   */
-  constructor(options: ConversationManagerOptions) {
-    super();
-    this.logger = options.logger;
-    this.motor = options.motor;
-    this.sessionManager = options.sessionManager;
-    this.vectorStore = options.vectorStore;
-    this.systemName = options.systemName ?? 'SOBERANO';
-  }
+import { describe, it, mock, afterEach } from 'node:test';
+import assert from 'node:assert';
+import { ConsoleLogger } from './ConsoleLogger.ts';
+import { LogLevel } from '../core/ILogger.ts';
 
-  /**
-   * Gera um embedding heurístico simples a partir de um texto.
-   * Cada palavra contribui com uma dimensão baseada no hash do caractere.
-   * Isso permite buscas no VectorStore mesmo sem um provedor de embeddings real.
-   *
-   * @param text - Texto a ser convertido em vetor
-   * @returns Vetor numérico de 10 dimensões
-   */
-  private gerarEmbeddingHeuristico(text: string): number[] {
-    const words = text.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
-    const dimensions = 10;
-    const vector = new Array(dimensions).fill(0);
+describe('ConsoleLogger', () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
 
-    for (let i = 0; i < words.length; i++) {
-      const word = words[i] as string;
-      for (let j = 0; j < word.length; j++) {
-        const dim = j % dimensions;
-        vector[dim] = (vector[dim] as number) + (word.charCodeAt(j) % 10) + 1;
-      }
-    }
+  describe('Filtragem por nível mínimo (minLevel)', () => {
+    it('não deve chamar console.log para DEBUG quando minLevel é INFO', () => {
+      const logMock = mock.method(console, 'log', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
 
-    // Normaliza para evitar valores muito grandes
-    const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
-    if (magnitude > 0) {
-      for (let i = 0; i < dimensions; i++) {
-        vector[i] = (vector[i] as number) / magnitude;
-      }
-    }
+      logger.debug('mensagem debug');
 
-    return vector;
-  }
+      assert.strictEqual(logMock.mock.calls.length, 0, 'console.log não deve ser chamado para DEBUG com minLevel INFO');
+    });
 
-  /**
-   * Processa uma interação completa de conversa multi-turno com RAG.
-   *
-   * @param sessionId    - Identificador único da sessão.
-   * @param inputUsuario - Texto de entrada do usuário.
-   * @returns A resposta gerada pelo motor cognitivo.
-   */
-  async conversar(sessionId: string, inputUsuario: string): Promise<string> {
-    this.logger.info(
-      `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
-    );
+    it('deve chamar console.log para INFO quando minLevel é INFO', () => {
+      const logMock = mock.method(console, 'log', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
 
-    // --- Passo 1: Guarda o input do usuário na sessão ---
-    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
-    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
-    this.logger.debug('[ConversationManager] User message saved to session.');
+      logger.info('mensagem info');
 
-    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
-    let documentosRecuperados: string[] = [];
-    if (this.vectorStore) {
-      try {
-        // Gera embedding heurístico para a consulta do usuário
-        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
-        this.logger.debug(
-          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
-        );
+      assert.strictEqual(logMock.mock.calls.length, 1, 'console.log deve ser chamado para INFO');
+    });
 
-        // Busca os 3 documentos mais similares
-        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
+    it('deve chamar console.log para DEBUG quando minLevel é DEBUG', () => {
+      const logMock = mock.method(console, 'log', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.DEBUG);
 
-        if (resultados.length > 0) {
-          documentosRecuperados = resultados.map((r) => {
-            const metadata = r.metadata as Record<string, unknown>;
-            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
-          });
-          this.logger.info(
-            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
-          );
-        } else {
-          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
-        }
-      } catch (ragError) {
-        this.logger.warn(
-          `[ConversationManager] RAG query failed (non-fatal): ${ragError}`
-        );
-      }
-    } else {
-      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
-    }
+      logger.debug('mensagem debug');
 
-    // --- Passo 3: Obtém o histórico completo da sessão ---
-    const historico = await this.sessionManager.obterHistorico(sessionId);
-    this.logger.debug(
-      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
-    );
+      assert.strictEqual(logMock.mock.calls.length, 1, 'console.log deve ser chamado para DEBUG com minLevel DEBUG');
+    });
 
-    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
-    let systemContent =
-      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
-      `Responda em Português do Brasil de forma clara e objetiva. ` +
-      `Mantenha o contexto da conversa ao responder.`;
+    it('não deve chamar console.log para INFO quando minLevel é ERROR', () => {
+      const logMock = mock.method(console, 'log', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.ERROR);
 
-    if (documentosRecuperados.length > 0) {
-      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
-      systemContent +=
-        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
-        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
-        `mas não invente informações que não estejam presentes.`;
-    }
+      logger.info('mensagem info');
 
-    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
+      assert.strictEqual(logMock.mock.calls.length, 0, 'console.log não deve ser chamado para INFO com minLevel ERROR');
+    });
+  });
 
-    // --- Passo 5: Monta array final e envia ao motor cognitivo ---
-    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historico];
+  describe('Métodos de saída corretos', () => {
+    it('deve chamar console.warn para warn()', () => {
+      const warnMock = mock.method(console, 'warn', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.WARN);
 
-    this.logger.info(
-      `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +
-      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'}).`
-    );
+      logger.warn('aviso');
 
-    const resposta = await this.motor.gerarResposta(mensagensParaMotor);
+      assert.strictEqual(warnMock.mock.calls.length, 1, 'console.warn deve ser chamado para WARN');
+    });
 
-    // --- Passo 6: Guarda a resposta (assistant) na sessão ---
-    const mensagemAssistant: ChatMessage = { role: 'assistant', content: resposta };
-    await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
+    it('deve chamar console.error para error()', () => {
+      const errorMock = mock.method(console, 'error', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.ERROR);
 
-    this.logger.info(
-      `[ConversationManager] Assistant response saved to session "${sessionId}". ` +
-      `Response length: ${resposta.length} chars.`
-    );
+      logger.error('falha crítica');
 
-    // --- Passo 7: Retorna a resposta ---
-    return resposta;
-  }
-}
+      assert.strictEqual(errorMock.mock.calls.length, 1, 'console.error deve ser chamado para ERROR');
+    });
+  });
+
+  describe('Formato da mensagem', () => {
+    it('deve conter o prefixo [SOBERANO] na mensagem logada', () => {
+      const logMock = mock.method(console, 'log', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
+
+      logger.info('teste de formato');
+
+      assert.strictEqual(logMock.mock.calls.length, 1);
+      const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
+      assert.ok(loggedMessage.includes('[SOBERANO]'), `Mensagem deve conter [SOBERANO], recebido: ${loggedMessage}`);
+    });
+
+    it('deve conter o nível [INFO] na mensagem logada', () => {
+      const logMock = mock.method(console, 'log', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
+
+      logger.info('teste de nível');
+
+      assert.strictEqual(logMock.mock.calls.length, 1);
+      const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
+      assert.ok(loggedMessage.includes('[INFO]'), `Mensagem deve conter [INFO], recebido: ${loggedMessage}`);
+    });
+
+    it('deve conter um timestamp ISO 8601 na mensagem logada', () => {
+      const logMock = mock.method(console, 'log', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
+
+      logger.info('teste de timestamp');
+
+      assert.strictEqual(logMock.mock.calls.length, 1);
+      const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
+      // Timestamp ISO: YYYY-MM-DDTHH:mm:ss.sssZ
+      const isoRegex = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+      assert.ok(isoRegex.test(loggedMessage), `Mensagem deve conter timestamp ISO, recebido: ${loggedMessage}`);
+    });
+
+    it('deve conter o nível [ERROR] ao logar um erro', () => {
+      const errorMock = mock.method(console, 'error', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.ERROR);
+
+      logger.error('erro grave');
+
+      assert.strictEqual(errorMock.mock.calls.length, 1);
+      const loggedMessage = errorMock.mock.calls[0]?.arguments[0] as string;
+      assert.ok(loggedMessage.includes('[ERROR]'), `Mensagem deve conter [ERROR], recebido: ${loggedMessage}`);
+    });
+
+    it('deve conter o nível [WARN] ao logar um aviso', () => {
+      const warnMock = mock.method(console, 'warn', () => {});
+      const logger = new ConsoleLogger('SOBERANO', LogLevel.WARN);
+
+      logger.warn('cuidado');
+
+      assert.strictEqual(warnMock.mock.calls.length, 1);
+      const loggedMessage = warnMock.mock.calls[0]?.arguments[0] as string;
+      assert.ok(loggedMessage.includes('[WARN]'), `Mensagem deve conter [WARN], recebido: ${loggedMessage}`);
+    });
+
+    it('deve conter o prefixo personalizado passado no construtor', () => {
+      const logMock = mock.method(console, 'log', () => {});
+      const logger = new ConsoleLogger('CUSTOM', LogLevel.INFO);
+
+      logger.info('prefixo custom');
+
+      assert.strictEqual(logMock.mock.calls.length, 1);
+      const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
+      assert.ok(loggedMessage.includes('[CUSTOM]'), `Mensagem deve conter [CUSTOM], recebido: ${loggedMessage}`);
+    });
+  });
+});
 </file>
 
 <file path="src/infra/InMemorySessionManager.test.ts">
@@ -535,6 +589,330 @@ describe('InMemorySessionManager', () => {
 });
 </file>
 
+<file path=".gitignore">
+# Dependências
+node_modules/
+
+# Build
+dist/
+build/
+out/
+
+# Ambiente
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript
+*.tsbuildinfo
+</file>
+
+<file path="src/core/ISensor.ts">
+/**
+ * @file ISensor.ts
+ * @description Contrato de abstração genérico para sensores do sistema SOBERANO.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ *
+ *              O tipo genérico T representa o tipo de dado retornado pelo sensor
+ *              (ex: string para leitura de arquivos, Buffer para binários, etc.).
+ */
+
+export abstract class ISensor<T> {
+  /**
+   * Lê dados de uma origem identificada por `target`.
+   * @param target - Identificador da origem (ex: caminho de arquivo, URL, etc.)
+   * @param signal - Opcional. AbortSignal para cancelamento da operação.
+   * @returns Promise com o dado lido, tipado como T
+   */
+  abstract ler(target: string, signal?: AbortSignal): Promise<T>;
+}
+</file>
+
+<file path="src/core/ISessionManager.ts">
+/**
+ * @file ISessionManager.ts
+ * @description Contrato de abstração para o gerenciador de sessões de chat.
+ *              Responsável por armazenar e recuperar o histórico de mensagens
+ *              de uma sessão multi-turno. Segue o DIP: módulos de alto nível
+ *              dependem desta abstração, não de implementações concretas.
+ */
+
+import type { ChatMessage } from './IMotorCognitivo.ts';
+
+export abstract class ISessionManager {
+  /**
+   * Adiciona uma mensagem ao histórico de uma sessão.
+   * Se a sessão não existir, ela é criada automaticamente.
+   * @param sessionId - Identificador único da sessão.
+   * @param mensagem  - Mensagem no formato ChatMessage a ser adicionada.
+   */
+  abstract adicionarMensagem(sessionId: string, mensagem: ChatMessage): Promise<void>;
+
+  /**
+   * Recupera o histórico completo de mensagens de uma sessão,
+   * na ordem em que foram adicionadas (da mais antiga para a mais recente).
+   * @param sessionId - Identificador único da sessão.
+   * @returns Array de mensagens no formato ReadonlyArray<ChatMessage>.
+   */
+  abstract obterHistorico(sessionId: string): Promise<ReadonlyArray<ChatMessage>>;
+
+  /**
+   * Remove todo o histórico de uma sessão, liberando a memória.
+   * @param sessionId - Identificador único da sessão a ser limpa.
+   */
+  abstract limparSessao(sessionId: string): Promise<void>;
+}
+</file>
+
+<file path="src/core/IVectorStore.ts">
+/**
+ * @file IVectorStore.ts
+ * @description Contrato de abstração para o armazenamento e busca de vetores
+ *              (Vector Store / Memória Vetorial). Permite adicionar vetores
+ *              com metadados associados e realizar buscas por similaridade.
+ *
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas (MockVectorStore, ChromaDB, etc.).
+ */
+
+export abstract class IVectorStore<M = any> {
+  /**
+   * Adiciona um vetor ao armazenamento com seu ID e metadados associados.
+   *
+   * @param id       - Identificador único do vetor (ex: hash do documento)
+   * @param vector   - Vetor numérico representando o embedding semântico
+   * @param metadata - Metadados associados ao vetor (ex: texto original, fonte)
+   * @throws {Error} Se o ID já existir (fail-fast) ou se houver falha no armazenamento
+   */
+  abstract adicionar(id: string, vector: number[], metadata: M): Promise<void>;
+
+  /**
+   * Busca os N vetores mais similares ao vetor de consulta fornecido,
+   * utilizando similaridade cosseno ou métrica equivalente.
+   *
+   * @param vector - Vetor de consulta para busca por similaridade
+   * @param limit  - Número máximo de resultados a retornar
+   * @returns Promise com array de objetos contendo id, metadata e score de similaridade
+   * @throws {Error} Se não houver vetores armazenados
+   */
+  abstract buscarSimilares(vector: number[], limit: number): Promise<
+    { id: string; metadata: M; score: number }[]
+  >;
+}
+</file>
+
+<file path="src/infra/ConversationManager.ts">
+/**
+ * @file ConversationManager.ts
+ * @description Implementação do Maestro — orquestrador central que concretiza
+ *              a Sprint 5.3 (Fusão de Contexto). Une a Memória Vetorial (RAG)
+ *              e a Memória de Curto Prazo (Sessões) em um único fluxo.
+ *
+ *              Depende de abstrações (DIP): ILogger, IMotorCognitivo,
+ *              ISessionManager e opcionalmente IVectorStore.
+ *
+ *              Fluxo do método conversar():
+ *              1. Guarda inputUsuario no SessionManager (role: user).
+ *              2. Se IVectorStore existir, gera um embedding heurístico simples
+ *                 (baseado no comprimento do texto) para buscar contextos similares.
+ *              3. Obtém o histórico atualizado do SessionManager.
+ *              4. Constrói mensagem system fundindo regras do SOBERANO
+ *                 com os documentos recuperados do VectorStore (Context Fusion).
+ *              5. Envia [SystemMessage, ...Historico] para IMotorCognitivo.gerarResposta().
+ *              6. Guarda resposta (role: assistant) no SessionManager.
+ *              7. Retorna resposta ao chamador.
+ */
+
+import { IConversationManager } from '../core/IConversationManager.ts';
+import type { ChatMessage } from '../core/IMotorCognitivo.ts';
+import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
+import { ISessionManager } from '../core/ISessionManager.ts';
+import { IVectorStore } from '../core/IVectorStore.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+export interface ConversationManagerOptions {
+  /** Instância obrigatória de ILogger para logging estruturado */
+  logger: ILogger;
+  /** Instância obrigatória do motor cognitivo (LLM) */
+  motor: IMotorCognitivo;
+  /** Instância obrigatória do gerenciador de sessões */
+  sessionManager: ISessionManager;
+  /** Instância opcional do Vector Store para RAG (Memória Vetorial).
+   *  Se não fornecida, o RAG é desabilitado. */
+  vectorStore?: IVectorStore;
+  /** Nome do sistema SOBERANO para a mensagem de system prompt */
+  systemName?: string;
+}
+
+export class ConversationManager extends IConversationManager {
+  private readonly logger: ILogger;
+  private readonly motor: IMotorCognitivo;
+  private readonly sessionManager: ISessionManager;
+  private readonly vectorStore?: IVectorStore;
+  private readonly systemName: string;
+
+  /**
+   * @param options - Options Object (ConversationManagerOptions).
+   *                  Apenas `logger`, `motor` e `sessionManager` são obrigatórios.
+   */
+  constructor(options: ConversationManagerOptions) {
+    super();
+    this.logger = options.logger;
+    this.motor = options.motor;
+    this.sessionManager = options.sessionManager;
+    this.vectorStore = options.vectorStore;
+    this.systemName = options.systemName ?? 'SOBERANO';
+  }
+
+  /**
+   * Gera um embedding heurístico simples a partir de um texto.
+   * Cada palavra contribui com uma dimensão baseada no hash do caractere.
+   * Isso permite buscas no VectorStore mesmo sem um provedor de embeddings real.
+   *
+   * @param text - Texto a ser convertido em vetor
+   * @returns Vetor numérico de 10 dimensões
+   */
+  private gerarEmbeddingHeuristico(text: string): number[] {
+    const words = text.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
+    const dimensions = 10;
+    const vector = new Array(dimensions).fill(0);
+
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i] as string;
+      for (let j = 0; j < word.length; j++) {
+        const dim = j % dimensions;
+        vector[dim] = (vector[dim] as number) + (word.charCodeAt(j) % 10) + 1;
+      }
+    }
+
+    // Normaliza para evitar valores muito grandes
+    const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
+    if (magnitude > 0) {
+      for (let i = 0; i < dimensions; i++) {
+        vector[i] = (vector[i] as number) / magnitude;
+      }
+    }
+
+    return vector;
+  }
+
+  /**
+   * Processa uma interação completa de conversa multi-turno com RAG.
+   *
+   * @param sessionId    - Identificador único da sessão.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @returns A resposta gerada pelo motor cognitivo.
+   */
+  async conversar(sessionId: string, inputUsuario: string): Promise<string> {
+    this.logger.info(
+      `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
+    );
+
+    // --- Passo 1: Guarda o input do usuário na sessão ---
+    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
+    this.logger.debug('[ConversationManager] User message saved to session.');
+
+    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
+    let documentosRecuperados: string[] = [];
+    if (this.vectorStore) {
+      try {
+        // Gera embedding heurístico para a consulta do usuário
+        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
+        this.logger.debug(
+          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
+        );
+
+        // Busca os 3 documentos mais similares
+        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
+
+        if (resultados.length > 0) {
+          documentosRecuperados = resultados.map((r) => {
+            const metadata = r.metadata as Record<string, unknown>;
+            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
+          });
+          this.logger.info(
+            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
+          );
+        } else {
+          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
+        }
+      } catch (ragError) {
+        this.logger.error(
+          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
+        );
+        throw ragError;
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
+    }
+
+    // --- Passo 3: Obtém o histórico completo da sessão ---
+    const historico = await this.sessionManager.obterHistorico(sessionId);
+    this.logger.debug(
+      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
+    );
+
+    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
+    let systemContent =
+      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
+      `Responda em Português do Brasil de forma clara e objetiva. ` +
+      `Mantenha o contexto da conversa ao responder.`;
+
+    if (documentosRecuperados.length > 0) {
+      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
+      systemContent +=
+        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
+        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
+        `mas não invente informações que não estejam presentes.`;
+    }
+
+    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
+
+    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
+    const historicoFiltrado = historico.filter(m => m.role !== 'system');
+
+    // --- Passo 5: Monta array final e envia ao motor cognitivo ---
+    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
+
+    this.logger.info(
+      `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +
+      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'}).`
+    );
+
+    const resposta = await this.motor.gerarResposta(mensagensParaMotor);
+
+    // --- Passo 6: Guarda a resposta (assistant) na sessão ---
+    const mensagemAssistant: ChatMessage = { role: 'assistant', content: resposta };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
+
+    this.logger.info(
+      `[ConversationManager] Assistant response saved to session "${sessionId}". ` +
+      `Response length: ${resposta.length} chars.`
+    );
+
+    // --- Passo 7: Retorna a resposta ---
+    return resposta;
+  }
+}
+</file>
+
 <file path="src/infra/InMemorySessionManager.ts">
 /**
  * @file InMemorySessionManager.ts
@@ -595,6 +973,13 @@ export class InMemorySessionManager extends ISessionManager {
           `[InMemorySessionManager] Session "${sessionId}" reached max limit. ` +
           `Removed oldest non-system message.`
         );
+      } else {
+        // Se todas as mensagens são system, remove a mais antiga (índice 0)
+        historico.shift();
+        this.logger.debug(
+          `[InMemorySessionManager] Session "${sessionId}" reached max limit. ` +
+          `All messages are system. Removed oldest message.`
+        );
       }
     }
 
@@ -614,7 +999,7 @@ export class InMemorySessionManager extends ISessionManager {
    * @param sessionId - Identificador único da sessão.
    * @returns Array de mensagens no formato ChatMessage[].
    */
-  async obterHistorico(sessionId: string): Promise<ChatMessage[]> {
+  async obterHistorico(sessionId: string): Promise<ReadonlyArray<ChatMessage>> {
     const historico = this.sessions.get(sessionId);
     if (!historico) {
       this.logger.debug(
@@ -622,7 +1007,7 @@ export class InMemorySessionManager extends ISessionManager {
       );
       return [];
     }
-    return [...historico]; // retorna uma cópia para evitar mutação externa
+    return historico; // retorna a referência direta; imutabilidade garantida pelo TypeScript (ReadonlyArray)
   }
 
   /**
@@ -647,245 +1032,140 @@ export class InMemorySessionManager extends ISessionManager {
 }
 </file>
 
-<file path="src/core/ICircuitBreaker.ts">
+<file path="src/infra/MockVectorStore.ts">
 /**
- * @file ICircuitBreaker.ts
- * @description Contrato de abstração para o padrão Circuit Breaker.
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas.
+ * @file MockVectorStore.ts
+ * @description Implementação mock do Vector Store (Memória Vetorial) para validação
+ *              da lógica de armazenamento e busca por similaridade sem dependências externas.
  *
- *              Estados: CLOSED (normal), OPEN (falhando), HALF_OPEN (teste).
+ *              Armazena vetores em memória (Map) e utiliza similaridade cosseno
+ *              para ordenação dos resultados de busca.
+ *
+ *              Depende da abstração IVectorStore e injeta ILogger via construtor.
  */
 
-export enum CircuitState {
-  CLOSED = 'CLOSED',
-  OPEN = 'OPEN',
-  HALF_OPEN = 'HALF_OPEN',
+import { IVectorStore } from '../core/IVectorStore.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+export interface MockVectorStoreOptions {
+  /** Instância de ILogger para logging estruturado */
+  logger: ILogger;
 }
 
-export abstract class ICircuitBreaker {
-  /** Estado atual do circuit breaker */
-  abstract get state(): CircuitState;
+interface VectorEntry<M = any> {
+  vector: number[];
+  metadata: M;
+}
+
+export class MockVectorStore<M = any> extends IVectorStore<M> {
+  private readonly store: Map<string, VectorEntry<M>> = new Map();
+  private readonly logger: ILogger;
 
   /**
-   * Executa uma operação respeitando o estado do circuit breaker.
-   * - CLOSED: executa normalmente, registra sucesso/falha
-   * - OPEN: lança erro imediatamente (a menos que o timeout tenha expirado para HALF_OPEN)
-   * - HALF_OPEN: permite 1 chamada de teste; sucesso volta para CLOSED, falha volta para OPEN
+   * @param options - Objeto de configuração seguindo o padrão Options Object.
+   */
+  constructor(options: MockVectorStoreOptions) {
+    super();
+    this.logger = options.logger;
+  }
+
+  /**
+   * Adiciona um vetor ao armazenamento em memória.
+   * Loga em DEBUG a operação para fins de rastreabilidade.
    *
-   * @param fn - Função assíncrona a ser protegida
-   * @returns O resultado da função
-   * @throws {Error} Se o circuit breaker estiver OPEN e o timeout não tiver expirado
+   * @param id       - Identificador único do vetor
+   * @param vector   - Vetor numérico representando o embedding
+   * @param metadata - Metadados associados ao vetor
+   * @throws {Error} Se o ID já existir no armazenamento
    */
-  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
+  async adicionar(id: string, vector: number[], metadata: M): Promise<void> {
+    if (this.store.has(id)) {
+      throw new Error(`[MockVectorStore] Vector with id '${id}' already exists.`);
+    }
 
-  /** Registra uma falha manualmente (para uso externo) */
-  abstract recordFailure(): void;
+    this.store.set(id, { vector, metadata });
 
-  /** Reseta o circuit breaker para o estado CLOSED */
-  abstract reset(): void;
-}
-</file>
+    this.logger.debug(
+      `[MockVectorStore] Vector added. id="${id}", vectorLength=${vector.length}, metadataKeys=${Object.keys(metadata as object).join(',')}`
+    );
+  }
 
-<file path="src/core/IEmbeddings.ts">
-/**
- * @file IEmbeddings.ts
- * @description Contrato de abstração para o serviço de embeddings vetoriais.
- *              Responsável por transformar texto em vetores numéricos (embeddings)
- *              que representam o significado semântico do conteúdo.
- *
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas (OllamaEmbeddings, OpenAI, etc.).
- */
-
-export abstract class IEmbeddings {
   /**
-   * Gera um vetor de números (embedding) a partir de um texto de entrada.
-   * O vetor resultante pode ser usado para busca semântica, similaridade,
-   * classificação ou clustering.
+   * Busca os N vetores mais similares usando similaridade cosseno.
+   * Retorna array vazio se o armazenamento estiver vazio.
    *
-   * @param text - Texto a ser convertido em embedding
-   * @returns Promise com um array de números representando o embedding
-   * @throws {Error} Se o serviço de embeddings falhar ou retornar dados inválidos
+   * @param vector - Vetor de consulta
+   * @param limit  - Número máximo de resultados
+   * @returns Array de resultados ordenados por score decrescente
    */
-  abstract gerarVector(text: string): Promise<number[]>;
-}
-</file>
+  async buscarSimilares(
+    vector: number[],
+    limit: number
+  ): Promise<{ id: string; metadata: M; score: number }[]> {
+    if (this.store.size === 0) {
+      this.logger.debug('[MockVectorStore] No vectors stored. Returning empty result.');
+      return [];
+    }
 
-<file path="src/core/IHttpServer.ts">
-/**
- * @file IHttpServer.ts
- * @description Contrato de abstração para servidor HTTP nativo do SOBERANO.
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas.
- *
- *              Suporta start/stop para integração com graceful shutdown.
- */
+    const entries = Array.from(this.store.entries());
+    const scored: { id: string; metadata: any; score: number }[] = [];
 
-export abstract class IHttpServer {
+    for (const [id, entry] of entries) {
+      if (!entry) continue;
+      const score = this.cosineSimilarity(vector, entry.vector);
+      scored.push({ id, metadata: entry.metadata, score });
+    }
+
+    // Ordena por score decrescente (mais similar primeiro)
+    scored.sort((a, b) => b.score - a.score);
+
+    const results = scored.slice(0, limit);
+
+    this.logger.debug(
+      `[MockVectorStore] Similarity search completed. totalEntries=${entries.length}, returned=${results.length}`
+    );
+
+    return results;
+  }
+
   /**
-   * Inicia o servidor HTTP na porta especificada.
-   * @param port - Número da porta para escutar (ex: 3000)
+   * Calcula a similaridade cosseno entre dois vetores.
+   *
+   * similarity = (A · B) / (||A|| * ||B||)
+   *
+   * @param a - Primeiro vetor
+   * @param b - Segundo vetor
+   * @returns Valor entre -1 e 1 (1 = idênticos, 0 = ortogonais, -1 = opostos)
    */
-  abstract start(port: number): Promise<void>;
+  private cosineSimilarity(a: number[], b: number[]): number {
+    if (a.length !== b.length) {
+      throw new Error(
+        `[MockVectorStore] Vector dimension mismatch: a.length=${a.length}, b.length=${b.length}`
+      );
+    }
 
-  /**
-   * Para o servidor HTTP de forma limpa.
-   * Fecha todas as conexões ativas e libera a porta.
-   */
-  abstract stop(): Promise<void>;
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+
+    for (let i = 0; i < a.length; i++) {
+      const ai = a[i] as number;
+      const bi = b[i] as number;
+      dotProduct += ai * bi;
+      normA += ai * ai;
+      normB += bi * bi;
+    }
+
+    const magnitudeA = Math.sqrt(normA);
+    const magnitudeB = Math.sqrt(normB);
+
+    if (magnitudeA === 0 || magnitudeB === 0) {
+      return 0; // Vetores nulos têm similaridade zero
+    }
+
+    return dotProduct / (magnitudeA * magnitudeB);
+  }
 }
-</file>
-
-<file path="src/infra/ConsoleLogger.test.ts">
-/**
- * @file ConsoleLogger.test.ts
- * @description Testes unitários para ConsoleLogger utilizando mock.method
- *              do node:test para capturar chamadas a console.log, console.warn
- *              e console.error.
- *
- * Como executar:
- *   node --experimental-transform-types --test src/infra/ConsoleLogger.test.ts
- */
-
-import { describe, it, mock, afterEach } from 'node:test';
-import assert from 'node:assert';
-import { ConsoleLogger } from './ConsoleLogger.ts';
-import { LogLevel } from '../core/ILogger.ts';
-
-describe('ConsoleLogger', () => {
-  afterEach(() => {
-    mock.restoreAll();
-  });
-
-  describe('Filtragem por nível mínimo (minLevel)', () => {
-    it('não deve chamar console.log para DEBUG quando minLevel é INFO', () => {
-      const logMock = mock.method(console, 'log', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
-
-      logger.debug('mensagem debug');
-
-      assert.strictEqual(logMock.mock.calls.length, 0, 'console.log não deve ser chamado para DEBUG com minLevel INFO');
-    });
-
-    it('deve chamar console.log para INFO quando minLevel é INFO', () => {
-      const logMock = mock.method(console, 'log', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
-
-      logger.info('mensagem info');
-
-      assert.strictEqual(logMock.mock.calls.length, 1, 'console.log deve ser chamado para INFO');
-    });
-
-    it('deve chamar console.log para DEBUG quando minLevel é DEBUG', () => {
-      const logMock = mock.method(console, 'log', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.DEBUG);
-
-      logger.debug('mensagem debug');
-
-      assert.strictEqual(logMock.mock.calls.length, 1, 'console.log deve ser chamado para DEBUG com minLevel DEBUG');
-    });
-
-    it('não deve chamar console.log para INFO quando minLevel é ERROR', () => {
-      const logMock = mock.method(console, 'log', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.ERROR);
-
-      logger.info('mensagem info');
-
-      assert.strictEqual(logMock.mock.calls.length, 0, 'console.log não deve ser chamado para INFO com minLevel ERROR');
-    });
-  });
-
-  describe('Métodos de saída corretos', () => {
-    it('deve chamar console.warn para warn()', () => {
-      const warnMock = mock.method(console, 'warn', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.WARN);
-
-      logger.warn('aviso');
-
-      assert.strictEqual(warnMock.mock.calls.length, 1, 'console.warn deve ser chamado para WARN');
-    });
-
-    it('deve chamar console.error para error()', () => {
-      const errorMock = mock.method(console, 'error', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.ERROR);
-
-      logger.error('falha crítica');
-
-      assert.strictEqual(errorMock.mock.calls.length, 1, 'console.error deve ser chamado para ERROR');
-    });
-  });
-
-  describe('Formato da mensagem', () => {
-    it('deve conter o prefixo [SOBERANO] na mensagem logada', () => {
-      const logMock = mock.method(console, 'log', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
-
-      logger.info('teste de formato');
-
-      assert.strictEqual(logMock.mock.calls.length, 1);
-      const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
-      assert.ok(loggedMessage.includes('[SOBERANO]'), `Mensagem deve conter [SOBERANO], recebido: ${loggedMessage}`);
-    });
-
-    it('deve conter o nível [INFO] na mensagem logada', () => {
-      const logMock = mock.method(console, 'log', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
-
-      logger.info('teste de nível');
-
-      assert.strictEqual(logMock.mock.calls.length, 1);
-      const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
-      assert.ok(loggedMessage.includes('[INFO]'), `Mensagem deve conter [INFO], recebido: ${loggedMessage}`);
-    });
-
-    it('deve conter um timestamp ISO 8601 na mensagem logada', () => {
-      const logMock = mock.method(console, 'log', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.INFO);
-
-      logger.info('teste de timestamp');
-
-      assert.strictEqual(logMock.mock.calls.length, 1);
-      const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
-      // Timestamp ISO: YYYY-MM-DDTHH:mm:ss.sssZ
-      const isoRegex = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
-      assert.ok(isoRegex.test(loggedMessage), `Mensagem deve conter timestamp ISO, recebido: ${loggedMessage}`);
-    });
-
-    it('deve conter o nível [ERROR] ao logar um erro', () => {
-      const errorMock = mock.method(console, 'error', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.ERROR);
-
-      logger.error('erro grave');
-
-      assert.strictEqual(errorMock.mock.calls.length, 1);
-      const loggedMessage = errorMock.mock.calls[0]?.arguments[0] as string;
-      assert.ok(loggedMessage.includes('[ERROR]'), `Mensagem deve conter [ERROR], recebido: ${loggedMessage}`);
-    });
-
-    it('deve conter o nível [WARN] ao logar um aviso', () => {
-      const warnMock = mock.method(console, 'warn', () => {});
-      const logger = new ConsoleLogger('SOBERANO', LogLevel.WARN);
-
-      logger.warn('cuidado');
-
-      assert.strictEqual(warnMock.mock.calls.length, 1);
-      const loggedMessage = warnMock.mock.calls[0]?.arguments[0] as string;
-      assert.ok(loggedMessage.includes('[WARN]'), `Mensagem deve conter [WARN], recebido: ${loggedMessage}`);
-    });
-
-    it('deve conter o prefixo personalizado passado no construtor', () => {
-      const logMock = mock.method(console, 'log', () => {});
-      const logger = new ConsoleLogger('CUSTOM', LogLevel.INFO);
-
-      logger.info('prefixo custom');
-
-      assert.strictEqual(logMock.mock.calls.length, 1);
-      const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
-      assert.ok(loggedMessage.includes('[CUSTOM]'), `Mensagem deve conter [CUSTOM], recebido: ${loggedMessage}`);
-    });
-  });
-});
 </file>
 
 <file path="src/infra/validateOllamaResponse.test.ts">
@@ -1185,271 +1465,6 @@ describe('validateOllamaResponse (função pura) - /api/chat', () => {
 });
 </file>
 
-<file path=".gitignore">
-# Dependências
-node_modules/
-
-# Build
-dist/
-build/
-out/
-
-# Ambiente
-.env
-.env.local
-.env.*.local
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Sistema
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-npm-debug.log*
-
-# TypeScript
-*.tsbuildinfo
-</file>
-
-<file path="src/core/IMotorCognitivo.ts">
-/**
- * @file IMotorCognitivo.ts
- * @description Contrato de abstração para o motor cognitivo (LLM).
- *              Módulos de alto nível dependem desta abstração,
- *              não de implementações concretas (DIP).
- *              Classe abstrata em vez de interface para preservar
- *              a estrutura em runtime com --experimental-transform-types.
- */
-
-/**
- * Representa uma mensagem no formato de chat multi-turno.
- * Suporta os papéis: system (instrução de sistema), user (usuário),
- * assistant (modelo).
- */
-export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
-}
-
-export abstract class IMotorCognitivo {
-  /**
-   * Define o sinal de aborto para cancelamento de operações pendentes.
-   * @param signal - Sinal AbortSignal para cancelamento gracioso.
-   */
-  abstract setAbortSignal(signal: AbortSignal): void;
-
-  /**
-   * Envia uma lista de mensagens no formato chat ao motor cognitivo
-   * e retorna a resposta gerada pelo modelo.
-   * @param mensagens - Array de mensagens no formato ChatMessage[].
-   * @returns A resposta gerada pelo modelo (content da mensagem assistant).
-   */
-  abstract gerarResposta(mensagens: ChatMessage[]): Promise<string>;
-}
-</file>
-
-<file path="src/core/ISensor.ts">
-/**
- * @file ISensor.ts
- * @description Contrato de abstração genérico para sensores do sistema SOBERANO.
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas.
- *
- *              O tipo genérico T representa o tipo de dado retornado pelo sensor
- *              (ex: string para leitura de arquivos, Buffer para binários, etc.).
- */
-
-export abstract class ISensor<T> {
-  /**
-   * Lê dados de uma origem identificada por `target`.
-   * @param target - Identificador da origem (ex: caminho de arquivo, URL, etc.)
-   * @param signal - Opcional. AbortSignal para cancelamento da operação.
-   * @returns Promise com o dado lido, tipado como T
-   */
-  abstract ler(target: string, signal?: AbortSignal): Promise<T>;
-}
-</file>
-
-<file path="src/core/IVectorStore.ts">
-/**
- * @file IVectorStore.ts
- * @description Contrato de abstração para o armazenamento e busca de vetores
- *              (Vector Store / Memória Vetorial). Permite adicionar vetores
- *              com metadados associados e realizar buscas por similaridade.
- *
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas (MockVectorStore, ChromaDB, etc.).
- */
-
-export abstract class IVectorStore<M = any> {
-  /**
-   * Adiciona um vetor ao armazenamento com seu ID e metadados associados.
-   *
-   * @param id       - Identificador único do vetor (ex: hash do documento)
-   * @param vector   - Vetor numérico representando o embedding semântico
-   * @param metadata - Metadados associados ao vetor (ex: texto original, fonte)
-   * @throws {Error} Se o ID já existir (fail-fast) ou se houver falha no armazenamento
-   */
-  abstract adicionar(id: string, vector: number[], metadata: M): Promise<void>;
-
-  /**
-   * Busca os N vetores mais similares ao vetor de consulta fornecido,
-   * utilizando similaridade cosseno ou métrica equivalente.
-   *
-   * @param vector - Vetor de consulta para busca por similaridade
-   * @param limit  - Número máximo de resultados a retornar
-   * @returns Promise com array de objetos contendo id, metadata e score de similaridade
-   * @throws {Error} Se não houver vetores armazenados
-   */
-  abstract buscarSimilares(vector: number[], limit: number): Promise<
-    { id: string; metadata: M; score: number }[]
-  >;
-}
-</file>
-
-<file path="src/infra/MockVectorStore.ts">
-/**
- * @file MockVectorStore.ts
- * @description Implementação mock do Vector Store (Memória Vetorial) para validação
- *              da lógica de armazenamento e busca por similaridade sem dependências externas.
- *
- *              Armazena vetores em memória (Map) e utiliza similaridade cosseno
- *              para ordenação dos resultados de busca.
- *
- *              Depende da abstração IVectorStore e injeta ILogger via construtor.
- */
-
-import { IVectorStore } from '../core/IVectorStore.ts';
-import { ILogger } from '../core/ILogger.ts';
-
-export interface MockVectorStoreOptions {
-  /** Instância de ILogger para logging estruturado */
-  logger: ILogger;
-}
-
-interface VectorEntry<M = any> {
-  vector: number[];
-  metadata: M;
-}
-
-export class MockVectorStore<M = any> extends IVectorStore<M> {
-  private readonly store: Map<string, VectorEntry<M>> = new Map();
-  private readonly logger: ILogger;
-
-  /**
-   * @param options - Objeto de configuração seguindo o padrão Options Object.
-   */
-  constructor(options: MockVectorStoreOptions) {
-    super();
-    this.logger = options.logger;
-  }
-
-  /**
-   * Adiciona um vetor ao armazenamento em memória.
-   * Loga em DEBUG a operação para fins de rastreabilidade.
-   *
-   * @param id       - Identificador único do vetor
-   * @param vector   - Vetor numérico representando o embedding
-   * @param metadata - Metadados associados ao vetor
-   * @throws {Error} Se o ID já existir no armazenamento
-   */
-  async adicionar(id: string, vector: number[], metadata: M): Promise<void> {
-    if (this.store.has(id)) {
-      throw new Error(`[MockVectorStore] Vector with id '${id}' already exists.`);
-    }
-
-    this.store.set(id, { vector, metadata });
-
-    this.logger.debug(
-      `[MockVectorStore] Vector added. id="${id}", vectorLength=${vector.length}, metadataKeys=${Object.keys(metadata as object).join(',')}`
-    );
-  }
-
-  /**
-   * Busca os N vetores mais similares usando similaridade cosseno.
-   * Retorna array vazio se o armazenamento estiver vazio.
-   *
-   * @param vector - Vetor de consulta
-   * @param limit  - Número máximo de resultados
-   * @returns Array de resultados ordenados por score decrescente
-   */
-  async buscarSimilares(
-    vector: number[],
-    limit: number
-  ): Promise<{ id: string; metadata: M; score: number }[]> {
-    if (this.store.size === 0) {
-      this.logger.debug('[MockVectorStore] No vectors stored. Returning empty result.');
-      return [];
-    }
-
-    const entries = Array.from(this.store.entries());
-    const scored: { id: string; metadata: any; score: number }[] = [];
-
-    for (const [id, entry] of entries) {
-      if (!entry) continue;
-      const score = this.cosineSimilarity(vector, entry.vector);
-      scored.push({ id, metadata: entry.metadata, score });
-    }
-
-    // Ordena por score decrescente (mais similar primeiro)
-    scored.sort((a, b) => b.score - a.score);
-
-    const results = scored.slice(0, limit);
-
-    this.logger.debug(
-      `[MockVectorStore] Similarity search completed. totalEntries=${entries.length}, returned=${results.length}`
-    );
-
-    return results;
-  }
-
-  /**
-   * Calcula a similaridade cosseno entre dois vetores.
-   *
-   * similarity = (A · B) / (||A|| * ||B||)
-   *
-   * @param a - Primeiro vetor
-   * @param b - Segundo vetor
-   * @returns Valor entre -1 e 1 (1 = idênticos, 0 = ortogonais, -1 = opostos)
-   */
-  private cosineSimilarity(a: number[], b: number[]): number {
-    if (a.length !== b.length) {
-      throw new Error(
-        `[MockVectorStore] Vector dimension mismatch: a.length=${a.length}, b.length=${b.length}`
-      );
-    }
-
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-
-    for (let i = 0; i < a.length; i++) {
-      const ai = a[i] as number;
-      const bi = b[i] as number;
-      dotProduct += ai * bi;
-      normA += ai * ai;
-      normB += bi * bi;
-    }
-
-    const magnitudeA = Math.sqrt(normA);
-    const magnitudeB = Math.sqrt(normB);
-
-    if (magnitudeA === 0 || magnitudeB === 0) {
-      return 0; // Vetores nulos têm similaridade zero
-    }
-
-    return dotProduct / (magnitudeA * magnitudeB);
-  }
-}
-</file>
-
 <file path=".clinerules">
 # Diretrizes SOBERANO - Engenharia de Software de Alta Robustez
 
@@ -1505,6 +1520,43 @@ export abstract class ILogger {
   abstract error(message: string): void;
   /** Debug message (development only) */
   abstract debug(message: string): void;
+}
+</file>
+
+<file path="src/core/IMotorCognitivo.ts">
+/**
+ * @file IMotorCognitivo.ts
+ * @description Contrato de abstração para o motor cognitivo (LLM).
+ *              Módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas (DIP).
+ *              Classe abstrata em vez de interface para preservar
+ *              a estrutura em runtime com --experimental-transform-types.
+ */
+
+/**
+ * Representa uma mensagem no formato de chat multi-turno.
+ * Suporta os papéis: system (instrução de sistema), user (usuário),
+ * assistant (modelo).
+ */
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export abstract class IMotorCognitivo {
+  /**
+   * Define o sinal de aborto para cancelamento de operações pendentes.
+   * @param signal - Sinal AbortSignal para cancelamento gracioso.
+   */
+  abstract setAbortSignal(signal: AbortSignal): void;
+
+  /**
+   * Envia uma lista de mensagens no formato chat ao motor cognitivo
+   * e retorna a resposta gerada pelo modelo.
+   * @param mensagens - Array de mensagens no formato ChatMessage[].
+   * @returns A resposta gerada pelo modelo (content da mensagem assistant).
+   */
+  abstract gerarResposta(mensagens: ChatMessage[]): Promise<string>;
 }
 </file>
 
@@ -2376,215 +2428,6 @@ export class CircuitBreaker extends ICircuitBreaker {
 }
 </file>
 
-<file path="src/infra/OllamaProvider.test.ts">
-/**
- * @file OllamaProvider.test.ts
- * @description Testes unitários para OllamaProvider utilizando
- *              node:test e node:assert (zero dependências externas).
- *
- * Como executar:
- *   node --experimental-transform-types src/infra/OllamaProvider.test.ts
- */
-
-import { describe, it, mock, afterEach } from 'node:test';
-import assert from 'node:assert';
-import { OllamaProvider } from './OllamaProvider.ts';
-import { ILogger } from '../core/ILogger.ts';
-import { ICircuitBreaker, CircuitState } from '../core/ICircuitBreaker.ts';
-import type { ChatMessage } from '../core/IMotorCognitivo.ts';
-
-/**
- * Logger fictício (mock) que estende ILogger sem efeitos colaterais.
- * Usado para isolar os testes do sistema de logging real.
- */
-class MockLogger extends ILogger {
-  public logs: string[] = [];
-
-  info(message: string): void {
-    this.logs.push(`INFO: ${message}`);
-  }
-  warn(message: string): void {
-    this.logs.push(`WARN: ${message}`);
-  }
-  error(message: string): void {
-    this.logs.push(`ERROR: ${message}`);
-  }
-  debug(message: string): void {
-    this.logs.push(`DEBUG: ${message}`);
-  }
-}
-
-/**
- * Mock de CircuitBreaker que sempre permite a execução (estado CLOSED).
- * Usado para satisfazer o requisito DIP nos testes do OllamaProvider.
- */
-class MockCircuitBreaker extends ICircuitBreaker {
-  get state(): CircuitState {
-    return CircuitState.CLOSED;
-  }
-
-  async execute<T>(fn: () => Promise<T>): Promise<T> {
-    return fn();
-  }
-
-  recordFailure(): void {
-    // no-op
-  }
-
-  reset(): void {
-    // no-op
-  }
-}
-
-describe('OllamaProvider', () => {
-  let fetchMock: ReturnType<typeof mock.method<typeof globalThis, 'fetch'>>;
-
-  afterEach(() => {
-    fetchMock?.mock.restore();
-  });
-
-  describe('Chamada fetch - gerarResposta', () => {
-    it('deve chamar fetch com a URL e payload corretos (endpoint /api/chat)', async () => {
-      const mockLogger = new MockLogger();
-
-      let capturedUrl: string | undefined;
-      let capturedOptions: RequestInit | undefined;
-
-      fetchMock = mock.method(globalThis, 'fetch', (url: RequestInfo | URL, options?: RequestInit) => {
-        capturedUrl = typeof url === 'string' ? url : url.toString();
-        capturedOptions = options;
-
-        return new Response(JSON.stringify({
-          model: 'test-model',
-          created_at: new Date().toISOString(),
-          message: {
-            role: 'assistant',
-            content: 'Resposta de teste do SOBERANO.',
-          },
-          done: true,
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      });
-
-      const mockCB = new MockCircuitBreaker();
-      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:11434', model: 'test-model', circuitBreaker: mockCB });
-
-      const mensagens: ChatMessage[] = [{ role: 'user', content: 'Prompt de teste' }];
-      const resposta = await provider.gerarResposta(mensagens);
-
-      // Valida que fetch foi chamado na URL correta (/api/chat)
-      assert.strictEqual(capturedUrl, 'http://localhost:11434/api/chat');
-
-      // Valida que o payload foi enviado corretamente
-      assert.ok(capturedOptions, 'fetch deve ter sido chamado com options');
-      assert.strictEqual(capturedOptions!.method, 'POST');
-      assert.strictEqual((capturedOptions!.headers as Record<string, string>)?.['Content-Type'], 'application/json');
-
-      const sentBody = JSON.parse(capturedOptions!.body as string);
-      assert.strictEqual(sentBody.model, 'test-model');
-      assert.deepStrictEqual(sentBody.messages, [{ role: 'user', content: 'Prompt de teste' }]);
-      assert.strictEqual(sentBody.stream, false);
-
-      // Valida que a resposta foi processada corretamente
-      assert.strictEqual(resposta, 'Resposta de teste do SOBERANO.');
-
-      // Valida que o logger registrou a operação
-      assert.ok(
-        mockLogger.logs.some((log) => log.includes('Attempt 1/3')),
-        'Logger deve registrar a tentativa de envio'
-      );
-      assert.ok(
-        mockLogger.logs.some((log) => log.includes('succeeded')),
-        'Logger deve registrar sucesso'
-      );
-    });
-
-    it('deve lançar erro HTTP quando resposta não for ok', async () => {
-      const mockLogger = new MockLogger();
-
-      fetchMock = mock.method(globalThis, 'fetch', () => {
-        return new Response(JSON.stringify({ error: 'Model not found' }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      });
-
-      const mockCB = new MockCircuitBreaker();
-      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
-      await assert.rejects(
-        () => provider.gerarResposta([{ role: 'user', content: 'teste' }]),
-        (err: unknown) => {
-          if (err instanceof Error) {
-            assert.ok(err.message.includes('HTTP error 404'));
-          }
-          return true;
-        }
-      );
-    });
-
-    it('deve fazer retry em caso de erro de conexão e falhar após 3 tentativas', async () => {
-      const mockLogger = new MockLogger();
-
-      // Fetch que sempre falha com TypeError (erro de conexão)
-      fetchMock = mock.method(globalThis, 'fetch', () => {
-        throw new TypeError('fetch failed: connection refused');
-      });
-
-      const mockCB = new MockCircuitBreaker();
-      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:99999', model: 'test-model', delayBase: 1, circuitBreaker: mockCB });
-      await assert.rejects(
-        () => provider.gerarResposta([{ role: 'user', content: 'teste' }]),
-        (err: unknown) => {
-          if (err instanceof Error) {
-            assert.ok(err.message.includes('fetch failed'));
-          }
-          return true;
-        }
-      );
-
-      // Valida o fluxo exato do loop de retry:
-      // Tentativa 1 → falha → log WARN com retry
-      // Tentativa 2 → falha → log WARN com retry
-      // Tentativa 3 → falha → log ERROR de "All attempts failed"
-
-      // Logs de retry: WARN com "Attempt X failed" e "Retrying"
-      const retryLogs = mockLogger.logs.filter(
-        (log) => log.startsWith('WARN:') && log.includes('failed') && log.includes('Retrying')
-      );
-      assert.strictEqual(retryLogs.length, 2, 'Deve haver 2 logs WARN de retry (Tentativa 1 e 2)');
-      assert.ok(retryLogs[0]!.includes('Attempt 1'), 'Primeiro retry deve ser da Tentativa 1');
-      assert.ok(retryLogs[1]!.includes('Attempt 2'), 'Segundo retry deve ser da Tentativa 2');
-
-      // Log final de falha: ERROR com "All" e "attempts failed"
-      const finalFailLog = mockLogger.logs.filter(
-        (log) => log.startsWith('ERROR:') && log.includes('All') && log.includes('attempts failed')
-      );
-      assert.strictEqual(finalFailLog.length, 1, 'Deve haver exatamente 1 log de falha final');
-      assert.ok(finalFailLog[0]!.includes('3 attempts failed'), 'Deve mencionar 3 tentativas falhas');
-    });
-
-    it('NÃO deve fazer retry para erros HTTP 4xx (não recuperáveis)', async () => {
-      const mockLogger = new MockLogger();
-
-      let callCount = 0;
-
-      fetchMock = mock.method(globalThis, 'fetch', () => {
-        callCount++;
-        return new Response('Bad Request', { status: 400 });
-      });
-
-      const mockCB = new MockCircuitBreaker();
-      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
-      await assert.rejects(() => provider.gerarResposta([{ role: 'user', content: 'teste' }]));
-      // Deve ter chamado fetch apenas 1 vez (sem retry para 4xx)
-      assert.strictEqual(callCount, 1, 'Não deve haver retry para erro HTTP 4xx');
-    });
-  });
-});
-</file>
-
 <file path="src/infra/CircuitBreaker.test.ts">
 /**
  * @file CircuitBreaker.test.ts
@@ -2832,6 +2675,215 @@ describe('CircuitBreaker', () => {
       const successFn = () => Promise.resolve('ok');
       const result = await cb.execute(successFn);
       assert.strictEqual(result, 'ok');
+    });
+  });
+});
+</file>
+
+<file path="src/infra/OllamaProvider.test.ts">
+/**
+ * @file OllamaProvider.test.ts
+ * @description Testes unitários para OllamaProvider utilizando
+ *              node:test e node:assert (zero dependências externas).
+ *
+ * Como executar:
+ *   node --experimental-transform-types src/infra/OllamaProvider.test.ts
+ */
+
+import { describe, it, mock, afterEach } from 'node:test';
+import assert from 'node:assert';
+import { OllamaProvider } from './OllamaProvider.ts';
+import { ILogger } from '../core/ILogger.ts';
+import { ICircuitBreaker, CircuitState } from '../core/ICircuitBreaker.ts';
+import type { ChatMessage } from '../core/IMotorCognitivo.ts';
+
+/**
+ * Logger fictício (mock) que estende ILogger sem efeitos colaterais.
+ * Usado para isolar os testes do sistema de logging real.
+ */
+class MockLogger extends ILogger {
+  public logs: string[] = [];
+
+  info(message: string): void {
+    this.logs.push(`INFO: ${message}`);
+  }
+  warn(message: string): void {
+    this.logs.push(`WARN: ${message}`);
+  }
+  error(message: string): void {
+    this.logs.push(`ERROR: ${message}`);
+  }
+  debug(message: string): void {
+    this.logs.push(`DEBUG: ${message}`);
+  }
+}
+
+/**
+ * Mock de CircuitBreaker que sempre permite a execução (estado CLOSED).
+ * Usado para satisfazer o requisito DIP nos testes do OllamaProvider.
+ */
+class MockCircuitBreaker extends ICircuitBreaker {
+  get state(): CircuitState {
+    return CircuitState.CLOSED;
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    return fn();
+  }
+
+  recordFailure(): void {
+    // no-op
+  }
+
+  reset(): void {
+    // no-op
+  }
+}
+
+describe('OllamaProvider', () => {
+  let fetchMock: ReturnType<typeof mock.method<typeof globalThis, 'fetch'>>;
+
+  afterEach(() => {
+    fetchMock?.mock.restore();
+  });
+
+  describe('Chamada fetch - gerarResposta', () => {
+    it('deve chamar fetch com a URL e payload corretos (endpoint /api/chat)', async () => {
+      const mockLogger = new MockLogger();
+
+      let capturedUrl: string | undefined;
+      let capturedOptions: RequestInit | undefined;
+
+      fetchMock = mock.method(globalThis, 'fetch', (url: RequestInfo | URL, options?: RequestInit) => {
+        capturedUrl = typeof url === 'string' ? url : url.toString();
+        capturedOptions = options;
+
+        return new Response(JSON.stringify({
+          model: 'test-model',
+          created_at: new Date().toISOString(),
+          message: {
+            role: 'assistant',
+            content: 'Resposta de teste do SOBERANO.',
+          },
+          done: true,
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:11434', model: 'test-model', circuitBreaker: mockCB });
+
+      const mensagens: ChatMessage[] = [{ role: 'user', content: 'Prompt de teste' }];
+      const resposta = await provider.gerarResposta(mensagens);
+
+      // Valida que fetch foi chamado na URL correta (/api/chat)
+      assert.strictEqual(capturedUrl, 'http://localhost:11434/api/chat');
+
+      // Valida que o payload foi enviado corretamente
+      assert.ok(capturedOptions, 'fetch deve ter sido chamado com options');
+      assert.strictEqual(capturedOptions!.method, 'POST');
+      assert.strictEqual((capturedOptions!.headers as Record<string, string>)?.['Content-Type'], 'application/json');
+
+      const sentBody = JSON.parse(capturedOptions!.body as string);
+      assert.strictEqual(sentBody.model, 'test-model');
+      assert.deepStrictEqual(sentBody.messages, [{ role: 'user', content: 'Prompt de teste' }]);
+      assert.strictEqual(sentBody.stream, false);
+
+      // Valida que a resposta foi processada corretamente
+      assert.strictEqual(resposta, 'Resposta de teste do SOBERANO.');
+
+      // Valida que o logger registrou a operação
+      assert.ok(
+        mockLogger.logs.some((log) => log.includes('Attempt 1/3')),
+        'Logger deve registrar a tentativa de envio'
+      );
+      assert.ok(
+        mockLogger.logs.some((log) => log.includes('succeeded')),
+        'Logger deve registrar sucesso'
+      );
+    });
+
+    it('deve lançar erro HTTP quando resposta não for ok', async () => {
+      const mockLogger = new MockLogger();
+
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        return new Response(JSON.stringify({ error: 'Model not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
+      await assert.rejects(
+        () => provider.gerarResposta([{ role: 'user', content: 'teste' }]),
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('HTTP error 404'));
+          }
+          return true;
+        }
+      );
+    });
+
+    it('deve fazer retry em caso de erro de conexão e falhar após 3 tentativas', async () => {
+      const mockLogger = new MockLogger();
+
+      // Fetch que sempre falha com TypeError (erro de conexão)
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        throw new TypeError('fetch failed: connection refused');
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, baseUrl: 'http://localhost:99999', model: 'test-model', delayBase: 1, circuitBreaker: mockCB });
+      await assert.rejects(
+        () => provider.gerarResposta([{ role: 'user', content: 'teste' }]),
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('fetch failed'));
+          }
+          return true;
+        }
+      );
+
+      // Valida o fluxo exato do loop de retry:
+      // Tentativa 1 → falha → log WARN com retry
+      // Tentativa 2 → falha → log WARN com retry
+      // Tentativa 3 → falha → log ERROR de "All attempts failed"
+
+      // Logs de retry: WARN com "Attempt X failed" e "Retrying"
+      const retryLogs = mockLogger.logs.filter(
+        (log) => log.startsWith('WARN:') && log.includes('failed') && log.includes('Retrying')
+      );
+      assert.strictEqual(retryLogs.length, 2, 'Deve haver 2 logs WARN de retry (Tentativa 1 e 2)');
+      assert.ok(retryLogs[0]!.includes('Attempt 1'), 'Primeiro retry deve ser da Tentativa 1');
+      assert.ok(retryLogs[1]!.includes('Attempt 2'), 'Segundo retry deve ser da Tentativa 2');
+
+      // Log final de falha: ERROR com "All" e "attempts failed"
+      const finalFailLog = mockLogger.logs.filter(
+        (log) => log.startsWith('ERROR:') && log.includes('All') && log.includes('attempts failed')
+      );
+      assert.strictEqual(finalFailLog.length, 1, 'Deve haver exatamente 1 log de falha final');
+      assert.ok(finalFailLog[0]!.includes('3 attempts failed'), 'Deve mencionar 3 tentativas falhas');
+    });
+
+    it('NÃO deve fazer retry para erros HTTP 4xx (não recuperáveis)', async () => {
+      const mockLogger = new MockLogger();
+
+      let callCount = 0;
+
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        callCount++;
+        return new Response('Bad Request', { status: 400 });
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
+      await assert.rejects(() => provider.gerarResposta([{ role: 'user', content: 'teste' }]));
+      // Deve ter chamado fetch apenas 1 vez (sem retry para 4xx)
+      assert.strictEqual(callCount, 1, 'Não deve haver retry para erro HTTP 4xx');
     });
   });
 });
@@ -3247,6 +3299,137 @@ export class OllamaProvider extends IMotorCognitivo {
 }
 </file>
 
+<file path="src/env.d.ts">
+/**
+ * @file env.d.ts
+ * @description Declarações de tipos mínimas para APIs nativas do Node.js.
+ *              Necessário porque não podemos instalar @types/node (zero dependências externas).
+ *              Apenas o essencial para eliminar erros de TypeScript no VS Code.
+ */
+
+// Buffer global (necessário para node:fs/promises overloads)
+declare class Buffer {
+  length: number;
+  static from(data: string, encoding?: string): Buffer;
+  toString(encoding?: string): string;
+}
+
+// Process global
+declare var process: {
+  argv: string[];
+  exit(code?: number): never;
+  on(event: string, listener: (...args: unknown[]) => void): void;
+  removeAllListeners(event?: string): void;
+};
+
+// AbortController e AbortSignal (API nativa global)
+declare class AbortController {
+  readonly signal: AbortSignal;
+  abort(): void;
+}
+
+declare class AbortSignal {
+  readonly aborted: boolean;
+  addEventListener(type: 'abort', listener: () => void): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
+  static timeout(ms: number): AbortSignal;
+  static any(signals: AbortSignal[]): AbortSignal;
+}
+
+// queueMicrotask
+declare function queueMicrotask(callback: () => void): void;
+
+// setTimeout e clearTimeout
+declare function setTimeout(
+  callback: (...args: unknown[]) => void,
+  ms?: number,
+  ...args: unknown[]
+): ReturnType<typeof setTimeout>;
+declare function clearTimeout(timeoutId: ReturnType<typeof setTimeout> | undefined): void;
+
+// node:test
+declare module 'node:test' {
+  interface TestContext {
+    diagnostic(message: string): void;
+  }
+  export function describe(name: string, fn: () => void): void;
+  export function it(name: string, fn: (t: TestContext) => void | Promise<void>): void;
+  interface MockCall {
+    arguments: unknown[];
+    result: unknown;
+    error: unknown | undefined;
+  }
+  interface MockMethodObject {
+    calls: MockCall[];
+    callCount(): number;
+    restore: () => void;
+  }
+  interface MockFunction<T extends (...args: any[]) => any> {
+    (...args: Parameters<T>): ReturnType<T>;
+    mock: MockMethodObject;
+  }
+  export const mock: {
+    fn<T extends (...args: any[]) => any>(implementation?: T): MockFunction<T>;
+    method<T, K extends keyof T>(object: T, method: K, implementation?: ((...args: any[]) => any) | undefined): T[K] & { mock: MockMethodObject };
+    restoreAll(): void;
+  };
+  export function before(fn: () => void | Promise<void>): void;
+  export function after(fn: () => void | Promise<void>): void;
+  export function beforeEach(fn: () => void | Promise<void>): void;
+  export function afterEach(fn: () => void | Promise<void>): void;
+}
+
+// node:http
+declare module 'node:http' {
+  interface IncomingMessage {
+    url?: string | undefined;
+    method?: string | undefined;
+    on(event: string, listener: (...args: unknown[]) => void): this;
+  }
+  interface ServerResponse {
+    writeHead(statusCode: number, headers?: Record<string, string>): void;
+    end(data?: string): void;
+  }
+  type RequestListener = (req: IncomingMessage, res: ServerResponse) => void;
+  interface Server {
+    listen(port: number, callback?: () => void): void;
+    close(callback?: (err?: Error) => void): void;
+    on(event: string, listener: (...args: unknown[]) => void): this;
+    address(): { port: number; family?: string; address?: string } | string | null;
+  }
+  export function createServer(requestListener: RequestListener): Server;
+}
+
+// node:fs/promises
+declare module 'node:fs/promises' {
+  export function readFile(path: string): Promise<Buffer>;
+  export function readFile(path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
+  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
+}
+
+// node:assert
+declare module 'node:assert' {
+  interface Assert {
+    ok(value: unknown, message?: string): void;
+    strictEqual<T>(actual: T, expected: T, message?: string): void;
+    deepStrictEqual<T>(actual: T, expected: T, message?: string): void;
+    throws(
+      block: () => unknown,
+      error?: RegExp | Function | Object | Error,
+      message?: string
+    ): void;
+    rejects(
+      block: (() => Promise<unknown>) | Promise<unknown>,
+      error?: RegExp | Function | Object | Error,
+      message?: string
+    ): Promise<void>;
+    fail(message?: string): never;
+  }
+  const assert: Assert;
+  export default assert;
+}
+</file>
+
 <file path="README.md">
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
@@ -3459,137 +3642,6 @@ abstract class IConversationManager {
 - **Mensagens para o usuário:** PT-BR
 - **Testes:** `node:test` nativo com `mock.method()` para isolamento
 - **Commits:** Descritivos em inglês, seguindo conventional commits
-</file>
-
-<file path="src/env.d.ts">
-/**
- * @file env.d.ts
- * @description Declarações de tipos mínimas para APIs nativas do Node.js.
- *              Necessário porque não podemos instalar @types/node (zero dependências externas).
- *              Apenas o essencial para eliminar erros de TypeScript no VS Code.
- */
-
-// Buffer global (necessário para node:fs/promises overloads)
-declare class Buffer {
-  length: number;
-  static from(data: string, encoding?: string): Buffer;
-  toString(encoding?: string): string;
-}
-
-// Process global
-declare var process: {
-  argv: string[];
-  exit(code?: number): never;
-  on(event: string, listener: (...args: unknown[]) => void): void;
-  removeAllListeners(event?: string): void;
-};
-
-// AbortController e AbortSignal (API nativa global)
-declare class AbortController {
-  readonly signal: AbortSignal;
-  abort(): void;
-}
-
-declare class AbortSignal {
-  readonly aborted: boolean;
-  addEventListener(type: 'abort', listener: () => void): void;
-  removeEventListener(type: 'abort', listener: () => void): void;
-  static timeout(ms: number): AbortSignal;
-  static any(signals: AbortSignal[]): AbortSignal;
-}
-
-// queueMicrotask
-declare function queueMicrotask(callback: () => void): void;
-
-// setTimeout e clearTimeout
-declare function setTimeout(
-  callback: (...args: unknown[]) => void,
-  ms?: number,
-  ...args: unknown[]
-): ReturnType<typeof setTimeout>;
-declare function clearTimeout(timeoutId: ReturnType<typeof setTimeout> | undefined): void;
-
-// node:test
-declare module 'node:test' {
-  interface TestContext {
-    diagnostic(message: string): void;
-  }
-  export function describe(name: string, fn: () => void): void;
-  export function it(name: string, fn: (t: TestContext) => void | Promise<void>): void;
-  interface MockCall {
-    arguments: unknown[];
-    result: unknown;
-    error: unknown | undefined;
-  }
-  interface MockMethodObject {
-    calls: MockCall[];
-    callCount(): number;
-    restore: () => void;
-  }
-  interface MockFunction<T extends (...args: any[]) => any> {
-    (...args: Parameters<T>): ReturnType<T>;
-    mock: MockMethodObject;
-  }
-  export const mock: {
-    fn<T extends (...args: any[]) => any>(implementation?: T): MockFunction<T>;
-    method<T, K extends keyof T>(object: T, method: K, implementation?: ((...args: any[]) => any) | undefined): T[K] & { mock: MockMethodObject };
-    restoreAll(): void;
-  };
-  export function before(fn: () => void | Promise<void>): void;
-  export function after(fn: () => void | Promise<void>): void;
-  export function beforeEach(fn: () => void | Promise<void>): void;
-  export function afterEach(fn: () => void | Promise<void>): void;
-}
-
-// node:http
-declare module 'node:http' {
-  interface IncomingMessage {
-    url?: string | undefined;
-    method?: string | undefined;
-    on(event: string, listener: (...args: unknown[]) => void): this;
-  }
-  interface ServerResponse {
-    writeHead(statusCode: number, headers?: Record<string, string>): void;
-    end(data?: string): void;
-  }
-  type RequestListener = (req: IncomingMessage, res: ServerResponse) => void;
-  interface Server {
-    listen(port: number, callback?: () => void): void;
-    close(callback?: (err?: Error) => void): void;
-    on(event: string, listener: (...args: unknown[]) => void): this;
-    address(): { port: number; family?: string; address?: string } | string | null;
-  }
-  export function createServer(requestListener: RequestListener): Server;
-}
-
-// node:fs/promises
-declare module 'node:fs/promises' {
-  export function readFile(path: string): Promise<Buffer>;
-  export function readFile(path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
-  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
-}
-
-// node:assert
-declare module 'node:assert' {
-  interface Assert {
-    ok(value: unknown, message?: string): void;
-    strictEqual<T>(actual: T, expected: T, message?: string): void;
-    deepStrictEqual<T>(actual: T, expected: T, message?: string): void;
-    throws(
-      block: () => unknown,
-      error?: RegExp | Function | Object | Error,
-      message?: string
-    ): void;
-    rejects(
-      block: (() => Promise<unknown>) | Promise<unknown>,
-      error?: RegExp | Function | Object | Error,
-      message?: string
-    ): Promise<void>;
-    fail(message?: string): never;
-  }
-  const assert: Assert;
-  export default assert;
-}
 </file>
 
 <file path="src/main.ts">

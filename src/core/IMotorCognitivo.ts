@@ -10,11 +10,28 @@
 /**
  * Representa uma mensagem no formato de chat multi-turno.
  * Suporta os papéis: system (instrução de sistema), user (usuário),
- * assistant (modelo).
+ * assistant (modelo), tool (resultado de ferramenta).
  */
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /** Chamadas de ferramenta emitidas pelo assistant (tool_calls do Ollama/OpenAI). */
+  tool_calls?: Array<{ function: { name: string; arguments: Record<string, any> } }>;
+  /** ID de correlação para tool call (formato OpenAI/Ollama compatível). */
+  tool_call_id?: string;
+}
+
+/**
+ * Definição de uma ferramenta (function calling) para envio ao motor cognitivo.
+ * Segue o formato esperado pelo Ollama na propriedade `tools` da requisição.
+ */
+export interface IToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, any>;
+  };
 }
 
 export abstract class IMotorCognitivo {
@@ -28,7 +45,9 @@ export abstract class IMotorCognitivo {
    * Envia uma lista de mensagens no formato chat ao motor cognitivo
    * e retorna a resposta gerada pelo modelo.
    * @param mensagens - Array de mensagens no formato ChatMessage[].
-   * @returns A resposta gerada pelo modelo (content da mensagem assistant).
+   * @param tools - Array opcional de definições de ferramentas (tool calling).
+   * @returns A mensagem completa de resposta (ChatMessage), podendo conter
+   *          tool_calls se o modelo decidir chamar uma ferramenta.
    */
-  abstract gerarResposta(mensagens: ChatMessage[]): Promise<string>;
+  abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
 }
