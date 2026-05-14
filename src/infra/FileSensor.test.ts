@@ -133,4 +133,22 @@ describe('FileSensor', () => {
       );
     });
   });
+
+  describe('Cancelamento via AbortSignal', () => {
+    it('deve propagar exceção e registrar aviso quando o sinal é abortado', async () => {
+      const logger = new MockLogger();
+      const abortError = new Error('ABORT_ERR: the operation was aborted');
+      (abortError as Error & { code: string }).code = 'ABORT_ERR';
+      const mockReadFile = async () => { throw abortError; };
+
+      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+
+      await assert.rejects(() => sensor.ler('/aborted.txt'));
+
+      assert.ok(
+        logger.logs.some((msg) => msg.includes('WARN') && msg.includes('aborted')),
+        'Deve registrar aviso de operação abortada'
+      );
+    });
+  });
 });

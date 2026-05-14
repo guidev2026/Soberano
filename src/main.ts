@@ -1,6 +1,6 @@
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Fase 1 (CLI MVP).
+ * @description Ponto de entrada do sistema SOBERANO - Fase 2 (Sensores).
  *              Realiza o wiring manual (Injeção de Dependência) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
@@ -83,7 +83,7 @@ async function bootstrap(): Promise<void> {
 
   logger.info(
     '╔══════════════════════════════════════════════════╗\n' +
-    '║       SOBERANO - Fase 1 (CLI MVP)               ║\n' +
+    '║       SOBERANO - Fase 2 (Sensores)               ║\n' +
     '║       Inicializando sistemas...                  ║\n' +
     '╚══════════════════════════════════════════════════╝'
   );
@@ -130,26 +130,34 @@ async function bootstrap(): Promise<void> {
     logger.info('[main] Test completed successfully.');
 
     // --- TESTE DO FILE SENSOR (Fase 2) ---
-    logger.info(
-      '╔══════════════════════════════════════════════════╗\n' +
-      '║       FILE SENSOR - Leitura do .clinerules       ║\n' +
-      '╚══════════════════════════════════════════════════╝'
-    );
+    // Aceita caminho de arquivo via argumento de linha de comando.
+    // Uso: npm start -- <caminho>
+    const filePath = process.argv[2];
 
-    const fileSensor: ISensor<string> = new FileSensor({ logger });
+    if (filePath) {
+      logger.info(
+        '╔══════════════════════════════════════════════════╗\n' +
+        '║       FILE SENSOR - Demonstração                 ║\n' +
+        '╚══════════════════════════════════════════════════╝'
+      );
 
-    try {
-      const conteudo = await fileSensor.ler('.clinerules');
-      logger.info('[main] Conteúdo do arquivo .clinerules:');
-      logger.info(conteudo);
-      logger.info('[main] FileSensor test completed successfully.');
-    } catch (sensorError) {
-      logger.error('[main] FileSensor: Erro ao ler o arquivo .clinerules.');
-      if (sensorError instanceof Error) {
-        logger.error(sensorError.message);
-      } else {
-        logger.error(`[main] Unknown error: ${String(sensorError)}`);
+      const fileSensor: ISensor<string> = new FileSensor({ logger });
+
+      try {
+        const conteudo = await fileSensor.ler(filePath, combinedSignal);
+        logger.info(`[main] Conteúdo do arquivo "${filePath}":`);
+        logger.info(conteudo);
+        logger.info('[main] FileSensor test completed successfully.');
+      } catch (sensorError) {
+        logger.error(`[main] FileSensor: Erro ao ler o arquivo "${filePath}".`);
+        if (sensorError instanceof Error) {
+          logger.error(sensorError.message);
+        } else {
+          logger.error(`[main] Unknown error: ${String(sensorError)}`);
+        }
       }
+    } else {
+      logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo>');
     }
   } catch (error) {
     // Se o erro foi causado pelo shutdown, não é uma falha real

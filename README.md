@@ -86,7 +86,7 @@ npm run typecheck
 | Fase | Descrição | Status |
 |------|-----------|--------|
 | **1** | CLI MVP — comunicação básica com Ollama + Circuit Breaker | ✅ **Concluída** |
-| **2** | Sensores — FileSensor (leitura de arquivos locais) | ✅ **Em andamento** |
+| **2** | Sensores — FileSensor (leitura de arquivos locais) | ✅ **Concluída** |
 | **3** | Servidor HTTP (Express-like nativo) + API REST | ⏳ Planejada |
 | **4** | Gerenciamento de contexto e sessões multi-turno | ⏳ Planejada |
 | **5** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
@@ -133,7 +133,7 @@ abstract class ICircuitBreaker {
 
 ```typescript
 abstract class ISensor<T> {
-  abstract ler(target: string): Promise<T>;
+  abstract ler(target: string, signal?: AbortSignal): Promise<T>;
 }
 ```
 

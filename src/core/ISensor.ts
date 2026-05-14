@@ -12,7 +12,8 @@ export abstract class ISensor<T> {
   /**
    * Lê dados de uma origem identificada por `target`.
    * @param target - Identificador da origem (ex: caminho de arquivo, URL, etc.)
+   * @param signal - Opcional. AbortSignal para cancelamento da operação.
    * @returns Promise com o dado lido, tipado como T
    */
-  abstract ler(target: string): Promise<T>;
+  abstract ler(target: string, signal?: AbortSignal): Promise<T>;
 }

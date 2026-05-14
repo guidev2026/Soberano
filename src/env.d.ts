@@ -7,6 +7,7 @@
 
 // Process global
 declare var process: {
+  argv: string[];
   exit(code?: number): never;
   on(event: string, listener: (...args: unknown[]) => void): void;
   removeAllListeners(event?: string): void;
@@ -61,8 +62,8 @@ declare module 'node:test' {
 
 // node:fs/promises
 declare module 'node:fs/promises' {
-  export function readFile(path: string, options?: { encoding?: string }): Promise<string>;
-  export function readFile(path: string, options: { encoding: null }): Promise<Buffer>;
+  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string>;
+  export function readFile(path: string, options: { encoding: null; signal?: AbortSignal }): Promise<Buffer>;
 }
 
 // node:assert

@@ -1,6 +1,6 @@
 {
   "name": "soberano",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
   "type": "module",
   "scripts": {

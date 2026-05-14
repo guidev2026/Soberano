@@ -22,12 +22,12 @@ export interface FileSensorOptions {
    * Padrão: readFile nativo de node:fs/promises.
    * Útil para testes com mock.
    */
-  readFile?: (path: string, options?: { encoding?: string }) => Promise<string>;
+  readFile?: (path: string, options?: { encoding?: string; signal?: AbortSignal }) => Promise<string>;
 }
 
 export class FileSensor extends ISensor<string> {
   private readonly logger: ILogger;
-  private readonly readFile: (path: string, options?: { encoding?: string }) => Promise<string>;
+  private readonly readFile: (path: string, options?: { encoding?: string; signal?: AbortSignal }) => Promise<string>;
 
   /**
    * @param options - Objeto de configuração seguindo o padrão Options Object.
@@ -42,14 +42,15 @@ export class FileSensor extends ISensor<string> {
    * Lê o conteúdo de um arquivo local como string UTF-8.
    *
    * @param target - Caminho absoluto ou relativo do arquivo a ser lido
+   * @param signal - Opcional. AbortSignal para cancelamento da leitura em andamento
    * @returns Conteúdo do arquivo em formato string
    * @throws {Error} Se o arquivo não existir, não puder ser lido, ou outro erro de I/O
    */
-  async ler(target: string): Promise<string> {
+  async ler(target: string, signal?: AbortSignal): Promise<string> {
     this.logger.debug(`[FileSensor] Attempting to read file: "${target}"`);
 
     try {
-      const content = await this.readFile(target, { encoding: 'utf-8' });
+      const content = await this.readFile(target, { encoding: 'utf-8', signal });
       this.logger.debug(`[FileSensor] Successfully read file: "${target}" (${content.length} bytes)`);
       return content;
     } catch (error) {
@@ -65,6 +66,9 @@ export class FileSensor extends ISensor<string> {
             break;
           case 'EISDIR':
             this.logger.error(`[FileSensor] Path is a directory, not a file: "${target}"`);
+            break;
+          case 'ABORT_ERR':
+            this.logger.warn(`[FileSensor] Read operation aborted for file: "${target}"`);
             break;
           default:
             this.logger.error(`[FileSensor] Error reading file "${target}": ${err.message}`);
