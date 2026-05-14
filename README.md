@@ -1,6 +1,6 @@
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.1.0 — Fase 1 (CLI MVP)
+**Versão:** 0.2.0 — Fase 2 (Sensores: FileSensor)
 
 ## Stack
 
@@ -18,13 +18,16 @@ src/
 ├── core/              # Contratos e lógica de negócio pura ("A Alma")
 │   ├── ILogger.ts         # Abstração de logging + LogLevel enum
 │   ├── IMotorCognitivo.ts # Abstração do motor cognitivo (LLM)
-│   └── ICircuitBreaker.ts # Abstração do Circuit Breaker
+│   ├── ICircuitBreaker.ts # Abstração do Circuit Breaker
+│   └── ISensor.ts         # Abstração genérica de sensor (T)
 ├── infra/             # Implementações técnicas ("Os Músculos")
 │   ├── ConsoleLogger.ts       # Logger concreto (stdout)
 │   ├── OllamaProvider.ts      # Provider Ollama via fetch nativo
 │   ├── OllamaProvider.test.ts # Testes unitários do provider
 │   ├── CircuitBreaker.ts      # Circuit Breaker (3 estados)
-│   └── CircuitBreaker.test.ts # Testes unitários do CB
+│   ├── CircuitBreaker.test.ts # Testes unitários do CB
+│   ├── FileSensor.ts          # Sensor de arquivo (ISensor<string>)
+│   └── FileSensor.test.ts     # Testes unitários do FileSensor
 └── main.ts            # Orquestração, wiring manual, ponto de entrada
 ```
 
@@ -32,7 +35,7 @@ src/
 
 - **Abstração Primeiro:** Interfaces/classes abstratas em `src/core` antes de qualquer implementação
 - **Inversão de Dependência:** Módulos de alto nível (`main.ts`) dependem de abstrações, não de implementações
-- **Injeção via Construtor:** Dependências são injetadas no construtor (não Service Locator)
+- **Injeção via Construtor/Options Object:** Dependências são injetadas no construtor (não Service Locator)
 - **Options Object:** Classes com múltiplas configurações usam objeto de configuração tipado
 - **Desacoplamento:** Detalhes técnicos nunca vazam para `src/core`
 
@@ -49,6 +52,8 @@ src/
 | Graceful shutdown (SIGINT/SIGTERM) | ✅ |
 | Validação de schema em runtime da resposta da API | ✅ |
 | Testes unitários com `node:test` e `mock.method` | ✅ |
+| Sensor de arquivo (FileSensor) com `node:fs/promises` | ✅ |
+| Contrato genérico ISensor\<T\> (preparação para novos sensores) | ✅ |
 
 ## Como Executar
 
@@ -70,6 +75,7 @@ npm test
 # Rodar testes específicos
 npm run test:ollama
 npm run test:circuit
+npm run test:file
 
 # Typecheck sem executar
 npm run typecheck
@@ -80,10 +86,11 @@ npm run typecheck
 | Fase | Descrição | Status |
 |------|-----------|--------|
 | **1** | CLI MVP — comunicação básica com Ollama + Circuit Breaker | ✅ **Concluída** |
-| **2** | Servidor HTTP (Express-like nativo) + API REST | ⏳ Planejada |
-| **3** | Gerenciamento de contexto e sessões multi-turno | ⏳ Planejada |
-| **4** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
-| **5** | Web UI (React) + WebSocket | ⏳ Planejada |
+| **2** | Sensores — FileSensor (leitura de arquivos locais) | ✅ **Em andamento** |
+| **3** | Servidor HTTP (Express-like nativo) + API REST | ⏳ Planejada |
+| **4** | Gerenciamento de contexto e sessões multi-turno | ⏳ Planejada |
+| **5** | Sistema de agentes e ferramentas (tool use) | ⏳ Planejada |
+| **6** | Web UI (React) + WebSocket | ⏳ Planejada |
 
 ## Contratos do Core
 
@@ -119,6 +126,14 @@ abstract class ICircuitBreaker {
   abstract execute<T>(fn: () => Promise<T>): Promise<T>;
   abstract recordFailure(): void;
   abstract reset(): void;
+}
+```
+
+### `ISensor<T>`
+
+```typescript
+abstract class ISensor<T> {
+  abstract ler(target: string): Promise<T>;
 }
 ```
 

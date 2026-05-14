@@ -15,6 +15,8 @@ import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
 import { ConsoleLogger } from './infra/ConsoleLogger.ts';
 import { ILogger } from './core/ILogger.ts';
 import { CircuitBreaker } from './infra/CircuitBreaker.ts';
+import { FileSensor } from './infra/FileSensor.ts';
+import { ISensor } from './core/ISensor.ts';
 
 /**
  * Sinalizador de encerramento usado pelas rotinas de graceful shutdown.
@@ -126,6 +128,29 @@ async function bootstrap(): Promise<void> {
     );
     logger.info(resposta);
     logger.info('[main] Test completed successfully.');
+
+    // --- TESTE DO FILE SENSOR (Fase 2) ---
+    logger.info(
+      '╔══════════════════════════════════════════════════╗\n' +
+      '║       FILE SENSOR - Leitura do .clinerules       ║\n' +
+      '╚══════════════════════════════════════════════════╝'
+    );
+
+    const fileSensor: ISensor<string> = new FileSensor({ logger });
+
+    try {
+      const conteudo = await fileSensor.ler('.clinerules');
+      logger.info('[main] Conteúdo do arquivo .clinerules:');
+      logger.info(conteudo);
+      logger.info('[main] FileSensor test completed successfully.');
+    } catch (sensorError) {
+      logger.error('[main] FileSensor: Erro ao ler o arquivo .clinerules.');
+      if (sensorError instanceof Error) {
+        logger.error(sensorError.message);
+      } else {
+        logger.error(`[main] Unknown error: ${String(sensorError)}`);
+      }
+    }
   } catch (error) {
     // Se o erro foi causado pelo shutdown, não é uma falha real
     if (shutdownController.signal.aborted) {

@@ -59,6 +59,12 @@ declare module 'node:test' {
   export function afterEach(fn: () => void | Promise<void>): void;
 }
 
+// node:fs/promises
+declare module 'node:fs/promises' {
+  export function readFile(path: string, options?: { encoding?: string }): Promise<string>;
+  export function readFile(path: string, options: { encoding: null }): Promise<Buffer>;
+}
+
 // node:assert
 declare module 'node:assert' {
   interface Assert {
