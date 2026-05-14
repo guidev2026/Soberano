@@ -4,6 +4,8 @@
  *              Realiza o wiring manual (Injeção de Dependência) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
+ *              - Cria AbortController global para graceful shutdown
+ *              - Injeta AbortSignal no OllamaProvider para cancelar fetch em andamento
  *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
  *              - Executa o teste inicial de comunicação com o motor cognitivo
  */
@@ -25,11 +27,17 @@ let isShuttingDown = false;
  * SIGINT  -> Ctrl+C no terminal
  * SIGTERM -> kill padrão do sistema
  *
- * O encerramento é feito de forma limpa: mensagem de log,
- * sinalizador ligado e processo finalizado com código 0.
+ * O encerramento é feito de forma limpa: aborta operações em andamento,
+ * mensagem de log, sinalizador ligado e processo finalizado com código 0.
+ *
+ * @param logger            - Instância de ILogger para logging
+ * @param shutdownController - AbortController global para cancelar operações
  */
-function registerShutdownHandlers(logger: ILogger): void {
-  const shutdown = (signal: string) => {
+function registerShutdownHandlers(
+  logger: ILogger,
+  shutdownController: AbortController
+): void {
+  const shutdown = async (signal: string) => {
     if (isShuttingDown) {
       logger.warn(`[main] Sinal ${signal} recebido novamente. Forçando saída.`);
       process.exit(1);
@@ -48,8 +56,14 @@ function registerShutdownHandlers(logger: ILogger): void {
     process.removeAllListeners('SIGINT');
     process.removeAllListeners('SIGTERM');
 
-    // Operações de limpeza podem ser adicionadas aqui no futuro
-    // (ex: fechar conexões HTTP, liberar recursos, etc.)
+    // Aborta todas as operações em andamento (fetch do OllamaProvider)
+    shutdownController.abort();
+
+    // Pequena pausa para permitir que as operações abortadas propaguem
+    await new Promise<void>((resolve) => {
+      // Aguarda um ciclo de event loop para os handlers de abort processarem
+      setTimeout(() => resolve(), 0);
+    });
 
     clearTimeout(forceExitTimer);
     logger.info('[main] Recursos liberados. Até logo, SOBERANO.');
@@ -73,14 +87,20 @@ async function bootstrap(): Promise<void> {
     '╚══════════════════════════════════════════════════╝'
   );
 
+  // --- ABORT CONTROLLER GLOBAL PARA GRACEFUL SHUTDOWN ---
+  const shutdownController = new AbortController();
+
   // --- GRACEFUL SHUTDOWN ---
-  registerShutdownHandlers(logger);
+  registerShutdownHandlers(logger, shutdownController);
 
   // --- WIRING MANUAL (Injeção de Dependência) ---
   // A variável "motor" é tipada como IMotorCognitivo (abstração).
   // O módulo de alto nível (main.ts) depende da abstração, não da implementação concreta.
   // O Logger é injetado via construtor em ambas as dependências.
-  const motor: IMotorCognitivo = new OllamaProvider(logger);
+  const motor = new OllamaProvider(logger);
+
+  // Injeta o sinal de abort para graceful shutdown
+  motor.setAbortSignal(shutdownController.signal);
 
   const promptTeste = 'Olá, Soberano. Confirme que seus sistemas base estão online.';
 
@@ -98,6 +118,12 @@ async function bootstrap(): Promise<void> {
     logger.info(resposta);
     logger.info('[main] Teste concluído com sucesso.');
   } catch (error) {
+    // Se o erro foi causado pelo shutdown, não é uma falha real
+    if (shutdownController.signal.aborted) {
+      logger.info('[main] Operação cancelada devido ao encerramento do sistema.');
+      return;
+    }
+
     logger.error(
       '╔══════════════════════════════════════════════════╗\n' +
       '║       ERRO NA COMUNICAÇÃO COM O MOTOR           ║\n' +

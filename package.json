@@ -1,0 +1,15 @@
+{
+  "name": "soberano",
+  "version": "0.1.0",
+  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-transform-types src/main.ts",
+    "test": "node --experimental-transform-types --test src/infra/*.test.ts",
+    "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
+    "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
+    "build": "tsc"
+  },
+  "keywords": ["soberano", "llm", "ollama"],
+  "license": "MIT"
+}

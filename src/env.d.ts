@@ -12,6 +12,26 @@ declare var process: {
   removeAllListeners(event?: string): void;
 };
 
+// AbortController e AbortSignal (API nativa global)
+declare class AbortController {
+  readonly signal: AbortSignal;
+  abort(): void;
+}
+
+declare class AbortSignal {
+  readonly aborted: boolean;
+  addEventListener(type: 'abort', listener: () => void): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
+}
+
+// setTimeout e clearTimeout
+declare function setTimeout(
+  callback: (...args: unknown[]) => void,
+  ms?: number,
+  ...args: unknown[]
+): ReturnType<typeof setTimeout>;
+declare function clearTimeout(timeoutId: ReturnType<typeof setTimeout> | undefined): void;
+
 // node:test
 declare module 'node:test' {
   interface TestContext {
