@@ -60,10 +60,9 @@ function registerShutdownHandlers(
     // Aborta todas as operações em andamento (fetch do OllamaProvider)
     shutdownController.abort();
 
-    // Pequena pausa para permitir que as operações abortadas propaguem
-    await new Promise<void>((resolve) => {
-      setTimeout(() => resolve(), 100);
-    });
+    // O timer de 5s permanece ativo durante toda a limpeza.
+    // Se operações assíncronas de cleanup forem adicionadas no futuro
+    // e travarem, o timer dispara e força process.exit(1).
 
     // Só cancela o timer se a limpeza terminou dentro do prazo de 5s
     clearTimeout(forceExitTimer);
