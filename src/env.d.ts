@@ -1,57 +1,10 @@
 /**
-* @file env.d.ts
- * @description Declarações de tipos mínimas para APIs nativas do Node.js.
- *              Necessário porque não podemos instalar @types/node (zero dependências externas).
- *              Apenas o essencial para eliminar erros de TypeScript no VS Code.
+ * @file env.d.ts
+ * @description Declarações de tipos mínimas suplementares para o SOBERANO.
+ *              Apenas o que o @types/node não cobre.
  */
 
-// Buffer global (necessário para node:fs/promises overloads)
-declare class Buffer {
-  length: number;
-  static from(data: string, encoding?: string): Buffer;
-  toString(encoding?: string): string;
-}
-
-// TextDecoder (necessário para streaming de respostas do Ollama)
-declare class TextDecoder {
-  constructor(label?: string);
-  decode(input?: BufferSource, options?: { stream: boolean }): string;
-}
-
-// Process global
-declare var process: {
-  argv: string[];
-  exit(code?: number): never;
-  on(event: string, listener: (...args: unknown[]) => void): void;
-  removeAllListeners(event?: string): void;
-};
-
-// AbortController e AbortSignal (API nativa global)
-declare class AbortController {
-  readonly signal: AbortSignal;
-  abort(): void;
-}
-
-declare class AbortSignal {
-  readonly aborted: boolean;
-  addEventListener(type: 'abort', listener: () => void): void;
-  removeEventListener(type: 'abort', listener: () => void): void;
-  static timeout(ms: number): AbortSignal;
-  static any(signals: AbortSignal[]): AbortSignal;
-}
-
-// queueMicrotask
-declare function queueMicrotask(callback: () => void): void;
-
-// setTimeout e clearTimeout
-declare function setTimeout(
-  callback: (...args: unknown[]) => void,
-  ms?: number,
-  ...args: unknown[]
-): ReturnType<typeof setTimeout>;
-declare function clearTimeout(timeoutId: ReturnType<typeof setTimeout> | undefined): void;
-
-// node:test
+// node:test (ainda não coberto pelo @types/node oficial)
 declare module 'node:test' {
   interface TestContext {
     diagnostic(message: string): void;
@@ -81,81 +34,4 @@ declare module 'node:test' {
   export function after(fn: () => void | Promise<void>): void;
   export function beforeEach(fn: () => void | Promise<void>): void;
   export function afterEach(fn: () => void | Promise<void>): void;
-}
-
-// node:http
-declare module 'node:http' {
-  interface IncomingMessage {
-    url?: string | undefined;
-    method?: string | undefined;
-    on(event: string, listener: (...args: unknown[]) => void): this;
-  }
-  interface ServerResponse {
-    writeHead(statusCode: number, headers?: Record<string, string>): void;
-    end(data?: string): void;
-  }
-  type RequestListener = (req: IncomingMessage, res: ServerResponse) => void;
-  interface Server {
-    listen(port: number, callback?: () => void): void;
-    close(callback?: (err?: Error) => void): void;
-    on(event: string, listener: (...args: unknown[]) => void): this;
-    address(): { port: number; family?: string; address?: string } | string | null;
-  }
-  export function createServer(requestListener: RequestListener): Server;
-}
-
-// node:fs/promises
-declare module 'node:fs/promises' {
-  export function readFile(path: string): Promise<Buffer>;
-  export function readFile(path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
-  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
-}
-
-// node:fs
-declare module 'node:fs' {
-  export function mkdtempSync(prefix: string): string;
-  export function writeFileSync(path: string, data: string, encoding?: string): void;
-  export function mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined;
-  export function rmdirSync(path: string, options?: { recursive?: boolean }): void;
-  export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
-  export function existsSync(path: string): boolean;
-}
-
-// node:os
-declare module 'node:os' {
-  export function tmpdir(): string;
-}
-
-// node:path
-declare module 'node:path' {
-  export function join(...paths: string[]): string;
-  export function resolve(...paths: string[]): string;
-  export function relative(from: string, to: string): string;
-}
-
-// node:crypto
-declare module 'node:crypto' {
-  export function randomUUID(): string;
-}
-
-// node:assert
-declare module 'node:assert' {
-  interface Assert {
-    ok(value: unknown, message?: string): void;
-    strictEqual<T>(actual: T, expected: T, message?: string): void;
-    deepStrictEqual<T>(actual: T, expected: T, message?: string): void;
-    throws(
-      block: () => unknown,
-      error?: RegExp | Function | Object | Error,
-      message?: string
-    ): void;
-    rejects(
-      block: (() => Promise<unknown>) | Promise<unknown>,
-      error?: RegExp | Function | Object | Error,
-      message?: string
-    ): Promise<void>;
-    fail(message?: string): never;
-  }
-  const assert: Assert;
-  export default assert;
 }

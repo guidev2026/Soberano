@@ -1,10 +1,14 @@
 {
   "name": "soberano",
-  "version": "0.6.6",
-  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
+  "version": "0.7.0",
+  "description": "SOBERANO - Microsserviço Local de IA Generativa (Tauri + Node.js HTTP/SSE)",
   "type": "module",
   "scripts": {
-    "start": "node --experimental-transform-types src/main.ts",
+    "start:server": "node --experimental-transform-types src/main.ts",
+    "start:server:dev": "node --watch --experimental-transform-types src/main.ts",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:init": "tauri init",
     "test": "node --experimental-transform-types --test src/infra/*.test.ts src/infra/tools/*.test.ts",
     "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
     "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
@@ -15,10 +19,14 @@
   "keywords": [
     "soberano",
     "llm",
-    "ollama"
+    "ollama",
+    "tauri"
   ],
   "license": "MIT",
   "devDependencies": {
+    "@tauri-apps/cli": "^1.6.0",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.22.0",
     "typescript": "^6.0.3"
   }
 }

@@ -9,6 +9,12 @@
 
 export abstract class IHttpServer {
   /**
+   * Retorna a porta real em que o servidor está escutando,
+   * ou null se o servidor não foi iniciado.
+   */
+  abstract get port(): number | null;
+
+  /**
    * Inicia o servidor HTTP na porta especificada.
    * @param port - Número da porta para escutar (ex: 3000)
    */

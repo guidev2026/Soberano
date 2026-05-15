@@ -59,6 +59,7 @@ src/
       CalculatorTool.ts
       ReadFileTool.test.ts
       ReadFileTool.ts
+      SystemTimeTool.test.ts
       SystemTimeTool.ts
     CircuitBreaker.test.ts
     CircuitBreaker.ts
@@ -70,14 +71,25 @@ src/
     FileSensor.ts
     InMemorySessionManager.test.ts
     InMemorySessionManager.ts
+    MockVectorStore.test.ts
     MockVectorStore.ts
     NativeHttpServer.test.ts
     NativeHttpServer.ts
     OllamaProvider.test.ts
     OllamaProvider.ts
+    ToolRegistry.test.ts
     ToolRegistry.ts
     validateOllamaResponse.test.ts
+  main/
+    main.ts
+  preload/
+    preload.ts
+  renderer/
+    app.js
+    index.html
+    style.css
   env.d.ts
+  main-cli.ts
   main.ts
 .clinerules
 .gitignore
@@ -89,356 +101,1042 @@ tsconfig.json
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/infra/ConversationManager.test.ts">
+<file path="src/main/main.ts">
 /**
- * @file ConversationManager.test.ts
- * @description Testes unitários para o ConversationManager com foco no ReAct/Tool Calling Loop.
- *              Utiliza node:test com classes mock concretas para garantir isolamento e determinismo.
- *              Zero dependências externas.
+ * @file main/main.ts
+ * @description Processo principal do Electron para o SOBERANO Desktop.
  *
- * Cobertura:
- * - Fluxo sem tool calling (resposta direta)
- * - Fluxo com tool calling bem-sucedido (1 iteração)
- * - Tool calling com ferramenta não encontrada
- * - Tool calling que atinge maxToolIterations (fallback)
- * - Tool calling com ToolRegistry ausente
- * - Cancelamento via AbortSignal
+ *              Responsabilidades:
+ *              1. Criar a janela do BrowserWindow com contextIsolation ativado
+ *                 e o preload script configurado.
+ *              2. Inicializar o ConversationManager (infra) e toda a cadeia
+ *                 de dependências (OllamaProvider, Logger, etc.) via Options Objects.
+ *              3. Registrar os handlers do ipcMain para:
+ *                 - 'soberano:mensagem' (invoke): recebe input, chama
+ *                   ConversationManager.conversar(), envia resultado via IPC.
+ *                 - 'soberano:cancelar' (on): aborta o AbortController ativo.
+ *              4. Graceful shutdown ao fechar a janela.
+ *
+ *              Dependências injetadas manualmente (DIP com Options Objects):
+ *              - ConsoleLogger (ILogger)
+ *              - OllamaProvider (IMotorCognitivo)
+ *              - CircuitBreaker (ICircuitBreaker)
+ *              - InMemorySessionManager (ISessionManager)
+ *              - ToolRegistry (IToolRegistry)
+ *              - ConversationManager
+ *
+ *              Nota: O streaming token-por-token será implementado na Sprint 7.1
+ *              quando adicionarmos gerarRespostaStream ao ConversationManager.
+ *              Por enquanto, usamos conversar() e enviamos a resposta completa.
+ *
+ *              Paths: Compilado pelo tsc para dist/. Os imports via .js
+ *              referem-se aos arquivos compilados em dist/.
  */
 
-import { describe, it, mock } from 'node:test';
-import assert from 'node:assert';
+import { app, BrowserWindow, ipcMain } from 'electron';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { ConversationManager } from './ConversationManager.ts';
-import { IMotorCognitivo, type ChatMessage, type IToolDefinition } from '../core/IMotorCognitivo.ts';
-import { ISessionManager } from '../core/ISessionManager.ts';
-import { ILogger } from '../core/ILogger.ts';
-import { IToolRegistry } from '../core/IToolRegistry.ts';
-import { ITool } from '../core/ITool.ts';
+// === Infra imports ===
+import { ConsoleLogger } from '../infra/ConsoleLogger.js';
+import { OllamaProvider } from '../infra/OllamaProvider.js';
+import { CircuitBreaker } from '../infra/CircuitBreaker.js';
+import { InMemorySessionManager } from '../infra/InMemorySessionManager.js';
+import { ToolRegistry } from '../infra/ToolRegistry.js';
+import { ConversationManager } from '../infra/ConversationManager.js';
 
-// ---------- Mocks concretos (classes que estendem as abstratas) ----------
+// === Core imports (apenas contratos para referência, apenas types) ===
+import type { ILogger } from '../core/ILogger.js';
+import type { IMotorCognitivo } from '../core/IMotorCognitivo.js';
+import type { ICircuitBreaker } from '../core/ICircuitBreaker.js';
+import type { ISessionManager } from '../core/ISessionManager.js';
+import type { IToolRegistry } from '../core/IToolRegistry.js';
 
-class MockLogger extends ILogger {
-  info = mock.fn();
-  warn = mock.fn();
-  error = mock.fn();
-  debug = mock.fn();
-}
+// __dirname equivalent for ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-class MockSessionManager extends ISessionManager {
-  private historico: ChatMessage[] = [];
+// ============================================================
+// 1. Bootstrap de Dependências (Wiring Manual via Options Objects)
+// ============================================================
 
-  adicionarMensagem = mock.fn(async (_sessionId: string, mensagem: ChatMessage): Promise<void> => {
-    this.historico.push(mensagem);
-  });
+const logger: ILogger = new ConsoleLogger();
 
-  obterHistorico = mock.fn(async (_sessionId: string): Promise<ReadonlyArray<ChatMessage>> => {
-    return [...this.historico];
-  });
+const circuitBreaker: ICircuitBreaker = new CircuitBreaker({
+  logger,
+  failureThreshold: 5,
+  openTimeoutMs: 30_000,
+});
 
-  limparSessao = mock.fn(async (_sessionId: string): Promise<void> => {
-    this.historico = [];
-  });
-}
+const sessionManager: ISessionManager = new InMemorySessionManager({
+  logger,
+  maxMessagesPerSession: 50,
+});
 
-class MockMotor extends IMotorCognitivo {
-  private callIndex = 0;
+const toolRegistry: IToolRegistry = new ToolRegistry({
+  logger,
+});
 
-  constructor(private readonly respostas: ChatMessage[]) {
-    super();
-  }
+const motorCognitivo: IMotorCognitivo = new OllamaProvider({
+  logger,
+  baseUrl: 'http://localhost:11434',
+  model: 'llama3.2:latest',
+  maxRetries: 3,
+  delayBase: 1000,
+  timeoutMs: 120_000,
+  circuitBreaker,
+});
 
-  setAbortSignal = mock.fn();
+// AbortController ativo para cancelamento
+let currentAbortController: AbortController | null = null;
 
-  gerarResposta = mock.fn(async (_mensagens: ChatMessage[], _tools?: IToolDefinition[]): Promise<ChatMessage> => {
-    const r = this.respostas[this.callIndex];
-    if (!r) throw new Error('[MockMotor] No more responses configured');
-    this.callIndex++;
-    return r;
-  });
+// Instância global do ConversationManager
+const conversationManager = new ConversationManager({
+  logger,
+  motor: motorCognitivo,
+  sessionManager,
+  toolRegistry,
+  systemName: 'SOBERANO',
+  maxToolIterations: 3,
+});
 
-  gerarRespostaStream = mock.fn(async function* (..._args: any[]): AsyncIterable<string> {
-    yield '';
-  });
-}
+// ============================================================
+// 2. IPC Handlers
+// ============================================================
 
-class MockToolRegistry extends IToolRegistry {
-  private readonly map: Map<string, ITool>;
+/**
+ * Handler principal de mensagem (invoke → await retorna void).
+ * A resposta completa é enviada via webContents.send (fire-and-forget).
+ */
+ipcMain.handle('soberano:mensagem', async (event, input: string) => {
+  const sessionId = 'electron-session';
+  currentAbortController = new AbortController();
+  const signal = currentAbortController.signal;
 
-  constructor(tools: ITool[]) {
-    super();
-    this.map = new Map(tools.map(t => [t.name, t]));
-  }
+  try {
+    // Chama o orchestrator completo (RAG, sessão, tool calling)
+    const resposta = await conversationManager.conversar(sessionId, input, signal);
 
-  registrar = mock.fn();
-  obter = mock.fn((nome: string): ITool | undefined => this.map.get(nome));
-  obterTodas = mock.fn((): ITool[] => [...this.map.values()]);
-}
+    // Envia a resposta completa como um único chunk
+    event.sender.send('soberano:stream-chunk', resposta);
 
-/** Cria uma tool fake concreta que estende ITool */
-function criaToolFake(nome: string, resultado: any): ITool & { executeMock: ReturnType<typeof mock.fn> } {
-  const executeMock = mock.fn(async (_args: Record<string, any>) => resultado);
-  const tool = new (class extends ITool {
-    get name() { return nome; }
-    get description() { return `Ferramenta fake ${nome}`; }
-    get parametersSchema() { return { type: 'object' as const, properties: {} }; }
-    execute = executeMock;
-  })();
-  return Object.assign(tool, { executeMock });
-}
-
-// ---------- Testes ----------
-
-describe('ConversationManager - ReAct Loop', () => {
-  describe('fluxo sem tool calling', () => {
-    it('deve retornar resposta direta do assistant quando não há tool_calls', async () => {
-      const logger = new MockLogger();
-      const sessionManager = new MockSessionManager();
-      const motor = new MockMotor([
-        { role: 'assistant', content: 'Resposta final.' },
-      ]);
-
-      const cm = new ConversationManager({ logger, motor, sessionManager });
-      const resposta = await cm.conversar('sessao-1', 'Olá');
-
-      assert.strictEqual(resposta, 'Resposta final.');
-      assert.strictEqual(sessionManager.adicionarMensagem.mock.callCount(), 2); // user + assistant
-      assert.strictEqual(motor.gerarResposta.mock.callCount(), 1);
-    });
-  });
-
-  describe('fluxo com tool calling bem-sucedido', () => {
-    it('deve executar tool, salvar resultado e retornar resposta final', async () => {
-      const logger = new MockLogger();
-      const sessionManager = new MockSessionManager();
-      const toolCalc = criaToolFake('calculadora', { resultado: 42 });
-      const toolRegistry = new MockToolRegistry([toolCalc]);
-
-      const motor = new MockMotor([
-        {
-          role: 'assistant',
-          content: '',
-          tool_calls: [{ id: 'call_abc123', function: { name: 'calculadora', arguments: { a: 1, b: 2 } } }],
-        },
-        { role: 'assistant', content: 'Resultado é 42.' },
-      ]);
-
-      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
-      const resposta = await cm.conversar('sessao-2', 'Quanto é 1+2?');
-
-      assert.strictEqual(resposta, 'Resultado é 42.');
-      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2); // 1ª com tools, 2ª sem
-      assert.strictEqual(toolCalc.executeMock.mock.callCount(), 1);
-
-      // Verifica que o tool_call_id real foi usado na mensagem tool
-      const historico = await sessionManager.obterHistorico('sessao-2');
-      const toolMessages = historico.filter(m => m.role === 'tool');
-      assert.ok(toolMessages.some(m => m.tool_call_id === 'call_abc123'));
-    });
-  });
-
-  describe('tool calling com ferramenta não encontrada', () => {
-    it('deve retornar erro simulado quando ferramenta não existe no registry', async () => {
-      const logger = new MockLogger();
-      const sessionManager = new MockSessionManager();
-      const toolRegistry = new MockToolRegistry([]);
-
-      const motor = new MockMotor([
-        {
-          role: 'assistant',
-          content: '',
-          tool_calls: [{ id: 'call_xyz', function: { name: 'toolInexistente', arguments: {} } }],
-        },
-        { role: 'assistant', content: 'Ferramenta não encontrada.' },
-      ]);
-
-      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
-      const resposta = await cm.conversar('sessao-3', 'Execute toolInexistente');
-
-      assert.strictEqual(resposta, 'Ferramenta não encontrada.');
-      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2);
-    });
-  });
-
-  describe('maxToolIterations atingido', () => {
-    it('deve retornar fallback seguro quando excede o limite de iterações', async () => {
-      const logger = new MockLogger();
-      const sessionManager = new MockSessionManager();
-      const toolCalc = criaToolFake('loopTool', { ok: true });
-      const toolRegistry = new MockToolRegistry([toolCalc]);
-
-      // Cada resposta pede tool novamente — simula loop infinito
-      const motor = new MockMotor([
-        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'loopTool', arguments: {} } }] },
-        { role: 'assistant', content: '', tool_calls: [{ id: 'call_2', function: { name: 'loopTool', arguments: {} } }] },
-        { role: 'assistant', content: '', tool_calls: [{ id: 'call_3', function: { name: 'loopTool', arguments: {} } }] },
-        // depth 3 >= maxToolIterations(3) — deve cair no fallback antes da 4ª chamada
-        { role: 'assistant', content: 'Nunca vou ser chamado.' },
-      ]);
-
-      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry, maxToolIterations: 3 });
-      const resposta = await cm.conversar('sessao-4', 'Loop infinito');
-
-      // Deve ter chamado o motor 3 vezes (depth 0, 1, 2) e parado no fallback
-      assert.strictEqual(motor.gerarResposta.mock.callCount(), 3);
-      // A resposta é do tipo string (fallback seguro)
-      assert.strictEqual(typeof resposta, 'string');
-    });
-
-    it('deve retornar mensagem de corte quando fallback não encontra assistant com conteúdo', async () => {
-      const logger = new MockLogger();
-      const sessionManager = new MockSessionManager();
-      const toolCalc = criaToolFake('loopTool', { ok: true });
-      const toolRegistry = new MockToolRegistry([toolCalc]);
-
-      // Apenas 1 resposta com tool_call (content vazio)
-      const motor = new MockMotor([
-        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'loopTool', arguments: {} } }] },
-      ]);
-
-      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry, maxToolIterations: 1 });
-      const resposta = await cm.conversar('sessao-5', 'Loop');
-
-      // maxToolIterations=1, depth 0 < 1, depth 1 >= 1 — 1 chamada, fallback
-      assert.strictEqual(motor.gerarResposta.mock.callCount(), 1);
-      assert.strictEqual(
-        resposta,
-        '[SOBERANO] Limite de iterações de ferramentas atingido. A execução foi interrompida para garantir estabilidade.'
+    // Sinaliza fim do stream
+    event.sender.send('soberano:stream-end', 'complete');
+  } catch (error: unknown) {
+    const err = error as Error;
+    if (err.name === 'AbortError') {
+      event.sender.send(
+        'soberano:stream-end',
+        'cancelled',
+        'Geração cancelada pelo usuário.',
       );
-    });
+    } else {
+      logger.error(`Erro na conversa: ${err.message ?? err}`);
+      event.sender.send(
+        'soberano:stream-end',
+        'error',
+        err.message ?? 'Erro interno.',
+      );
+    }
+  } finally {
+    currentAbortController = null;
+  }
+});
+
+/**
+ * Handler de cancelamento (mensagem simples, sem resposta).
+ */
+ipcMain.on('soberano:cancelar', () => {
+  if (currentAbortController) {
+    currentAbortController.abort();
+    currentAbortController = null;
+  }
+});
+
+// ============================================================
+// 3. Criação da Janela (BrowserWindow)
+// ============================================================
+
+function createWindow(): BrowserWindow {
+  const mainWindow = new BrowserWindow({
+    width: 900,
+    height: 700,
+    title: 'SOBERANO Desktop',
+    webPreferences: {
+      // preload.js compilado pelo tsc
+      preload: join(__dirname, '..', 'preload', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
   });
 
-  describe('ToolRegistry ausente', () => {
-    it('deve funcionar quando tool_calls são recebidas sem ToolRegistry', async () => {
-      const logger = new MockLogger();
-      const sessionManager = new MockSessionManager();
+  // Carrega o HTML direto da pasta src/renderer/
+  mainWindow.loadFile(join(__dirname, '..', 'renderer', 'index.html'));
 
-      const motor = new MockMotor([
-        {
-          role: 'assistant',
-          content: '',
-          tool_calls: [{ id: 'call_noop', function: { name: 'semRegistry', arguments: {} } }],
-        },
-        { role: 'assistant', content: 'ToolRegistry não configurado, mas segui em frente.' },
-      ]);
+  return mainWindow;
+}
 
-      const cm = new ConversationManager({ logger, motor, sessionManager });
-      const resposta = await cm.conversar('sessao-6', 'Teste sem registry');
+// ============================================================
+// 4. App Lifecycle
+// ============================================================
 
-      assert.strictEqual(resposta, 'ToolRegistry não configurado, mas segui em frente.');
-      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2);
-    });
+app.whenReady().then(() => {
+  logger.info('SOBERANO Desktop iniciado.');
+
+  const mainWindow = createWindow();
+
+  // Graceful shutdown: limpar resources ao fechar a janela
+  mainWindow.on('closed', () => {
+    logger.info('Janela fechada. Encerrando...');
+    app.quit();
   });
+});
 
-  describe('cancelamento via AbortSignal', () => {
-    it('deve propagar o signal para o motor cognitivo', async () => {
-      const logger = new MockLogger();
-      const sessionManager = new MockSessionManager();
-      const motor = new MockMotor([
-        { role: 'assistant', content: 'Resposta antes do abort.' },
-      ]);
+app.on('window-all-closed', () => {
+  app.quit();
+});
 
-      const ac = new AbortController();
-      const cm = new ConversationManager({ logger, motor, sessionManager });
-      const resposta = await cm.conversar('sessao-7', 'Mensagem normal', ac.signal);
-
-      assert.strictEqual(resposta, 'Resposta antes do abort.');
-      assert.strictEqual(motor.setAbortSignal.mock.callCount(), 1);
-    });
-
-    it('deve propagar o signal na recursão do tool loop', async () => {
-      const logger = new MockLogger();
-      const sessionManager = new MockSessionManager();
-      const toolCalc = criaToolFake('calc', { resultado: 10 });
-      const toolRegistry = new MockToolRegistry([toolCalc]);
-
-      const motor = new MockMotor([
-        {
-          role: 'assistant',
-          content: '',
-          tool_calls: [{ id: 'call_1', function: { name: 'calc', arguments: {} } }],
-        },
-        { role: 'assistant', content: 'Recursão concluída.' },
-      ]);
-
-      const ac = new AbortController();
-      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
-      const resposta = await cm.conversar('sessao-8', 'Teste com signal', ac.signal);
-
-      assert.strictEqual(resposta, 'Recursão concluída.');
-      // setAbortSignal foi chamado em cada depth (2 vezes)
-      assert.strictEqual(motor.setAbortSignal.mock.callCount(), 2);
-    });
-  });
+app.on('before-quit', () => {
+  logger.info('before-quit: limpando resources...');
+  if (currentAbortController) {
+    currentAbortController.abort();
+    currentAbortController = null;
+  }
 });
 </file>
 
-<file path="src/core/ICircuitBreaker.ts">
+<file path="src/preload/preload.ts">
 /**
- * @file ICircuitBreaker.ts
- * @description Contrato de abstração para o padrão Circuit Breaker.
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas.
+ * @file preload.ts
+ * @description Context Bridge seguro do Electron para o SOBERANO.
+ *              Expõe uma API restrita (window.soberanoAPI) para o renderer,
+ *              utilizando contextBridge com contextIsolation: true.
  *
- *              Estados: CLOSED (normal), OPEN (falhando), HALF_OPEN (teste).
+ *              API exposta:
+ *              - enviarMensagem(input): Invoca o handler IPC para iniciar streaming
+ *              - onStream(callback): Registra listener para chunks de texto
+ *              - onStreamEnd(callback): Registra listener para fim do stream
+ *              - cancelar(): Envia sinal de aborto para o main process
+ *              - cleanup(): Remove todos os listeners IPC
  */
 
-export enum CircuitState {
-  CLOSED = 'CLOSED',
-  OPEN = 'OPEN',
-  HALF_OPEN = 'HALF_OPEN',
+import { contextBridge, ipcRenderer } from 'electron';
+
+/**
+ * Interface da API exposta para o mundo renderer.
+ * Declarada aqui e também no app.ts para type-safety.
+ */
+export interface SoberanoAPI {
+  enviarMensagem(input: string): Promise<void>;
+  onStream(callback: (chunk: string) => void): void;
+  onStreamEnd(callback: (reason: 'complete' | 'error' | 'cancelled', message?: string) => void): void;
+  cancelar(): void;
+  cleanup(): void;
 }
 
-export abstract class ICircuitBreaker {
-  /** Estado atual do circuit breaker */
-  abstract get state(): CircuitState;
+// Lista de funções de remoção de listeners para cleanup
+type ListenerEntry = {
+  channel: string;
+  handler: (...args: any[]) => void;
+};
+
+const registeredListeners: ListenerEntry[] = [];
+
+contextBridge.exposeInMainWorld('soberanoAPI', {
+  /**
+   * Envia uma mensagem do usuário para o main process e inicia o streaming.
+   * O main process responde com chunks via 'soberano:stream-chunk'
+   * e sinaliza fim via 'soberano:stream-end'.
+   */
+  enviarMensagem: async (input: string): Promise<void> => {
+    await ipcRenderer.invoke('soberano:mensagem', input);
+  },
 
   /**
-   * Executa uma operação respeitando o estado do circuit breaker.
-   * - CLOSED: executa normalmente, registra sucesso/falha
-   * - OPEN: lança erro imediatamente (a menos que o timeout tenha expirado para HALF_OPEN)
-   * - HALF_OPEN: permite 1 chamada de teste; sucesso volta para CLOSED, falha volta para OPEN
-   *
-   * @param fn - Função assíncrona a ser protegida
-   * @returns O resultado da função
-   * @throws {Error} Se o circuit breaker estiver OPEN e o timeout não tiver expirado
+   * Registra um callback para receber chunks de texto do stream.
    */
-  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
+  onStream: (callback: (chunk: string) => void): void => {
+    const handler = (_event: unknown, chunk: string) => {
+      callback(chunk);
+    };
+    ipcRenderer.on('soberano:stream-chunk', handler);
+    registeredListeners.push({ channel: 'soberano:stream-chunk', handler });
+  },
 
-  /** Registra uma falha manualmente (para uso externo) */
-  abstract recordFailure(): void;
+  /**
+   * Registra um callback para ser notificado quando o streaming terminar.
+   */
+  onStreamEnd: (callback: (reason: 'complete' | 'error' | 'cancelled', message?: string) => void): void => {
+    const handler = (_event: unknown, reason: string, message?: string) => {
+      callback(reason as 'complete' | 'error' | 'cancelled', message);
+    };
+    ipcRenderer.on('soberano:stream-end', handler);
+    registeredListeners.push({ channel: 'soberano:stream-end', handler });
+  },
 
-  /** Reseta o circuit breaker para o estado CLOSED */
-  abstract reset(): void;
+  /**
+   * Cancela a operação de streaming em andamento.
+   * Envia um sinal para o main process abortar o AbortController.
+   */
+  cancelar: (): void => {
+    ipcRenderer.send('soberano:cancelar');
+  },
+
+  /**
+   * Remove todos os listeners IPC registrados.
+   * Deve ser chamado quando a UI for destruída ou reinicializada.
+   */
+  cleanup: (): void => {
+    for (const entry of registeredListeners) {
+      ipcRenderer.removeListener(entry.channel, entry.handler);
+    }
+    registeredListeners.length = 0;
+    ipcRenderer.removeAllListeners('soberano:stream-chunk');
+    ipcRenderer.removeAllListeners('soberano:stream-end');
+  },
+} satisfies SoberanoAPI);
+</file>
+
+<file path="src/renderer/app.js">
+/**
+ * @file renderer/app.js
+ * @description UI logic for SOBERANO Desktop renderer process.
+ *              Communicates with the main process via window.soberanoAPI
+ *              (exposed by preload Context Bridge).
+ *
+ *              Zero external dependencies. Pure vanilla JS.
+ */
+
+/* global window, document */
+
+(function () {
+  'use strict';
+
+  // ============================================================
+  // DOM References
+  // ============================================================
+  const chatHistory = document.getElementById('chat-history');
+  const messageInput = document.getElementById('message-input');
+  const sendBtn = document.getElementById('send-btn');
+  const cancelBtn = document.getElementById('cancel-btn');
+  const statusBar = document.getElementById('status-bar');
+
+  // State
+  let isLoading = false;
+
+  // ============================================================
+  // Helper: Adicionar mensagem ao chat
+  // ============================================================
+  function addMessage(role, content) {
+    const div = document.createElement('div');
+    div.className = 'message ' + role;
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    contentDiv.textContent = content;
+
+    div.appendChild(contentDiv);
+    chatHistory.appendChild(div);
+
+    // Scroll para o final
+    chatHistory.scrollTop = chatHistory.scrollHeight;
+
+    return contentDiv;
+  }
+
+  function setStatus(text, className) {
+    statusBar.textContent = text;
+    statusBar.className = 'status-' + className;
+  }
+
+  function setLoadingState(loading) {
+    isLoading = loading;
+    sendBtn.disabled = loading;
+    messageInput.disabled = loading;
+
+    if (loading) {
+      cancelBtn.classList.remove('hidden');
+      setStatus('Gerando...', 'loading');
+    } else {
+      cancelBtn.classList.add('hidden');
+      setStatus('Pronto', 'idle');
+    }
+  }
+
+  // ============================================================
+  // Enviar mensagem
+  // ============================================================
+  async function sendMessage() {
+    const text = messageInput.value.trim();
+    if (!text || isLoading) return;
+
+    // Limpa o input
+    messageInput.value = '';
+
+    // Mostra mensagem do usuário
+    addMessage('user', text);
+
+    // Adiciona indicador de loading
+    const loadingDiv = addMessage('loading', 'Aguardando resposta...');
+
+    setLoadingState(true);
+
+    try {
+      // Aguarda resposta completa (invoke)
+      await window.soberanoAPI.enviarMensagem(text);
+      // A resposta chegará via listener onChunk/onEnd
+    } catch (err) {
+      // Remove loading e mostra erro
+      loadingDiv.parentNode.removeChild(loadingDiv);
+      addMessage('system', 'Erro ao enviar mensagem: ' + (err.message || err));
+      setStatus('Erro', 'error');
+      setLoadingState(false);
+    }
+  }
+
+  // ============================================================
+  // IPC Listeners (via Context Bridge)
+  // ============================================================
+
+  /**
+   * Listener para cada chunk de streaming.
+   * Por enquanto, como usamos conversar() que retorna a resposta
+   * completa, recebemos um único chunk com o texto completo.
+   */
+  window.soberanoAPI.onStream(function (chunkText) {
+    // Procura o último elemento .loading para substituir
+    const loadingMsg = chatHistory.querySelector('.message.loading');
+    if (loadingMsg) {
+      loadingMsg.parentNode.removeChild(loadingMsg);
+    }
+
+    // Adiciona como mensagem do assistente
+    addMessage('assistant', chunkText);
+    setStatus('Completo', 'success');
+  });
+
+  /**
+   * Listener de fim de stream.
+   * status: 'complete' | 'cancelled' | 'error'
+   */
+  window.soberanoAPI.onStreamEnd(function (status, detail) {
+    setLoadingState(false);
+
+    // Remove loading se ainda existir
+    const loadingMsg = chatHistory.querySelector('.message.loading');
+    if (loadingMsg) {
+      loadingMsg.parentNode.removeChild(loadingMsg);
+    }
+
+    if (status === 'cancelled') {
+      addMessage('system', 'Geração cancelada.');
+      setStatus('Cancelado', 'idle');
+    } else if (status === 'error') {
+      addMessage('system', 'Erro: ' + (detail || 'Ocorreu um erro na geração.'));
+      setStatus('Erro', 'error');
+    }
+  });
+
+  // ============================================================
+  // Cancelar geração
+  // ============================================================
+  cancelBtn.addEventListener('click', function () {
+    if (!isLoading) return;
+    window.soberanoAPI.cancelar();
+    // O listener onEnd irá tratar o estado 'cancelled'
+  });
+
+  // ============================================================
+  // Event Listeners
+  // ============================================================
+
+  // Botão Enviar
+  sendBtn.addEventListener('click', sendMessage);
+
+  // Enter para enviar (Shift+Enter para nova linha)
+  messageInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  // Foco inicial no input
+  messageInput.focus();
+})();
+</file>
+
+<file path="src/renderer/index.html">
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';" />
+  <title>SOBERANO Desktop</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header id="header">
+      <h1>SOBERANO</h1>
+      <p class="subtitle">Sistema de Orquestração com Engenharia de Software de Alta Robustez</p>
+    </header>
+
+    <!-- Chat History Area -->
+    <div id="chat-history" role="log" aria-live="polite" aria-label="Histórico do chat">
+      <div class="message system">
+        <div class="message-content">
+          Bem-vindo ao SOBERANO Desktop. Digite sua mensagem abaixo para iniciar a conversa.
+        </div>
+      </div>
+    </div>
+
+    <!-- Input Area -->
+    <div id="input-area">
+      <textarea
+        id="message-input"
+        placeholder="Digite sua mensagem..."
+        rows="2"
+        aria-label="Campo de mensagem"
+      ></textarea>
+      <button id="send-btn" aria-label="Enviar mensagem">Enviar</button>
+      <button id="cancel-btn" class="hidden" aria-label="Cancelar geração">Cancelar</button>
+      <div id="status-bar" class="status-idle">Pronto</div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
+</file>
+
+<file path="src/renderer/style.css">
+/* ============================================================
+   SOBERANO Desktop — UI Stylesheet
+   Minimalista, responsivo e sem dependências externas.
+   ============================================================ */
+
+/* --- Reset básico --- */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-tertiary: #0f3460;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0b0;
+  --accent: #4fc3f7;
+  --accent-hover: #29b6f6;
+  --danger: #ef5350;
+  --danger-hover: #e53935;
+  --success: #66bb6a;
+  --warning: #ffa726;
+  --border: #2a2a4a;
+  --radius: 8px;
+  --font: 'Segoe UI', 'Roboto', system-ui, -apple-system, sans-serif;
+}
+
+html, body {
+  height: 100%;
+  font-family: var(--font);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 0 16px;
+}
+
+/* --- Header --- */
+#header {
+  padding: 16px 0 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: center;
+  flex-shrink: 0;
+}
+
+#header h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 1px;
+}
+
+#header .subtitle {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+/* --- Chat History --- */
+#chat-history {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.message {
+  display: flex;
+  max-width: 85%;
+}
+
+.message.user {
+  align-self: flex-end;
+}
+
+.message.assistant {
+  align-self: flex-start;
+}
+
+.message.system {
+  align-self: center;
+  font-style: italic;
+  opacity: 0.8;
+}
+
+.message-content {
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  line-height: 1.5;
+  font-size: 0.95rem;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.message.user .message-content {
+  background: var(--accent);
+  color: #000;
+  border-bottom-right-radius: 2px;
+}
+
+.message.assistant .message-content {
+  background: var(--bg-tertiary);
+  border-bottom-left-radius: 2px;
+}
+
+.message.system .message-content {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px dashed var(--border);
+  text-align: center;
+  font-size: 0.85rem;
+}
+
+.message.loading .message-content {
+  background: var(--bg-secondary);
+  border-bottom-left-radius: 2px;
+  color: var(--text-secondary);
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+/* --- Input Area --- */
+#input-area {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 12px 0 16px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#message-input {
+  flex: 1;
+  resize: none;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 0.95rem;
+  line-height: 1.4;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+#message-input:focus {
+  border-color: var(--accent);
+}
+
+#message-input::placeholder {
+  color: var(--text-secondary);
+}
+
+button {
+  padding: 10px 20px;
+  border: none;
+  border-radius: var(--radius);
+  font-family: var(--font);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+  white-space: nowrap;
+}
+
+#send-btn {
+  background: var(--accent);
+  color: #000;
+}
+
+#send-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+#cancel-btn {
+  background: var(--danger);
+  color: #fff;
+}
+
+#cancel-btn:hover {
+  background: var(--danger-hover);
+}
+
+#cancel-btn.hidden {
+  display: none;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* --- Status Bar --- */
+#status-bar {
+  text-align: right;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  min-width: 80px;
+  flex-shrink: 0;
+}
+
+.status-idle { color: var(--text-secondary); }
+.status-loading { color: var(--warning); }
+.status-error { color: var(--danger); }
+.status-success { color: var(--success); }
+
+/* --- Scrollbar personalizada (Webkit) --- */
+#chat-history::-webkit-scrollbar {
+  width: 6px;
+}
+
+#chat-history::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#chat-history::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+#chat-history::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
 }
 </file>
 
-<file path="src/core/IConversationManager.ts">
+<file path="src/main-cli.ts">
 /**
- * @file IConversationManager.ts
- * @description Contrato do Maestro — orquestrador que une a Memória Vetorial (RAG)
- *              e a Memória de Curto Prazo (Sessões) em um único fluxo de conversação
- *              multi-turno. Segue o DIP: módulos de alto nível dependem desta abstração.
+ * @file main.ts
+ * @description Ponto de entrada do sistema SOBERANO - Sprint 6.5 (Zero Debt).
+ *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
+ *              - Instancia ConsoleLogger para logging estruturado
+ *              - Instancia OllamaProvider com Logger injetado via construtor
+ *              - Cria AbortController global para graceful shutdown
+ *              - Injeta AbortSignal no OllamaProvider para cancelar fetch em andamento
+ *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
+ *              - Inicializa NativeHttpServer para servir rota /healthz
+ *              - Executa o teste de comunicacao com o motor cognitivo
+ *              - Executa o teste do FileSensor (leitura de arquivo local)
+ *              - Demonstra o MockVectorStore (Memoria Vetorial - Fase 3)
+ *              - Instancia InMemorySessionManager para gestao de sessoes (Fase 5)
+ *              - Instancia ConversationManager para orquestracao multi-turno com RAG (Fase 5)
+ *              - Simula 2 turnos de conversa para provar a retencao de memoria de sessao
  */
 
-export abstract class IConversationManager {
-  /**
-   * Processa uma interação completa de conversa:
-   * 1. Guarda o input do usuário no SessionManager (role: user).
-   * 2. Se um VectorStore estiver disponível, busca contextos similares ao input (RAG).
-   * 3. Obtém o histórico completo da sessão.
-   * 4. Constrói uma mensagem system fundindo regras do SOBERANO com documentos recuperados.
-   * 5. Envia o array de mensagens ao motor cognitivo.
-   * 6. Executa o ReAct/Tool Calling Loop se houver tool_calls.
-   * 7. Guarda a resposta (role: assistant) no SessionManager.
-   * 8. Retorna a resposta ao chamador.
-   *
-   * @param sessionId    - Identificador único da sessão de conversa.
-   * @param inputUsuario - Texto de entrada do usuário.
-   * @param signal       - Sinal opcional para abortar a operação (graceful shutdown / cancelamento).
-   * @returns A resposta gerada pelo motor cognitivo (role: assistant).
-   */
-  abstract conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string>;
+import { randomUUID } from 'node:crypto';
+import { OllamaProvider } from './infra/OllamaProvider.ts';
+import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
+import { ConsoleLogger } from './infra/ConsoleLogger.ts';
+import { ILogger } from './core/ILogger.ts';
+import { CircuitBreaker } from './infra/CircuitBreaker.ts';
+import { NativeHttpServer } from './infra/NativeHttpServer.ts';
+import { IHttpServer } from './core/IHttpServer.ts';
+import { FileSensor } from './infra/FileSensor.ts';
+import { ISensor } from './core/ISensor.ts';
+import { MockVectorStore } from './infra/MockVectorStore.ts';
+import { IVectorStore } from './core/IVectorStore.ts';
+import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
+import { ISessionManager } from './core/ISessionManager.ts';
+import { ConversationManager } from './infra/ConversationManager.ts';
+import { IConversationManager } from './core/IConversationManager.ts';
+import { ToolRegistry } from './infra/ToolRegistry.ts';
+import { IToolRegistry } from './core/IToolRegistry.ts';
+import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
+import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
+import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
+
+let isShuttingDown = false;
+let shutdownInProgress = false;
+
+function registerShutdownHandlers(
+  logger: ILogger,
+  shutdownController: AbortController,
+  httpServer: IHttpServer
+): void {
+    const shutdown = async (signal: string) => {
+      if (isShuttingDown) {
+        logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
+        process.exit(1);
+      }
+
+      isShuttingDown = true;
+      logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
+
+      const forceExitTimer = setTimeout(() => {
+        logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
+        process.exit(1);
+      }, 5_000);
+
+      process.removeAllListeners('SIGINT');
+      process.removeAllListeners('SIGTERM');
+
+      // Prevent race condition: ensure abort is called before cleanup
+      if (!shutdownInProgress) {
+        shutdownInProgress = true;
+        shutdownController.abort();
+        clearTimeout(forceExitTimer);
+        logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
+      } else {
+        clearTimeout(forceExitTimer);
+        logger.info('[main] Shutdown already in progress.');
+      }
+    };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  logger.info('[main] Graceful shutdown handlers registered (SIGINT/SIGTERM).');
 }
+
+async function bootstrap(): Promise<void> {
+  const logger: ILogger = new ConsoleLogger('SOBERANO');
+  const shutdownController = new AbortController();
+  const circuitBreaker = new CircuitBreaker({ logger });
+
+  const httpServer: IHttpServer = new NativeHttpServer({
+    logger,
+    abortSignal: shutdownController.signal,
+  });
+
+  registerShutdownHandlers(logger, shutdownController, httpServer);
+
+  const globalTimeoutSignal = AbortSignal.timeout(120_000);
+  const combinedSignal = AbortSignal.any([shutdownController.signal, globalTimeoutSignal]);
+
+  const provider = new OllamaProvider({ logger, circuitBreaker });
+  provider.setAbortSignal(combinedSignal);
+  const motor: IMotorCognitivo = provider;
+
+  const portArg = process.argv[3];
+  let HTTP_PORT = 3000;
+  if (portArg !== undefined) {
+    HTTP_PORT = parseInt(portArg, 10);
+    if (Number.isNaN(HTTP_PORT)) {
+      logger.error('[main] Invalid port argument "' + portArg + '". Porta invalida. Encerrando.');
+      process.exit(1);
+    }
+  }
+  await httpServer.start(HTTP_PORT);
+
+  try {
+    // TESTE 1: MOTOR COGNITIVO
+    logger.info('[main] === TESTE 1: MOTOR COGNITIVO ===');
+
+    const promptTeste = 'Ola, Soberano. Confirme que seus sistemas base estao online.';
+    const mensagens = [{ role: 'user' as const, content: promptTeste }];
+
+    logger.info('[main] Sending messages to cognitive engine...');
+    logger.info('[main] Messages: ' + JSON.stringify(mensagens));
+
+    const respostaMessage = await motor.gerarResposta(mensagens);
+
+    logger.info('[main] === RESPOSTA DO MOTOR COGNITIVO ===');
+    logger.info(respostaMessage.content);
+    logger.info('[main] Test completed successfully.');
+
+    // TESTE DO FILE SENSOR (Fase 2)
+    const filePath = process.argv[2];
+
+    if (filePath) {
+      logger.info('[main] === FILE SENSOR - Demonstracao ===');
+
+      const fileSensor: ISensor<string> = new FileSensor({ logger });
+
+      try {
+        const conteudo = await fileSensor.ler(filePath, combinedSignal);
+        logger.info('[main] Conteudo do arquivo "' + filePath + '":');
+        logger.info(conteudo);
+        logger.info('[main] FileSensor test completed successfully.');
+      } catch (sensorError) {
+        logger.error('[main] FileSensor: Erro ao ler o arquivo "' + filePath + '".');
+        if (sensorError instanceof Error) {
+          logger.error(sensorError.message);
+        } else {
+          logger.error('[main] Unknown error: ' + String(sensorError));
+        }
+      }
+    } else {
+      logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo> [porta]');
+    }
+
+    // DEMONSTRACAO DO MOCK VECTOR STORE (Fase 3)
+    logger.info('[main] === MOCK VECTOR STORE - Demonstracao ===');
+
+    const vectorStore: IVectorStore = new MockVectorStore({ logger });
+
+    await vectorStore.adicionar('doc-1', [0.1, 0.2, 0.3], { texto: 'Gato felino mamifero', fonte: 'enciclopedia' });
+    await vectorStore.adicionar('doc-2', [0.4, 0.5, 0.6], { texto: 'Cachorro canino mamifero', fonte: 'enciclopedia' });
+    await vectorStore.adicionar('doc-3', [0.7, 0.8, 0.9], { texto: 'Aguia ave rapina', fonte: 'enciclopedia' });
+
+    logger.info('[main] 3 vectors added to MockVectorStore.');
+
+    const queryVector = [0.35, 0.45, 0.55];
+    const similar = await vectorStore.buscarSimilares(queryVector, 2);
+
+    logger.info('[main] Top ' + similar.length + ' similar vectors to query [0.35, 0.45, 0.55]:');
+    for (const result of similar) {
+      logger.info('  -> id="' + result.id + '", score=' + result.score.toFixed(4) + ', texto="' + result.metadata.texto + '"');
+    }
+
+    logger.info('[main] MockVectorStore demonstration completed successfully.');
+
+    // TESTE DO CONVERSATION MANAGER (Fase 5)
+    logger.info('[main] === CONVERSATION MANAGER - Demonstracao: Sessoes + RAG (Fase 5) ===');
+
+    const sessionManager: ISessionManager = new InMemorySessionManager({
+      logger,
+      maxMessagesPerSession: 20,
+    });
+
+    // --- Tool Registry (Fase 6) ---
+    const toolRegistry: IToolRegistry = new ToolRegistry({ logger });
+    const systemTimeTool = new SystemTimeTool();
+    toolRegistry.registrar(systemTimeTool);
+    logger.info('[main] SystemTimeTool registered in ToolRegistry.');
+
+    const calculatorTool = new CalculatorTool();
+    toolRegistry.registrar(calculatorTool);
+    logger.info('[main] CalculatorTool registered in ToolRegistry.');
+
+    const readFileTool = new ReadFileTool();
+    toolRegistry.registrar(readFileTool);
+    logger.info('[main] ReadFileTool registered in ToolRegistry.');
+
+    const conversationManager: IConversationManager = new ConversationManager({
+      logger,
+      motor,
+      sessionManager,
+      vectorStore,
+      toolRegistry,
+    });
+
+    const sessionId = randomUUID();
+
+    // Turno 1
+    const input1 = 'Ola, quem es tu?';
+    logger.info('[main] CONVERSATION - Turno 1/2: "' + input1 + '"');
+    const resposta1 = await conversationManager.conversar(sessionId, input1);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 1 ===');
+    logger.info(resposta1);
+
+    // Turno 2
+    const input2 = 'Qual foi a minha primeira pergunta?';
+    logger.info('[main] CONVERSATION - Turno 2/2: "' + input2 + '"');
+    const resposta2 = await conversationManager.conversar(sessionId, input2);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 2 ===');
+    logger.info(resposta2);
+
+    // Turno 3 - Força o uso da ferramenta get_system_time
+    const input3 = 'Que horas sao exatamente agora?';
+    logger.info('[main] CONVERSATION - Turno 3/4 (Tool Calling): "' + input3 + '"');
+    const resposta3 = await conversationManager.conversar(sessionId, input3);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 3 (Tool Calling) ===');
+    logger.info(resposta3);
+    logger.info('[main] === Tool Call test completed successfully. ===');
+
+    // Turno 4 - Uso multiplo de ferramentas (calculator + get_system_time)
+    const input4 = 'Soberano, calcule quanto e 1450 dividido por 5 e depois me diga que horas sao';
+    logger.info('[main] CONVERSATION - Turno 4/4 (Multi-tool): "' + input4 + '"');
+    const resposta4 = await conversationManager.conversar(sessionId, input4);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 4 (Multi-tool) ===');
+    logger.info(resposta4);
+    logger.info('[main] === Sprint 6.5 - Zero Debt test completed successfully. ===');
+
+    // Verificacao da memoria de sessao
+    const historicoFinal = await sessionManager.obterHistorico(sessionId);
+    logger.info('[main] === SESSAO "' + sessionId + '" — ' + historicoFinal.length + ' mensagens ===');
+    logger.info('[main] Session history (' + historicoFinal.length + ' messages):');
+    for (const msg of historicoFinal) {
+      const truncatedContent = msg.content.substring(0, 100) + (msg.content.length > 100 ? '...' : '');
+      logger.info('  [' + msg.role + '] ' + truncatedContent);
+    }
+
+    logger.info('[main] === FASE 6.5 COMPLETA - Todos os testes OK ===');
+  } catch (error) {
+    if (shutdownController.signal.aborted) {
+      logger.info('[main] Operation cancelled due to system shutdown.');
+      return;
+    }
+
+    logger.error('[main] === ERRO NA COMUNICACAO COM O MOTOR ===');
+
+    if (error instanceof Error) {
+      logger.error(error.message);
+    } else {
+      logger.error('[main] Unknown error: ' + String(error));
+    }
+
+    logger.error('[main] O sistema nao pode se comunicar com o motor cognitivo.');
+    logger.error('[main] Verifique se o servidor Ollama esta em execucao: ollama serve');
+
+    process.exit(1);
+  } finally {
+    // Ensure httpServer.stop() is called exactly once to avoid race condition
+    if (!shutdownInProgress) {
+      shutdownInProgress = true;
+      await httpServer.stop().catch((err) => {
+        logger.error('[main] Error stopping HTTP server: ' + err);
+      });
+    }
+
+    if (isShuttingDown) {
+      logger.info('[main] Resources released. Goodbye, SOBERANO.');
+      process.exit(0);
+    }
+  }
+}
+
+bootstrap();
 </file>
 
 <file path="src/core/IEmbeddings.ts">
@@ -925,6 +1623,90 @@ export class ReadFileTool extends ITool {
 }
 </file>
 
+<file path="src/infra/tools/SystemTimeTool.test.ts">
+/**
+ * @file SystemTimeTool.test.ts
+ * @description Testes unitários para SystemTimeTool utilizando node:test e node:assert.
+ *              Verifica o contrato da ferramenta de sistema (data/hora ISO 8601).
+ *
+ * Como executar:
+ *   node --experimental-transform-types --test src/infra/tools/SystemTimeTool.test.ts
+ */
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import { SystemTimeTool } from './SystemTimeTool.ts';
+
+describe('SystemTimeTool', () => {
+  const tool = new SystemTimeTool();
+
+  describe('Metadados da ferramenta', () => {
+    it('deve ter o nome "get_system_time"', () => {
+      assert.strictEqual(tool.name, 'get_system_time');
+    });
+
+    it('deve ter uma descrição não vazia', () => {
+      assert.ok(tool.description.length > 0);
+      assert.strictEqual(typeof tool.description, 'string');
+    });
+
+    it('deve ter um parametersSchema vazio (object sem propriedades required)', () => {
+      const schema = tool.parametersSchema;
+      assert.strictEqual(schema.type, 'object');
+      assert.deepStrictEqual(schema.properties, {});
+      assert.ok(Array.isArray(schema.required));
+      assert.strictEqual(schema.required.length, 0);
+    });
+
+    it('getDefinition() deve retornar a definição compatível com IToolDefinition', () => {
+      const def = tool.getDefinition();
+      assert.strictEqual(def.type, 'function');
+      assert.strictEqual(def.function.name, 'get_system_time');
+      assert.ok(def.function.description.length > 0);
+      assert.strictEqual(def.function.parameters.type, 'object');
+    });
+  });
+
+  describe('Execução', () => {
+    it('execute({}) deve retornar uma string ISO 8601 válida', async () => {
+      const result = await tool.execute({});
+      assert.strictEqual(typeof result, 'string');
+
+      // Valida formato ISO 8601: "2026-05-15T03:00:00.000Z"
+      const isoRegex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+      assert.ok(isoRegex.test(result), `Result "${result}" does not match ISO 8601 format`);
+    });
+
+    it('deve retornar uma data válida (new Date não retorna Invalid Date)', async () => {
+      const result = await tool.execute({});
+      const date = new Date(result);
+      assert.ok(date instanceof Date);
+      assert.ok(!isNaN(date.getTime()));
+    });
+
+    it('deve ser executado sem argumentos e sem lançar erro', async () => {
+      // A ferramenta não requer parâmetros, então qualquer args vazio deve funcionar
+      const result1 = await tool.execute({});
+      const result2 = await tool.execute(undefined as any);
+      const result3 = await tool.execute(null as any);
+
+      assert.strictEqual(typeof result1, 'string');
+      assert.strictEqual(typeof result2, 'string');
+      assert.strictEqual(typeof result3, 'string');
+    });
+
+    it('deve retornar tempos diferentes em chamadas consecutivas (não é cacheado)', async () => {
+      const result1 = await tool.execute({});
+      // Pequena pausa forçada para garantir timestamp diferente
+      await new Promise(resolve => setTimeout(resolve, 5));
+      const result2 = await tool.execute({});
+
+      assert.ok(result1 !== result2);
+    });
+  });
+});
+</file>
+
 <file path="src/infra/tools/SystemTimeTool.ts">
 /**
  * @file SystemTimeTool.ts
@@ -1105,6 +1887,289 @@ describe('ConsoleLogger', () => {
       assert.strictEqual(logMock.mock.calls.length, 1);
       const loggedMessage = logMock.mock.calls[0]?.arguments[0] as string;
       assert.ok(loggedMessage.includes('[CUSTOM]'), `Mensagem deve conter [CUSTOM], recebido: ${loggedMessage}`);
+    });
+  });
+});
+</file>
+
+<file path="src/infra/ConversationManager.test.ts">
+/**
+ * @file ConversationManager.test.ts
+ * @description Testes unitários para o ConversationManager com foco no ReAct/Tool Calling Loop.
+ *              Utiliza node:test com classes mock concretas para garantir isolamento e determinismo.
+ *              Zero dependências externas.
+ *
+ * Cobertura:
+ * - Fluxo sem tool calling (resposta direta)
+ * - Fluxo com tool calling bem-sucedido (1 iteração)
+ * - Tool calling com ferramenta não encontrada
+ * - Tool calling que atinge maxToolIterations (fallback)
+ * - Tool calling com ToolRegistry ausente
+ * - Cancelamento via AbortSignal
+ */
+
+import { describe, it, mock } from 'node:test';
+import assert from 'node:assert';
+
+import { ConversationManager } from './ConversationManager.ts';
+import { IMotorCognitivo, type ChatMessage, type IToolDefinition } from '../core/IMotorCognitivo.ts';
+import { ISessionManager } from '../core/ISessionManager.ts';
+import { ILogger } from '../core/ILogger.ts';
+import { IToolRegistry } from '../core/IToolRegistry.ts';
+import { ITool } from '../core/ITool.ts';
+
+// ---------- Mocks concretos (classes que estendem as abstratas) ----------
+
+class MockLogger extends ILogger {
+  info = mock.fn();
+  warn = mock.fn();
+  error = mock.fn();
+  debug = mock.fn();
+}
+
+class MockSessionManager extends ISessionManager {
+  private historico: ChatMessage[] = [];
+
+  adicionarMensagem = mock.fn(async (_sessionId: string, mensagem: ChatMessage): Promise<void> => {
+    this.historico.push(mensagem);
+  });
+
+  obterHistorico = mock.fn(async (_sessionId: string): Promise<ReadonlyArray<ChatMessage>> => {
+    return [...this.historico];
+  });
+
+  limparSessao = mock.fn(async (_sessionId: string): Promise<void> => {
+    this.historico = [];
+  });
+}
+
+class MockMotor extends IMotorCognitivo {
+  private callIndex = 0;
+
+  constructor(private readonly respostas: ChatMessage[]) {
+    super();
+  }
+
+  setAbortSignal = mock.fn();
+
+  gerarResposta = mock.fn(async (_mensagens: ChatMessage[], _tools?: IToolDefinition[]): Promise<ChatMessage> => {
+    const r = this.respostas[this.callIndex];
+    if (!r) throw new Error('[MockMotor] No more responses configured');
+    this.callIndex++;
+    return r;
+  });
+
+  gerarRespostaStream = mock.fn(async function* (..._args: any[]): AsyncIterable<string> {
+    yield '';
+  });
+}
+
+class MockToolRegistry extends IToolRegistry {
+  private readonly map: Map<string, ITool>;
+
+  constructor(tools: ITool[]) {
+    super();
+    this.map = new Map(tools.map(t => [t.name, t]));
+  }
+
+  registrar = mock.fn();
+  obter = mock.fn((nome: string): ITool | undefined => this.map.get(nome));
+  obterTodas = mock.fn((): ITool[] => [...this.map.values()]);
+}
+
+/** Cria uma tool fake concreta que estende ITool */
+function criaToolFake(nome: string, resultado: any): ITool & { executeMock: ReturnType<typeof mock.fn> } {
+  const executeMock = mock.fn(async (_args: Record<string, any>) => resultado);
+  const tool = new (class extends ITool {
+    get name() { return nome; }
+    get description() { return `Ferramenta fake ${nome}`; }
+    get parametersSchema() { return { type: 'object' as const, properties: {} }; }
+    execute = executeMock;
+  })();
+  return Object.assign(tool, { executeMock });
+}
+
+// ---------- Testes ----------
+
+describe('ConversationManager - ReAct Loop', () => {
+  describe('fluxo sem tool calling', () => {
+    it('deve retornar resposta direta do assistant quando não há tool_calls', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const motor = new MockMotor([
+        { role: 'assistant', content: 'Resposta final.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager });
+      const resposta = await cm.conversar('sessao-1', 'Olá');
+
+      assert.strictEqual(resposta, 'Resposta final.');
+      assert.strictEqual(sessionManager.adicionarMensagem.mock.callCount(), 2); // user + assistant
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 1);
+    });
+  });
+
+  describe('fluxo com tool calling bem-sucedido', () => {
+    it('deve executar tool, salvar resultado e retornar resposta final', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolCalc = criaToolFake('calculadora', { resultado: 42 });
+      const toolRegistry = new MockToolRegistry([toolCalc]);
+
+      const motor = new MockMotor([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'call_abc123', function: { name: 'calculadora', arguments: { a: 1, b: 2 } } }],
+        },
+        { role: 'assistant', content: 'Resultado é 42.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
+      const resposta = await cm.conversar('sessao-2', 'Quanto é 1+2?');
+
+      assert.strictEqual(resposta, 'Resultado é 42.');
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2); // 1ª com tools, 2ª sem
+      assert.strictEqual(toolCalc.executeMock.mock.callCount(), 1);
+
+      // Verifica que o tool_call_id real foi usado na mensagem tool
+      const historico = await sessionManager.obterHistorico('sessao-2');
+      const toolMessages = historico.filter(m => m.role === 'tool');
+      assert.ok(toolMessages.some(m => m.tool_call_id === 'call_abc123'));
+    });
+  });
+
+  describe('tool calling com ferramenta não encontrada', () => {
+    it('deve retornar erro simulado quando ferramenta não existe no registry', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolRegistry = new MockToolRegistry([]);
+
+      const motor = new MockMotor([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'call_xyz', function: { name: 'toolInexistente', arguments: {} } }],
+        },
+        { role: 'assistant', content: 'Ferramenta não encontrada.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
+      const resposta = await cm.conversar('sessao-3', 'Execute toolInexistente');
+
+      assert.strictEqual(resposta, 'Ferramenta não encontrada.');
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2);
+    });
+  });
+
+  describe('maxToolIterations atingido', () => {
+    it('deve retornar fallback seguro quando excede o limite de iterações', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolCalc = criaToolFake('loopTool', { ok: true });
+      const toolRegistry = new MockToolRegistry([toolCalc]);
+
+      // Cada resposta pede tool novamente — simula loop infinito
+      const motor = new MockMotor([
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'loopTool', arguments: {} } }] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_2', function: { name: 'loopTool', arguments: {} } }] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_3', function: { name: 'loopTool', arguments: {} } }] },
+        // depth 3 >= maxToolIterations(3) — deve cair no fallback antes da 4ª chamada
+        { role: 'assistant', content: 'Nunca vou ser chamado.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry, maxToolIterations: 3 });
+      const resposta = await cm.conversar('sessao-4', 'Loop infinito');
+
+      // Deve ter chamado o motor 3 vezes (depth 0, 1, 2) e parado no fallback
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 3);
+      // A resposta é do tipo string (fallback seguro)
+      assert.strictEqual(typeof resposta, 'string');
+    });
+
+    it('deve retornar mensagem de corte quando fallback não encontra assistant com conteúdo', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolCalc = criaToolFake('loopTool', { ok: true });
+      const toolRegistry = new MockToolRegistry([toolCalc]);
+
+      // Apenas 1 resposta com tool_call (content vazio)
+      const motor = new MockMotor([
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'loopTool', arguments: {} } }] },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry, maxToolIterations: 1 });
+      const resposta = await cm.conversar('sessao-5', 'Loop');
+
+      // maxToolIterations=1, depth 0 < 1, depth 1 >= 1 — 1 chamada, fallback
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 1);
+      assert.strictEqual(
+        resposta,
+        '[SOBERANO] Limite de iterações de ferramentas atingido. A execução foi interrompida para garantir estabilidade.'
+      );
+    });
+  });
+
+  describe('ToolRegistry ausente', () => {
+    it('deve funcionar quando tool_calls são recebidas sem ToolRegistry', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+
+      const motor = new MockMotor([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'call_noop', function: { name: 'semRegistry', arguments: {} } }],
+        },
+        { role: 'assistant', content: 'ToolRegistry não configurado, mas segui em frente.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager });
+      const resposta = await cm.conversar('sessao-6', 'Teste sem registry');
+
+      assert.strictEqual(resposta, 'ToolRegistry não configurado, mas segui em frente.');
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2);
+    });
+  });
+
+  describe('cancelamento via AbortSignal', () => {
+    it('deve propagar o signal para o motor cognitivo', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const motor = new MockMotor([
+        { role: 'assistant', content: 'Resposta antes do abort.' },
+      ]);
+
+      const ac = new AbortController();
+      const cm = new ConversationManager({ logger, motor, sessionManager });
+      const resposta = await cm.conversar('sessao-7', 'Mensagem normal', ac.signal);
+
+      assert.strictEqual(resposta, 'Resposta antes do abort.');
+      assert.strictEqual(motor.setAbortSignal.mock.callCount(), 1);
+    });
+
+    it('deve propagar o signal na recursão do tool loop', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolCalc = criaToolFake('calc', { resultado: 10 });
+      const toolRegistry = new MockToolRegistry([toolCalc]);
+
+      const motor = new MockMotor([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'call_1', function: { name: 'calc', arguments: {} } }],
+        },
+        { role: 'assistant', content: 'Recursão concluída.' },
+      ]);
+
+      const ac = new AbortController();
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
+      const resposta = await cm.conversar('sessao-8', 'Teste com signal', ac.signal);
+
+      assert.strictEqual(resposta, 'Recursão concluída.');
+      // setAbortSignal foi chamado em cada depth (2 vezes)
+      assert.strictEqual(motor.setAbortSignal.mock.callCount(), 2);
     });
   });
 });
@@ -1352,81 +2417,313 @@ describe('InMemorySessionManager', () => {
 });
 </file>
 
-<file path="src/infra/ToolRegistry.ts">
+<file path="src/infra/MockVectorStore.test.ts">
 /**
- * @file ToolRegistry.ts
- * @description Implementação concreta de IToolRegistry.
- *              Gerencia o registro e consulta de ferramentas (ITool) em memória.
- *              Segue o padrão Options Object para injeção de dependências.
+ * @file MockVectorStore.test.ts
+ * @description Testes unitários para MockVectorStore com foco no cosineSimilarity
+ *              via método público buscarSimilares.
  *
- *              Depende de abstrações (DIP): ILogger.
+ * Como executar:
+ *   node --experimental-transform-types src/infra/MockVectorStore.test.ts
  */
 
-import { IToolRegistry } from '../core/IToolRegistry.ts';
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import { MockVectorStore } from './MockVectorStore.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+class MockLogger extends ILogger {
+  info(): void {}
+  warn(): void {}
+  error(): void {}
+  debug(): void {}
+}
+
+describe('MockVectorStore', () => {
+  describe('cosineSimilarity (via buscarSimilares)', () => {
+    it('deve retornar score 1.0 para vetores idênticos', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      const vector = [1, 2, 3, 4, 5];
+      await store.adicionar('id1', vector, { text: 'teste' });
+
+      const results = await store.buscarSimilares(vector, 1);
+      assert.strictEqual(results.length, 1);
+      assert.ok(Math.abs(results[0]!.score - 1.0) < 0.0001, `Expected score ~1.0, got ${results[0]!.score}`);
+    });
+
+    it('deve retornar score 0 para vetores ortogonais', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      await store.adicionar('id1', [1, 0, 0], { text: 'eixo x' });
+
+      const results = await store.buscarSimilares([0, 1, 0], 1);
+      assert.strictEqual(results.length, 1);
+      assert.ok(Math.abs(results[0]!.score - 0.0) < 0.0001, `Expected score ~0.0, got ${results[0]!.score}`);
+    });
+
+    it('deve retornar score 0 para vetor nulo', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      await store.adicionar('id1', [0, 0, 0], { text: 'nulo' });
+
+      const results = await store.buscarSimilares([1, 2, 3], 1);
+      assert.strictEqual(results.length, 1);
+      assert.strictEqual(results[0]!.score, 0, 'Vetor nulo deve ter score 0');
+    });
+
+    it('deve retornar scores ordenados do mais similar ao menos similar', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      // Query vector: [1, 0, 0]
+      // id1 = [1, 0, 0] → cos = 1.0
+      // id2 = [0, 1, 0] → cos = 0.0
+      // id3 = [0.5, 0, 0] → cos = 1.0 (magnitude menor, mas dot product = 0.5, cos = 1.0)
+      // id4 = [1, 1, 0] → cos ≈ 0.707
+      await store.adicionar('id1', [1, 0, 0], { text: 'igual' });
+      await store.adicionar('id2', [0, 1, 0], { text: 'ortogonal' });
+      await store.adicionar('id4', [1, 1, 0], { text: 'diagonal' });
+
+      const queryVector = [1, 0, 0];
+      const results = await store.buscarSimilares(queryVector, 3);
+
+      assert.strictEqual(results.length, 3);
+      // Ordenação decrescente de score
+      for (let i = 1; i < results.length; i++) {
+        assert.ok(results[i - 1]!.score >= results[i]!.score,
+          `Results should be sorted descending. results[${i - 1}].score=${results[i - 1]!.score} < results[${i}].score=${results[i]!.score}`
+        );
+      }
+
+      // id1 (identical) should have highest score
+      assert.strictEqual(results[0]!.id, 'id1', 'Most similar should be id1');
+    });
+
+    it('deve retornar score ~ -1 para vetores opostos', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      await store.adicionar('id1', [1, 2, 3], { text: 'positivo' });
+
+      const results = await store.buscarSimilares([-1, -2, -3], 1);
+      assert.strictEqual(results.length, 1);
+      assert.ok(Math.abs(results[0]!.score - (-1.0)) < 0.0001,
+        `Expected score ~-1.0 for opposite vectors, got ${results[0]!.score}`
+      );
+    });
+
+    it('deve lançar erro se dimensões forem diferentes entre query e stored', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      await store.adicionar('id1', [1, 2, 3], { text: '3d' });
+
+      await assert.rejects(
+        () => store.buscarSimilares([1, 2], 1),
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('Vector dimension mismatch'));
+          }
+          return true;
+        }
+      );
+    });
+
+    it('deve respeitar o parâmetro limit', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      await store.adicionar('id1', [1, 0, 0], { text: 'a' });
+      await store.adicionar('id2', [0, 1, 0], { text: 'b' });
+      await store.adicionar('id3', [0, 0, 1], { text: 'c' });
+
+      const results = await store.buscarSimilares([1, 0, 0], 2);
+      assert.strictEqual(results.length, 2, 'Deve respeitar limit=2');
+    });
+
+    it('deve retornar array vazio se não houver vetores armazenados', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      const results = await store.buscarSimilares([1, 2, 3], 5);
+      assert.strictEqual(results.length, 0, 'Store vazio deve retornar array vazio');
+    });
+
+    it('deve rejeitar ID duplicado no adicionar', async () => {
+      const logger = new MockLogger();
+      const store = new MockVectorStore<{ text: string }>({ logger });
+
+      await store.adicionar('dup', [1, 2, 3], { text: 'primeiro' });
+      await assert.rejects(
+        () => store.adicionar('dup', [4, 5, 6], { text: 'segundo' }),
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('already exists'));
+          }
+          return true;
+        }
+      );
+    });
+  });
+});
+</file>
+
+<file path="src/infra/ToolRegistry.test.ts">
+/**
+ * @file ToolRegistry.test.ts
+ * @description Testes unitários para ToolRegistry utilizando node:test e node:assert.
+ *              Verifica o registro, consulta e o novo comportamento de lançar Error
+ *              em caso de nomes duplicados (ao invés de sobrescrever).
+ *
+ * Como executar:
+ *   node --experimental-transform-types --test src/infra/ToolRegistry.test.ts
+ */
+
+import { describe, it, mock } from 'node:test';
+import assert from 'node:assert';
+
+import { ToolRegistry } from './ToolRegistry.ts';
 import { ITool } from '../core/ITool.ts';
 import { ILogger } from '../core/ILogger.ts';
 
-export interface ToolRegistryOptions {
-  /** Instância obrigatória de ILogger para logging estruturado */
-  logger: ILogger;
+// ---------- Mocks concretos ----------
+
+class MockLogger extends ILogger {
+  info = mock.fn();
+  warn = mock.fn();
+  error = mock.fn();
+  debug = mock.fn();
 }
 
-export class ToolRegistry extends IToolRegistry {
-  private readonly tools: Map<string, ITool>;
-  private readonly logger: ILogger;
-
-  /**
-   * @param options - Options Object (ToolRegistryOptions).
-   *                  Apenas `logger` é obrigatório.
-   */
-  constructor(options: ToolRegistryOptions) {
+class MockTool extends ITool {
+  constructor(
+    private readonly _name: string,
+    private readonly _description: string = `Tool ${_name}`
+  ) {
     super();
-    this.logger = options.logger;
-    this.tools = new Map();
   }
 
-  /**
-   * Registra uma ferramenta no registry.
-   * Se uma ferramenta com o mesmo nome já existir, emite um aviso e sobrescreve.
-   *
-   * @param tool - Instância concreta de ITool a ser registrada.
-   */
-  registrar(tool: ITool): void {
-    const nome = tool.name;
-
-    if (this.tools.has(nome)) {
-      this.logger.warn(
-        `[ToolRegistry] Tool "${nome}" is already registered. Overwriting previous registration.`
-      );
-    }
-
-    this.tools.set(nome, tool);
-    this.logger.info(`[ToolRegistry] Tool registered: "${nome}"`);
+  get name(): string {
+    return this._name;
   }
 
-  /**
-   * Obtém uma ferramenta pelo nome único.
-   *
-   * @param nome - Nome único da ferramenta (case-sensitive).
-   * @returns A instância de ITool ou undefined se não encontrada.
-   */
-  obter(nome: string): ITool | undefined {
-    const tool = this.tools.get(nome);
-    if (!tool) {
-      this.logger.debug(`[ToolRegistry] Tool "${nome}" not found.`);
-    }
-    return tool;
+  get description(): string {
+    return this._description;
   }
 
-  /**
-   * Retorna todas as ferramentas registradas.
-   *
-   * @returns Array de ITool.
-   */
-  obterTodas(): ITool[] {
-    return Array.from(this.tools.values());
+  get parametersSchema(): Record<string, any> {
+    return { type: 'object', properties: {}, required: [] };
+  }
+
+  async execute(_args: Record<string, any>): Promise<any> {
+    return `executed ${this._name}`;
   }
 }
+
+// ---------- Helper para criar instância limpa ----------
+function criarRegistry(): { logger: MockLogger; registry: ToolRegistry } {
+  const logger = new MockLogger();
+  const registry = new ToolRegistry({ logger });
+  return { logger, registry };
+}
+
+// ---------- Testes ----------
+
+describe('ToolRegistry', () => {
+  describe('registrar()', () => {
+    it('deve registrar uma ferramenta com sucesso', () => {
+      const { logger, registry } = criarRegistry();
+      const tool = new MockTool('tool_a');
+      registry.registrar(tool);
+
+      assert.strictEqual(registry.obter('tool_a'), tool);
+      assert.strictEqual(logger.info.mock.calls.length, 1);
+    });
+
+    it('deve lançar Error ao registrar nome duplicado', () => {
+      const { registry } = criarRegistry();
+      const toolA = new MockTool('tool_a');
+      const toolADup = new MockTool('tool_a');
+
+      registry.registrar(toolA);
+
+      assert.throws(
+        () => registry.registrar(toolADup),
+        {
+          name: 'Error',
+          message: /already registered/i,
+        }
+      );
+    });
+
+    it('deve permitir registrar múltiplas ferramentas com nomes diferentes', () => {
+      const { registry } = criarRegistry();
+      const toolA = new MockTool('tool_a');
+      const toolB = new MockTool('tool_b');
+
+      registry.registrar(toolA);
+      registry.registrar(toolB);
+
+      assert.strictEqual(registry.obterTodas().length, 2);
+    });
+  });
+
+  describe('obter()', () => {
+    it('deve retornar a ferramenta quando o nome existe', () => {
+      const { registry } = criarRegistry();
+      const tool = new MockTool('my_tool');
+      registry.registrar(tool);
+
+      const result = registry.obter('my_tool');
+      assert.strictEqual(result, tool);
+    });
+
+    it('deve retornar undefined quando o nome não existe', () => {
+      const { registry } = criarRegistry();
+      const result = registry.obter('non_existent');
+      assert.strictEqual(result, undefined);
+    });
+
+    it('deve ser case-sensitive', () => {
+      const { registry } = criarRegistry();
+      const tool = new MockTool('CaseSensitive');
+      registry.registrar(tool);
+
+      assert.strictEqual(registry.obter('CaseSensitive'), tool);
+      assert.strictEqual(registry.obter('casesensitive'), undefined);
+    });
+  });
+
+  describe('obterTodas()', () => {
+    it('deve retornar array vazio quando nenhuma ferramenta foi registrada', () => {
+      const { registry } = criarRegistry();
+      const todas = registry.obterTodas();
+      assert.ok(Array.isArray(todas));
+      assert.strictEqual(todas.length, 0);
+    });
+
+    it('deve retornar todas as ferramentas registradas', () => {
+      const { registry } = criarRegistry();
+      const toolA = new MockTool('a');
+      const toolB = new MockTool('b');
+      const toolC = new MockTool('c');
+
+      registry.registrar(toolA);
+      registry.registrar(toolB);
+      registry.registrar(toolC);
+
+      const todas = registry.obterTodas();
+      assert.strictEqual(todas.length, 3);
+      assert.ok(todas.includes(toolA));
+      assert.ok(todas.includes(toolB));
+      assert.ok(todas.includes(toolC));
+    });
+  });
+});
 </file>
 
 <file path=".gitignore">
@@ -1460,6 +2757,78 @@ npm-debug.log*
 
 # TypeScript
 *.tsbuildinfo
+</file>
+
+<file path="src/core/ICircuitBreaker.ts">
+/**
+ * @file ICircuitBreaker.ts
+ * @description Contrato de abstração para o padrão Circuit Breaker.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ *
+ *              Estados: CLOSED (normal), OPEN (falhando), HALF_OPEN (teste).
+ */
+
+export enum CircuitState {
+  CLOSED = 'CLOSED',
+  OPEN = 'OPEN',
+  HALF_OPEN = 'HALF_OPEN',
+}
+
+export abstract class ICircuitBreaker {
+  /** Estado atual do circuit breaker */
+  abstract get state(): CircuitState;
+
+  /**
+   * Executa uma operação respeitando o estado do circuit breaker.
+   * - CLOSED: executa normalmente, registra sucesso/falha
+   * - OPEN: lança erro imediatamente (a menos que o timeout tenha expirado para HALF_OPEN)
+   * - HALF_OPEN: permite 1 chamada de teste; sucesso volta para CLOSED, falha volta para OPEN
+   *
+   * @param fn - Função assíncrona a ser protegida
+   * @returns O resultado da função
+   * @throws {Error} Se o circuit breaker estiver OPEN e o timeout não tiver expirado
+   */
+  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
+
+  /** Reseta o circuit breaker para o estado CLOSED */
+  abstract reset(): void;
+
+  /**
+   * Registra uma falha manualmente. Protegido para uso interno do execute().
+   * Não deve ser chamado externamente.
+   */
+  protected abstract recordFailure(): void;
+}
+</file>
+
+<file path="src/core/IConversationManager.ts">
+/**
+ * @file IConversationManager.ts
+ * @description Contrato do Maestro — orquestrador que une a Memória Vetorial (RAG)
+ *              e a Memória de Curto Prazo (Sessões) em um único fluxo de conversação
+ *              multi-turno. Segue o DIP: módulos de alto nível dependem desta abstração.
+ */
+
+export abstract class IConversationManager {
+  /**
+   * Processa uma interação completa de conversa:
+   * 1. Guarda o input do usuário no SessionManager (role: user).
+   * 2. Se um VectorStore estiver disponível, busca contextos similares ao input (RAG).
+   * 3. Obtém o histórico completo da sessão.
+   * 4. Constrói uma mensagem system fundindo regras do SOBERANO com documentos recuperados.
+   * 5. Envia o array de mensagens ao motor cognitivo.
+   * 6. Executa o ReAct/Tool Calling Loop se houver tool_calls.
+   * 7. Guarda a resposta (role: assistant) no SessionManager.
+   * 8. Retorna a resposta ao chamador.
+   *
+   * @param sessionId    - Identificador único da sessão de conversa.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @param signal       - Sinal opcional para abortar a operação (graceful shutdown / cancelamento).
+   * @returns A resposta gerada pelo motor cognitivo (role: assistant).
+   */
+  abstract conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string>;
+}
 </file>
 
 <file path="src/core/ISensor.ts">
@@ -1554,125 +2923,6 @@ export abstract class IVectorStore<M = any> {
   abstract buscarSimilares(vector: number[], limit: number): Promise<
     { id: string; metadata: M; score: number }[]
   >;
-}
-</file>
-
-<file path="src/infra/InMemorySessionManager.ts">
-/**
- * @file InMemorySessionManager.ts
- * @description Implementação concreta de ISessionManager utilizando
- *              armazenamento em memória (Map<string, ChatMessage[]>).
- *              - Depende da abstração ISessionManager, não o contrário (DIP).
- *              - Logger injetado via construtor (Options Object).
- *              - Suporta limite máximo de mensagens por sessão.
- *              - Quando o limite é excedido, a mensagem não-system mais antiga é removida.
- */
-
-import { ISessionManager } from '../core/ISessionManager.ts';
-import type { ChatMessage } from '../core/IMotorCognitivo.ts';
-import { ILogger } from '../core/ILogger.ts';
-
-export interface InMemorySessionManagerOptions {
-  /** Instância obrigatória de ILogger para logging */
-  logger: ILogger;
-  /** Número máximo de mensagens por sessão. Quando excedido,
-   *  a mensagem não-system mais antiga é removida. Opcional. */
-  maxMessagesPerSession?: number;
-}
-
-export class InMemorySessionManager extends ISessionManager {
-  private readonly sessions: Map<string, ChatMessage[]>;
-  private readonly logger: ILogger;
-  private readonly maxMessagesPerSession: number;
-
-  /**
-   * @param options - Objeto de configuração (InMemorySessionManagerOptions).
-   *                  Apenas `logger` é obrigatório.
-   */
-  constructor(options: InMemorySessionManagerOptions) {
-    super();
-    this.logger = options.logger;
-    this.sessions = new Map();
-    this.maxMessagesPerSession = options.maxMessagesPerSession ?? 50;
-  }
-
-  /**
-   * Adiciona uma mensagem ao histórico de uma sessão.
-   * Se a sessão não existir, ela é criada automaticamente.
-   * Se o limite maxMessagesPerSession for excedido, a mensagem
-   * não-system mais antiga é removida antes da inserção.
-   *
-   * @param sessionId - Identificador único da sessão.
-   * @param mensagem  - Mensagem no formato ChatMessage a ser adicionada.
-   */
-  async adicionarMensagem(sessionId: string, mensagem: ChatMessage): Promise<void> {
-    const historico = this.sessions.get(sessionId) ?? [];
-
-    // Se atingiu o limite, remove a mensagem não-system mais antiga
-    if (historico.length >= this.maxMessagesPerSession) {
-      const indexToRemove = historico.findIndex((m) => m.role !== 'system');
-      if (indexToRemove !== -1) {
-        historico.splice(indexToRemove, 1);
-        this.logger.debug(
-          `[InMemorySessionManager] Session "${sessionId}" reached max limit. ` +
-          `Removed oldest non-system message.`
-        );
-      } else {
-        // Se todas as mensagens são system, remove a mais antiga (índice 0)
-        historico.shift();
-        this.logger.debug(
-          `[InMemorySessionManager] Session "${sessionId}" reached max limit. ` +
-          `All messages are system. Removed oldest message.`
-        );
-      }
-    }
-
-    historico.push(mensagem);
-    this.sessions.set(sessionId, historico);
-
-    this.logger.debug(
-      `[InMemorySessionManager] Mensagem adicionada à sessão "${sessionId}". ` +
-      `Role: ${mensagem.role}, total messages: ${historico.length}`
-    );
-  }
-
-  /**
-   * Recupera o histórico completo de mensagens de uma sessão,
-   * na ordem em que foram adicionadas (da mais antiga para a mais recente).
-   *
-   * @param sessionId - Identificador único da sessão.
-   * @returns Array de mensagens no formato ChatMessage[].
-   */
-  async obterHistorico(sessionId: string): Promise<ReadonlyArray<ChatMessage>> {
-    const historico = this.sessions.get(sessionId);
-    if (!historico) {
-      this.logger.debug(
-        `[InMemorySessionManager] Session "${sessionId}" not found. Returning empty array.`
-      );
-      return [];
-    }
-    return historico; // retorna a referência direta; imutabilidade garantida pelo TypeScript (ReadonlyArray)
-  }
-
-  /**
-   * Remove todo o histórico de uma sessão, liberando a memória.
-   *
-   * @param sessionId - Identificador único da sessão a ser limpa.
-   */
-  async limparSessao(sessionId: string): Promise<void> {
-    const existed = this.sessions.has(sessionId);
-    this.sessions.delete(sessionId);
-
-    if (existed) {
-      this.logger.debug(
-        `[InMemorySessionManager] Session "${sessionId}" cleared.`
-      );
-    } else {
-      this.logger.debug(
-        `[InMemorySessionManager] Session "${sessionId}" not found for clearing (no-op).`
-      );
-    }
-  }
 }
 </file>
 
@@ -1808,6 +3058,84 @@ export class MockVectorStore<M = any> extends IVectorStore<M> {
     }
 
     return dotProduct / (magnitudeA * magnitudeB);
+  }
+}
+</file>
+
+<file path="src/infra/ToolRegistry.ts">
+/**
+ * @file ToolRegistry.ts
+ * @description Implementação concreta de IToolRegistry.
+ *              Gerencia o registro e consulta de ferramentas (ITool) em memória.
+ *              Segue o padrão Options Object para injeção de dependências.
+ *
+ *              Depende de abstrações (DIP): ILogger.
+ */
+
+import { IToolRegistry } from '../core/IToolRegistry.ts';
+import { ITool } from '../core/ITool.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+export interface ToolRegistryOptions {
+  /** Instância obrigatória de ILogger para logging estruturado */
+  logger: ILogger;
+}
+
+export class ToolRegistry extends IToolRegistry {
+  private readonly tools: Map<string, ITool>;
+  private readonly logger: ILogger;
+
+  /**
+   * @param options - Options Object (ToolRegistryOptions).
+   *                  Apenas `logger` é obrigatório.
+   */
+  constructor(options: ToolRegistryOptions) {
+    super();
+    this.logger = options.logger;
+    this.tools = new Map();
+  }
+
+  /**
+   * Registra uma ferramenta no registry.
+   * Lança erro se uma ferramenta com o mesmo nome já existir (colisão).
+   *
+   * @param tool - Instância concreta de ITool a ser registrada.
+   * @throws {Error} Se já existir uma ferramenta registrada com o mesmo nome.
+   */
+  registrar(tool: ITool): void {
+    const nome = tool.name;
+
+    if (this.tools.has(nome)) {
+      throw new Error(
+        `[ToolRegistry] Tool "${nome}" is already registered. Cannot register duplicate.`
+      );
+    }
+
+    this.tools.set(nome, tool);
+    this.logger.info(`[ToolRegistry] Tool registered: "${nome}"`);
+  }
+
+  /**
+   * Obtém uma ferramenta pelo nome único.
+   *
+   * @param nome - Nome único da ferramenta (case-sensitive).
+   * @returns A instância de ITool ou undefined se não encontrada.
+   */
+  obter(nome: string): ITool | undefined {
+    const tool = this.tools.get(nome);
+    if (!tool) {
+      this.logger.debug(`[ToolRegistry] Tool "${nome}" not found.`);
+    }
+    return tool;
+  }
+
+  /**
+   * Retorna todas as ferramentas registradas.
+   *
+   * @returns Array de ITool.
+   */
+  obterTodas(): ITool[] {
+    return Array.from(this.tools.values());
   }
 }
 </file>
@@ -2563,6 +3891,150 @@ export class NativeHttpServer extends IHttpServer {
 }
 </file>
 
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "outDir": "dist/",
+    "rootDir": "src/",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "sourceMap": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+}
+</file>
+
+<file path="src/infra/InMemorySessionManager.ts">
+/**
+ * @file InMemorySessionManager.ts
+ * @description Implementação concreta de ISessionManager utilizando
+ *              armazenamento em memória (Map<string, ChatMessage[]>).
+ *              - Depende da abstração ISessionManager, não o contrário (DIP).
+ *              - Logger injetado via construtor (Options Object).
+ *              - Suporta limite máximo de mensagens por sessão.
+ *              - Quando o limite é excedido, a mensagem não-system mais antiga é removida.
+ */
+
+import { ISessionManager } from '../core/ISessionManager.ts';
+import type { ChatMessage } from '../core/IMotorCognitivo.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+export interface InMemorySessionManagerOptions {
+  /** Instância obrigatória de ILogger para logging */
+  logger: ILogger;
+  /** Número máximo de mensagens por sessão. Quando excedido,
+   *  a mensagem não-system mais antiga é removida. Opcional. */
+  maxMessagesPerSession?: number;
+}
+
+export class InMemorySessionManager extends ISessionManager {
+  private readonly sessions: Map<string, ChatMessage[]>;
+  private readonly logger: ILogger;
+  private readonly maxMessagesPerSession: number;
+
+  /**
+   * @param options - Objeto de configuração (InMemorySessionManagerOptions).
+   *                  Apenas `logger` é obrigatório.
+   */
+  constructor(options: InMemorySessionManagerOptions) {
+    super();
+    this.logger = options.logger;
+    this.sessions = new Map();
+    this.maxMessagesPerSession = options.maxMessagesPerSession ?? 50;
+  }
+
+  /**
+   * Adiciona uma mensagem ao histórico de uma sessão.
+   * Se a sessão não existir, ela é criada automaticamente.
+   * Se o limite maxMessagesPerSession for excedido, a mensagem
+   * não-system mais antiga é removida antes da inserção.
+   *
+   * @param sessionId - Identificador único da sessão.
+   * @param mensagem  - Mensagem no formato ChatMessage a ser adicionada.
+   */
+  async adicionarMensagem(sessionId: string, mensagem: ChatMessage): Promise<void> {
+    // Cópia defensiva: evita que mutações externas corrompam o estado interno
+    const historico = [...(this.sessions.get(sessionId) ?? [])];
+
+    // Se atingiu o limite, remove a mensagem não-system mais antiga
+    if (historico.length >= this.maxMessagesPerSession) {
+      const indexToRemove = historico.findIndex((m) => m.role !== 'system');
+      if (indexToRemove !== -1) {
+        historico.splice(indexToRemove, 1);
+        this.logger.debug(
+          `[InMemorySessionManager] Session "${sessionId}" reached max limit. ` +
+          `Removed oldest non-system message.`
+        );
+      } else {
+        // Se todas as mensagens são system, remove a mais antiga (índice 0)
+        historico.shift();
+        this.logger.debug(
+          `[InMemorySessionManager] Session "${sessionId}" reached max limit. ` +
+          `All messages are system. Removed oldest message.`
+        );
+      }
+    }
+
+    historico.push(mensagem);
+    // Armazena uma cópia defensiva para isolar o estado interno
+    this.sessions.set(sessionId, [...historico]);
+
+    this.logger.debug(
+      `[InMemorySessionManager] Mensagem adicionada à sessão "${sessionId}". ` +
+      `Role: ${mensagem.role}, total messages: ${historico.length}`
+    );
+  }
+
+  /**
+   * Recupera o histórico completo de mensagens de uma sessão,
+   * na ordem em que foram adicionadas (da mais antiga para a mais recente).
+   *
+   * @param sessionId - Identificador único da sessão.
+   * @returns Array de mensagens no formato ChatMessage[].
+   */
+  async obterHistorico(sessionId: string): Promise<ReadonlyArray<ChatMessage>> {
+    const historico = this.sessions.get(sessionId);
+    if (!historico) {
+      this.logger.debug(
+        `[InMemorySessionManager] Session "${sessionId}" not found. Returning empty array.`
+      );
+      return [];
+    }
+    return [...historico]; // cópia defensiva para evitar corrupção acidental do estado interno
+  }
+
+  /**
+   * Remove todo o histórico de uma sessão, liberando a memória.
+   *
+   * @param sessionId - Identificador único da sessão a ser limpa.
+   */
+  async limparSessao(sessionId: string): Promise<void> {
+    const existed = this.sessions.has(sessionId);
+    this.sessions.delete(sessionId);
+
+    if (existed) {
+      this.logger.debug(
+        `[InMemorySessionManager] Session "${sessionId}" cleared.`
+      );
+    } else {
+      this.logger.debug(
+        `[InMemorySessionManager] Session "${sessionId}" not found for clearing (no-op).`
+      );
+    }
+  }
+}
+</file>
+
 <file path="src/infra/validateOllamaResponse.test.ts">
 /**
  * @file validateOllamaResponse.test.ts
@@ -2940,27 +4412,6 @@ describe('validateOllamaResponse (função pura) - /api/chat', () => {
 });
 </file>
 
-<file path="tsconfig.json">
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "outDir": "dist/",
-    "rootDir": "src/",
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "allowImportingTsExtensions": true,
-    "noEmit": true
-  },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist"]
-}
-</file>
-
 <file path="src/core/IMotorCognitivo.ts">
 /**
  * @file IMotorCognitivo.ts
@@ -3122,7 +4573,7 @@ export class CircuitBreaker extends ICircuitBreaker {
     }
   }
 
-  recordFailure(): void {
+  protected recordFailure(): void {
     this.failureCount++;
     this.lastFailureTime = Date.now();
 
@@ -3184,400 +4635,6 @@ export class CircuitBreaker extends ICircuitBreaker {
 
     this.logger.info(
       `[CircuitBreaker] State transition: ${oldState} -> ${newState}`
-    );
-  }
-}
-</file>
-
-<file path="src/infra/ConversationManager.ts">
-/**
- * @file ConversationManager.ts
- * @description Implementação do Maestro — orquestrador central que concretiza
- *              a Sprint 5.3 (Fusão de Contexto). Une a Memória Vetorial (RAG)
- *              e a Memória de Curto Prazo (Sessões) em um único fluxo.
- *
- *              A partir da Fase 6, implementa o ReAct/Tool Calling Loop:
- *              - Se um ToolRegistry for fornecido, expõe as ferramentas ao LLM.
- *              - Detecta tool_calls na resposta, executa as ferramentas localmente,
- *                realimenta o resultado e repete o ciclo até o LLM gerar a resposta final
- *                (máximo de 3 iterações por segurança).
- *
- *              Depende de abstrações (DIP): ILogger, IMotorCognitivo,
- *              ISessionManager, IToolRegistry (opcional) e IVectorStore (opcional).
- */
-
-import { IConversationManager } from '../core/IConversationManager.ts';
-import type { ChatMessage, IToolDefinition } from '../core/IMotorCognitivo.ts';
-import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
-import { ISessionManager } from '../core/ISessionManager.ts';
-import { IVectorStore } from '../core/IVectorStore.ts';
-import { ILogger } from '../core/ILogger.ts';
-import { IToolRegistry } from '../core/IToolRegistry.ts';
-
-export interface ConversationManagerOptions {
-  /** Instância obrigatória de ILogger para logging estruturado */
-  logger: ILogger;
-  /** Instância obrigatória do motor cognitivo (LLM) */
-  motor: IMotorCognitivo;
-  /** Instância obrigatória do gerenciador de sessões */
-  sessionManager: ISessionManager;
-  /** Instância opcional do Vector Store para RAG (Memória Vetorial).
-   *  Se não fornecida, o RAG é desabilitado. */
-  vectorStore?: IVectorStore;
-  /** Instância opcional do Tool Registry para Tool Calling.
-   *  Se não fornecida, o Tool Calling é desabilitado. */
-  toolRegistry?: IToolRegistry;
-  /** Nome do sistema SOBERANO para a mensagem de system prompt */
-  systemName?: string;
-  /** Número máximo de iterações do Tool Calling Loop (segurança anti-loop infinito).
-   *  Padrão: 3 */
-  maxToolIterations?: number;
-}
-
-export class ConversationManager extends IConversationManager {
-  private readonly logger: ILogger;
-  private readonly motor: IMotorCognitivo;
-  private readonly sessionManager: ISessionManager;
-  private readonly vectorStore?: IVectorStore;
-  private readonly toolRegistry?: IToolRegistry;
-  private readonly systemName: string;
-  private readonly maxToolIterations: number;
-
-  /**
-   * @param options - Options Object (ConversationManagerOptions).
-   *                  Apenas `logger`, `motor` e `sessionManager` são obrigatórios.
-   */
-  constructor(options: ConversationManagerOptions) {
-    super();
-    this.logger = options.logger;
-    this.motor = options.motor;
-    this.sessionManager = options.sessionManager;
-    this.vectorStore = options.vectorStore;
-    this.toolRegistry = options.toolRegistry;
-    this.systemName = options.systemName ?? 'SOBERANO';
-    this.maxToolIterations = options.maxToolIterations ?? 3;
-  }
-
-  /**
-   * Gera um embedding heurístico simples a partir de um texto.
-   * Cada palavra contribui com uma dimensão baseada no hash do caractere.
-   * Isso permite buscas no VectorStore mesmo sem um provedor de embeddings real.
-   *
-   * @param text - Texto a ser convertido em vetor
-   * @returns Vetor numérico de 10 dimensões
-   */
-  private gerarEmbeddingHeuristico(text: string): number[] {
-    const words = text.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
-    const dimensions = 10;
-    const vector = new Array(dimensions).fill(0);
-
-    for (let i = 0; i < words.length; i++) {
-      const word = words[i] as string;
-      for (let j = 0; j < word.length; j++) {
-        const dim = j % dimensions;
-        vector[dim] = (vector[dim] as number) + (word.charCodeAt(j) % 10) + 1;
-      }
-    }
-
-    // Normaliza para evitar valores muito grandes
-    const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
-    if (magnitude > 0) {
-      for (let i = 0; i < dimensions; i++) {
-        vector[i] = (vector[i] as number) / magnitude;
-      }
-    }
-
-    return vector;
-  }
-
-  /**
-   * Processa uma interação completa de conversa multi-turno com RAG e Tool Calling.
-   *
-   * Fluxo:
-   * 1. Guarda inputUsuario no SessionManager (role: user).
-   * 2. Se IVectorStore existir, gera embedding heurístico e busca contextos similares.
-   * 3. Obtém o histórico atualizado do SessionManager.
-   * 4. Constrói mensagem system fundindo regras do SOBERANO com documentos recuperados.
-   * 5. Se ToolRegistry existir, obtém definições das ferramentas para expor ao LLM.
-   * 6. Chama o motor cognitivo com as definições de ferramentas.
-   * 7. Executa o ReAct/Tool Calling Loop (se houver tool_calls).
-   * 8. Quando não houver mais tool_calls, guarda e retorna a resposta final.
-   *
-   * @param sessionId    - Identificador único da sessão.
-   * @param inputUsuario - Texto de entrada do usuário.
-   * @returns A resposta gerada pelo motor cognitivo.
-   */
-  async conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string> {
-    this.logger.info(
-      `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
-    );
-
-    // --- Passo 1: Guarda o input do usuário na sessão ---
-    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
-    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
-    this.logger.debug('[ConversationManager] User message saved to session.');
-
-    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
-    let documentosRecuperados: string[] = [];
-    if (this.vectorStore) {
-      try {
-        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
-        this.logger.debug(
-          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
-        );
-
-        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
-
-        if (resultados.length > 0) {
-          documentosRecuperados = resultados.map((r) => {
-            const metadata = r.metadata as Record<string, unknown>;
-            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
-          });
-          this.logger.info(
-            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
-          );
-        } else {
-          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
-        }
-      } catch (ragError) {
-        this.logger.error(
-          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
-        );
-        throw ragError;
-      }
-    } else {
-      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
-    }
-
-    // --- Passo 3: Obtém o histórico completo da sessão ---
-    const historico = await this.sessionManager.obterHistorico(sessionId);
-    this.logger.debug(
-      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
-    );
-
-    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
-    let systemContent =
-      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
-      `Responda em Português do Brasil de forma clara e objetiva. ` +
-      `Mantenha o contexto da conversa ao responder.`;
-
-    if (documentosRecuperados.length > 0) {
-      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
-      systemContent +=
-        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
-        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
-        `mas não invente informações que não estejam presentes.`;
-    }
-
-    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
-
-    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
-    const historicoFiltrado = historico.filter(m => m.role !== 'system');
-
-    // --- Passo 5: Obtém definições das ferramentas se ToolRegistry estiver disponível ---
-    let toolDefinitions: IToolDefinition[] | undefined = undefined;
-    if (this.toolRegistry) {
-      const ferramentas = this.toolRegistry.obterTodas();
-      if (ferramentas.length > 0) {
-        toolDefinitions = ferramentas.map((f) => f.getDefinition());
-        this.logger.info(
-          `[ConversationManager] Exposing ${toolDefinitions.length} tool(s) to cognitive engine: ` +
-          ferramentas.map((f) => `"${f.name}"`).join(', ')
-        );
-      } else {
-        this.logger.debug('[ConversationManager] ToolRegistry has no tools registered.');
-      }
-    } else {
-      this.logger.debug('[ConversationManager] No ToolRegistry configured. Tool Calling disabled.');
-    }
-
-    // Monta array inicial de mensagens para enviar ao motor
-    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
-
-    this.logger.info(
-      `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +
-      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'})` +
-      (toolDefinitions ? ` with ${toolDefinitions.length} tool(s)` : '.')
-    );
-
-    // --- Passo 6: Executa o ReAct/Tool Calling Loop ---
-    const respostaFinal = await this.executarToolLoop(
-      sessionId,
-      mensagensParaMotor,
-      toolDefinitions,
-      0,
-      signal
-    );
-
-    return respostaFinal;
-  }
-
-  /**
-   * Executa o ReAct/Tool Calling Loop recursivo.
-   *
-   * 1. Envia as mensagens (com tool definitions, se for a primeira chamada) ao motor.
-   * 2. Se a resposta contiver tool_calls:
-   *    a. Guarda a mensagem do assistant (com tool_calls) no SessionManager.
-   *    b. Itera sobre cada tool_call, executa ou cria erro simulado.
-   *    c. Cria mensagens tool com os resultados e guarda no SessionManager.
-   *    d. Rechama recursivamente SEM tool definitions para o LLM processar os resultados.
-   * 3. Se não houver tool_calls, guarda a resposta final e retorna.
-   *
-   * @param sessionId      - Identificador da sessão.
-   * @param mensagens      - Array de mensagens para enviar ao motor.
-   * @param toolDefinitions - Definições de ferramentas (opcional, apenas na 1ª chamada).
-   * @param depth          - Profundidade atual do loop (controle anti-loop infinito).
-   * @returns O texto da resposta final do assistente.
-   */
-  private async executarToolLoop(
-    sessionId: string,
-    mensagens: ChatMessage[],
-    toolDefinitions?: IToolDefinition[],
-    depth: number = 0,
-    signal?: AbortSignal
-  ): Promise<string> {
-    if (depth >= this.maxToolIterations) {
-      this.logger.warn(
-        `[ConversationManager] Tool loop reached maximum depth (${this.maxToolIterations}). ` +
-        `Returning safe fallback message.`
-      );
-
-      // Fallback seguro: busca a última mensagem assistant no SessionManager
-      // Se não encontrar, retorna mensagem limpa informando o corte da execução
-      const historico = await this.sessionManager.obterHistorico(sessionId);
-      const ultimaAssistant = historico.filter(m => m.role === 'assistant').pop();
-      if (ultimaAssistant && ultimaAssistant.content) {
-        return ultimaAssistant.content;
-      }
-
-      const fallbackMsg = '[SOBERANO] Limite de iterações de ferramentas atingido. A execução foi interrompida para garantir estabilidade.';
-      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
-      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
-      return fallbackMsg;
-    }
-
-    // --- Passo A: Envia as mensagens ao motor ---
-    // Propaga o AbortSignal externo para o motor cognitivo
-    if (signal) {
-      this.motor.setAbortSignal(signal);
-    }
-    const respostaMessage = await this.motor.gerarResposta(mensagens, toolDefinitions);
-
-    // --- Passo B: Verifica se a resposta contém tool_calls ---
-    const hasToolCalls = respostaMessage.tool_calls && respostaMessage.tool_calls.length > 0;
-
-    if (!hasToolCalls) {
-      // --- Passo E: Sem tool_calls — guarda e retorna resposta final ---
-      const respostaContent = respostaMessage.content;
-      const mensagemAssistant: ChatMessage = { role: 'assistant', content: respostaContent };
-      await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
-
-      this.logger.info(
-        `[ConversationManager] Final assistant response (depth ${depth}). ` +
-        `Response length: ${respostaContent.length} chars.`
-      );
-
-      return respostaContent;
-    }
-
-    // --- Passo C: Resposta contém tool_calls — processa ---
-    this.logger.info(
-      `[ConversationManager] Tool calls detected (depth ${depth}): ` +
-      `${respostaMessage.tool_calls!.length} tool call(s).`
-    );
-
-    // Guarda a mensagem do assistant contendo o pedido das ferramentas (crucial para contexto da LLM)
-    await this.sessionManager.adicionarMensagem(sessionId, respostaMessage);
-    this.logger.debug('[ConversationManager] Assistant message with tool_calls saved to session.');
-
-    // Itera sobre cada tool_call
-    const toolResultMessages: ChatMessage[] = [];
-
-    for (let i = 0; i < respostaMessage.tool_calls!.length; i++) {
-      const toolCall = respostaMessage.tool_calls![i] as {
-        id: string;
-        function: { name: string; arguments: Record<string, any> };
-      };
-      const toolName = toolCall.function.name;
-      const toolArgs = toolCall.function.arguments;
-      // Extrai o tool_call_id real emitido pelo LLM. O campo `id` foi validado
-      // e extraído durante o parse da resposta em OllamaProvider.
-      const toolCallId = toolCall.id;
-
-      this.logger.info(
-        `[ConversationManager] Executing tool "${toolName}" ` +
-        `with arguments: ${JSON.stringify(toolArgs)}`
-      );
-
-      let resultado: any;
-
-      if (this.toolRegistry) {
-        const ferramenta = this.toolRegistry.obter(toolName);
-
-        if (ferramenta) {
-          try {
-            resultado = await ferramenta.execute(toolArgs);
-            this.logger.info(
-              `[ConversationManager] Tool "${toolName}" executed successfully. ` +
-              `Result: ${JSON.stringify(resultado)}`
-            );
-          } catch (execError) {
-            const errorMsg = execError instanceof Error ? execError.message : String(execError);
-            this.logger.error(
-              `[ConversationManager] Tool "${toolName}" execution failed: ${errorMsg}`
-            );
-            resultado = { error: `Tool execution failed: ${errorMsg}` };
-          }
-        } else {
-          // Ferramenta não encontrada no registry
-          this.logger.error(
-            `[ConversationManager] Tool "${toolName}" not found in registry. ` +
-            `Available tools: ${this.toolRegistry.obterTodas().map((t) => `"${t.name}"`).join(', ')}`
-          );
-          resultado = { error: `Tool "${toolName}" not found. Available tools: ${this.toolRegistry.obterTodas().map((t) => t.name).join(', ')}` };
-        }
-      } else {
-        // ToolRegistry não configurado — cria mensagem de erro simulando a ferramenta
-        this.logger.warn(
-          `[ConversationManager] Tool "${toolName}" called but no ToolRegistry configured. ` +
-          `Returning simulated error.`
-        );
-        resultado = { error: `Tool "${toolName}" não está disponível porque nenhum ToolRegistry foi configurado.` };
-      }
-
-      // Cria uma ChatMessage com role: 'tool' contendo o resultado da execução em JSON
-      const toolResultMessage: ChatMessage = {
-        role: 'tool',
-        content: JSON.stringify(resultado),
-        tool_call_id: toolCallId,
-      };
-
-      // Adiciona ao array de resultados e guarda na sessão
-      toolResultMessages.push(toolResultMessage);
-      await this.sessionManager.adicionarMensagem(sessionId, toolResultMessage);
-      this.logger.debug(
-        `[ConversationManager] Tool result message saved for "${toolName}" (tool_call_id: ${toolCallId}).`
-      );
-    }
-
-    // --- Passo D: Rechama o motor com o histórico atualizado (sem tool definitions) ---
-    // Busca o histórico completo do SessionManager, que já contém a mensagem assistant
-    // com tool_calls e os tool results salvos nos passos anteriores (single source of truth).
-    // Isso elimina a duplicação: a mensagem NÃO é incluída manualmente no array de recursão.
-    const historicoAtualizado = await this.sessionManager.obterHistorico(sessionId);
-    const mensagensComResultados: ChatMessage[] = [mensagens[0]!, ...historicoAtualizado.filter(m => m.role !== 'system')];
-
-    this.logger.info(
-      `[ConversationManager] Re-invoking cognitive engine (depth ${depth + 1}) with updated context.`
-    );
-
-    // Chama recursivamente o loop SEM tool definitions (apenas para processar o resultado da ferramenta)
-    return this.executarToolLoop(
-      sessionId,
-      mensagensComResultados,
-      undefined, // Sem tool definitions na recursão
-      depth + 1,
-      signal
     );
   }
 }
@@ -3803,15 +4860,17 @@ describe('CircuitBreaker', () => {
     });
   });
 
-  describe('recordFailure e reset', () => {
-    it('recordFailure deve incrementar contagem e abrir ao atingir threshold', () => {
+  describe('execute e reset - contagem de falhas e recuperação', () => {
+    it('execute com falha deve incrementar contagem e abrir ao atingir threshold', async () => {
       const logger = new MockLogger();
       const cb = new CircuitBreaker({ logger, failureThreshold: 2, openTimeoutMs: 30_000 });
 
-      cb.recordFailure();
+      const failingFn = () => Promise.reject(new Error('Falha simulada'));
+
+      await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.CLOSED);
 
-      cb.recordFailure();
+      await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
     });
 
@@ -3900,6 +4959,91 @@ describe('OllamaProvider', () => {
 
   afterEach(() => {
     fetchMock?.mock.restore();
+  });
+
+  describe('gerarRespostaStream', () => {
+    it('deve produzir chunks de texto a partir de um stream NDJSON', async () => {
+      const mockLogger = new MockLogger();
+
+      // Simula resposta NDJSON do Ollama (cada linha é um JSON com { message: { content: "..." } })
+      const ndjsonResponse = [
+        JSON.stringify({ message: { content: 'Olá' } }),
+        JSON.stringify({ message: { content: ', ' } }),
+        JSON.stringify({ message: { content: 'mundo!' } }),
+        JSON.stringify({ message: { content: '' }, done: true }),
+      ].join('\n');
+
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(ndjsonResponse));
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'application/x-ndjson' },
+        });
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
+
+      const chunks: string[] = [];
+      for await (const chunk of provider.gerarRespostaStream([{ role: 'user', content: 'teste' }])) {
+        chunks.push(chunk);
+      }
+
+      assert.deepStrictEqual(chunks, ['Olá', ', ', 'mundo!']);
+    });
+
+    it('deve lançar erro HTTP quando resposta não for ok no stream', async () => {
+      const mockLogger = new MockLogger();
+
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        return new Response('Not Found', { status: 404 });
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
+
+      await assert.rejects(
+        async () => {
+          for await (const _ of provider.gerarRespostaStream([{ role: 'user', content: 'teste' }])) {
+            // should not yield
+          }
+        },
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('HTTP error 404'));
+          }
+          return true;
+        }
+      );
+    });
+
+    it('deve rejeitar imediatamente com AbortError se sinal já estiver abortado', async () => {
+      const mockLogger = new MockLogger();
+
+      // Um sinal já abortado deve fazer o fetch falhar imediatamente
+      const ac = new AbortController();
+      ac.abort();
+
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        throw new Error('fetch should not be called with pre-aborted signal');
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
+
+      await assert.rejects(
+        async () => {
+          for await (const _ of provider.gerarRespostaStream([{ role: 'user', content: 'teste' }], undefined, ac.signal)) {
+            // should not yield
+          }
+        }
+      );
+    });
   });
 
   describe('Chamada fetch - gerarResposta', () => {
@@ -4045,29 +5189,433 @@ describe('OllamaProvider', () => {
 });
 </file>
 
-<file path="package.json">
-{
-  "name": "soberano",
-  "version": "0.6.4",
-  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
-  "type": "module",
-  "scripts": {
-    "start": "node --experimental-transform-types src/main.ts",
-    "test": "node --experimental-transform-types --test src/infra/*.test.ts src/infra/tools/*.test.ts",
-    "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
-    "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
-    "test:file": "node --experimental-transform-types src/infra/FileSensor.test.ts",
-    "test:http": "node --experimental-transform-types --test src/infra/NativeHttpServer.test.ts",
-    "typecheck": "tsc --noEmit"
-  },
-  "keywords": [
-    "soberano",
-    "llm",
-    "ollama"
-  ],
-  "license": "MIT",
-  "devDependencies": {
-    "typescript": "^6.0.3"
+<file path="src/infra/ConversationManager.ts">
+/**
+ * @file ConversationManager.ts
+ * @description Implementação do Maestro — orquestrador central que concretiza
+ *              a Sprint 5.3 (Fusão de Contexto). Une a Memória Vetorial (RAG)
+ *              e a Memória de Curto Prazo (Sessões) em um único fluxo.
+ *
+ *              A partir da Fase 6, implementa o ReAct/Tool Calling Loop:
+ *              - Se um ToolRegistry for fornecido, expõe as ferramentas ao LLM.
+ *              - Detecta tool_calls na resposta, executa as ferramentas localmente,
+ *                realimenta o resultado e repete o ciclo até o LLM gerar a resposta final
+ *                (máximo de 3 iterações por segurança).
+ *
+ *              Depende de abstrações (DIP): ILogger, IMotorCognitivo,
+ *              ISessionManager, IToolRegistry (opcional) e IVectorStore (opcional).
+ */
+
+import { IConversationManager } from '../core/IConversationManager.ts';
+import type { ChatMessage, IToolDefinition } from '../core/IMotorCognitivo.ts';
+import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
+import { ISessionManager } from '../core/ISessionManager.ts';
+import { IVectorStore } from '../core/IVectorStore.ts';
+import { ILogger } from '../core/ILogger.ts';
+import { IToolRegistry } from '../core/IToolRegistry.ts';
+
+export interface ConversationManagerOptions {
+  /** Instância obrigatória de ILogger para logging estruturado */
+  logger: ILogger;
+  /** Instância obrigatória do motor cognitivo (LLM) */
+  motor: IMotorCognitivo;
+  /** Instância obrigatória do gerenciador de sessões */
+  sessionManager: ISessionManager;
+  /** Instância opcional do Vector Store para RAG (Memória Vetorial).
+   *  Se não fornecida, o RAG é desabilitado. */
+  vectorStore?: IVectorStore;
+  /** Instância opcional do Tool Registry para Tool Calling.
+   *  Se não fornecida, o Tool Calling é desabilitado. */
+  toolRegistry?: IToolRegistry;
+  /** Nome do sistema SOBERANO para a mensagem de system prompt */
+  systemName?: string;
+  /** Número máximo de iterações do Tool Calling Loop (segurança anti-loop infinito).
+   *  Padrão: 3 */
+  maxToolIterations?: number;
+}
+
+export class ConversationManager extends IConversationManager {
+  private readonly logger: ILogger;
+  private readonly motor: IMotorCognitivo;
+  private readonly sessionManager: ISessionManager;
+  private readonly vectorStore?: IVectorStore;
+  private readonly toolRegistry?: IToolRegistry;
+  private readonly systemName: string;
+  private readonly maxToolIterations: number;
+
+  /**
+   * @param options - Options Object (ConversationManagerOptions).
+   *                  Apenas `logger`, `motor` e `sessionManager` são obrigatórios.
+   */
+  constructor(options: ConversationManagerOptions) {
+    super();
+    this.logger = options.logger;
+    this.motor = options.motor;
+    this.sessionManager = options.sessionManager;
+    this.vectorStore = options.vectorStore;
+    this.toolRegistry = options.toolRegistry;
+    this.systemName = options.systemName ?? 'SOBERANO';
+    this.maxToolIterations = options.maxToolIterations ?? 3;
+  }
+
+  /**
+   * Gera um embedding heurístico simples a partir de um texto.
+   * Cada palavra contribui com uma dimensão baseada no hash do caractere.
+   * Isso permite buscas no VectorStore mesmo sem um provedor de embeddings real.
+   *
+   * @param text - Texto a ser convertido em vetor
+   * @returns Vetor numérico de 10 dimensões
+   */
+  private gerarEmbeddingHeuristico(text: string): number[] {
+    const words = text.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
+    const dimensions = 10;
+    const vector = new Array(dimensions).fill(0);
+
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i] as string;
+      for (let j = 0; j < word.length; j++) {
+        const dim = j % dimensions;
+        vector[dim] = (vector[dim] as number) + (word.charCodeAt(j) % 10) + 1;
+      }
+    }
+
+    // Normaliza para evitar valores muito grandes
+    const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
+    if (magnitude > 0) {
+      for (let i = 0; i < dimensions; i++) {
+        vector[i] = (vector[i] as number) / magnitude;
+      }
+    }
+
+    return vector;
+  }
+
+  /**
+   * Processa uma interação completa de conversa multi-turno com RAG e Tool Calling.
+   *
+   * Fluxo:
+   * 1. Guarda inputUsuario no SessionManager (role: user).
+   * 2. Se IVectorStore existir, gera embedding heurístico e busca contextos similares.
+   * 3. Obtém o histórico atualizado do SessionManager.
+   * 4. Constrói mensagem system fundindo regras do SOBERANO com documentos recuperados.
+   * 5. Se ToolRegistry existir, obtém definições das ferramentas para expor ao LLM.
+   * 6. Chama o motor cognitivo com as definições de ferramentas.
+   * 7. Executa o ReAct/Tool Calling Loop (se houver tool_calls).
+   * 8. Quando não houver mais tool_calls, guarda e retorna a resposta final.
+   *
+   * @param sessionId    - Identificador único da sessão.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @returns A resposta gerada pelo motor cognitivo.
+   */
+  async conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string> {
+    this.logger.info(
+      `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
+    );
+
+    // --- Guard: valida entrada vazia ---
+    if (inputUsuario.length === 0) {
+      const fallbackMsg = '[SOBERANO] Nenhuma mensagem foi fornecida. Por favor, digite algo para conversarmos.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      this.logger.warn(
+        `[ConversationManager] Empty input received for session "${sessionId}". Returned fallback.`
+      );
+      return fallbackMsg;
+    }
+
+    // --- Passo 1: Guarda o input do usuário na sessão ---
+    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
+    this.logger.debug('[ConversationManager] User message saved to session.');
+
+    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
+    let documentosRecuperados: string[] = [];
+    if (this.vectorStore) {
+      try {
+        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
+        this.logger.debug(
+          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
+        );
+
+        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
+
+        if (resultados.length > 0) {
+          documentosRecuperados = resultados.map((r) => {
+            const metadata = r.metadata as Record<string, unknown>;
+            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
+          });
+          this.logger.info(
+            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
+          );
+        } else {
+          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
+        }
+      } catch (ragError) {
+        this.logger.error(
+          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
+        );
+        // RAG failure is non-fatal — conversation continues without retrieved context.
+        // The error was already logged above for diagnostics.
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
+    }
+
+    // --- Passo 3: Obtém o histórico completo da sessão ---
+    const historico = await this.sessionManager.obterHistorico(sessionId);
+    this.logger.debug(
+      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
+    );
+
+    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
+    let systemContent =
+      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
+      `Responda em Português do Brasil de forma clara e objetiva. ` +
+      `Mantenha o contexto da conversa ao responder.`;
+
+    if (documentosRecuperados.length > 0) {
+      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
+      systemContent +=
+        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
+        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
+        `mas não invente informações que não estejam presentes.`;
+    }
+
+    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
+
+    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
+    const historicoFiltrado = historico.filter(m => m.role !== 'system');
+
+    // --- Passo 5: Obtém definições das ferramentas se ToolRegistry estiver disponível ---
+    let toolDefinitions: IToolDefinition[] | undefined = undefined;
+    if (this.toolRegistry) {
+      const ferramentas = this.toolRegistry.obterTodas();
+      if (ferramentas.length > 0) {
+        toolDefinitions = ferramentas.map((f) => f.getDefinition());
+        this.logger.info(
+          `[ConversationManager] Exposing ${toolDefinitions.length} tool(s) to cognitive engine: ` +
+          ferramentas.map((f) => `"${f.name}"`).join(', ')
+        );
+      } else {
+        this.logger.debug('[ConversationManager] ToolRegistry has no tools registered.');
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No ToolRegistry configured. Tool Calling disabled.');
+    }
+
+    // Monta array inicial de mensagens para enviar ao motor
+    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
+
+    this.logger.info(
+      `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +
+      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'})` +
+      (toolDefinitions ? ` with ${toolDefinitions.length} tool(s)` : '.')
+    );
+
+    // --- Passo 6: Executa o ReAct/Tool Calling Loop ---
+    const respostaFinal = await this.executarToolLoop(
+      sessionId,
+      mensagensParaMotor,
+      toolDefinitions,
+      0,
+      signal
+    );
+
+    return respostaFinal;
+  }
+
+  /**
+   * Executa o ReAct/Tool Calling Loop recursivo.
+   *
+   * 1. Envia as mensagens (com tool definitions, se for a primeira chamada) ao motor.
+   * 2. Se a resposta contiver tool_calls:
+   *    a. Guarda a mensagem do assistant (com tool_calls) no SessionManager.
+   *    b. Itera sobre cada tool_call, executa ou cria erro simulado.
+   *    c. Cria mensagens tool com os resultados e guarda no SessionManager.
+   *    d. Rechama recursivamente SEM tool definitions para o LLM processar os resultados.
+   * 3. Se não houver tool_calls, guarda a resposta final e retorna.
+   *
+   * @param sessionId      - Identificador da sessão.
+   * @param mensagens      - Array de mensagens para enviar ao motor.
+   * @param toolDefinitions - Definições de ferramentas (opcional, apenas na 1ª chamada).
+   * @param depth          - Profundidade atual do loop (controle anti-loop infinito).
+   * @returns O texto da resposta final do assistente.
+   */
+  private async executarToolLoop(
+    sessionId: string,
+    mensagens: ChatMessage[],
+    toolDefinitions?: IToolDefinition[],
+    depth: number = 0,
+    signal?: AbortSignal
+  ): Promise<string> {
+    // --- Guard: valida se o array de mensagens é válido antes de qualquer acesso indexado ---
+    if (!mensagens || mensagens.length === 0) {
+      this.logger.warn(
+        `[ConversationManager] Tool loop called with empty or null messages array (depth ${depth}, session "${sessionId}"). Returning fallback.`
+      );
+      const fallbackMsg = '[SOBERANO] Erro interno: estado de conversa inválido. A operação foi interrompida para garantir estabilidade.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      return fallbackMsg;
+    }
+
+    if (depth >= this.maxToolIterations) {
+      this.logger.warn(
+        `[ConversationManager] Tool loop reached maximum depth (${this.maxToolIterations}). ` +
+        `Returning safe fallback message.`
+      );
+
+      // Fallback seguro: busca no histórico a última mensagem assistant com conteúdo
+      // textual não vazio (edge case: content pode ser "" quando só há tool_calls)
+      const historico = await this.sessionManager.obterHistorico(sessionId);
+      const mensagensAssistant = historico.filter(m => m.role === 'assistant');
+      for (let i = mensagensAssistant.length - 1; i >= 0; i--) {
+        const msg = mensagensAssistant[i]!;
+        if (msg.content && msg.content.length > 0) {
+          return msg.content;
+        }
+      }
+
+      // Nenhuma mensagem assistant com conteúdo encontrada — retorna fallback genérico
+      const fallbackMsg = '[SOBERANO] Limite de iterações de ferramentas atingido. A execução foi interrompida para garantir estabilidade.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      return fallbackMsg;
+    }
+
+    // --- Passo A: Envia as mensagens ao motor ---
+    // Propaga o AbortSignal externo para o motor cognitivo
+    if (signal) {
+      this.motor.setAbortSignal(signal);
+    }
+    const respostaMessage = await this.motor.gerarResposta(mensagens, toolDefinitions);
+
+    // --- Passo B: Verifica se a resposta contém tool_calls ---
+    const hasToolCalls = respostaMessage.tool_calls && respostaMessage.tool_calls.length > 0;
+
+    if (!hasToolCalls) {
+      // --- Passo E: Sem tool_calls — guarda e retorna resposta final ---
+      const respostaContent = respostaMessage.content;
+      const mensagemAssistant: ChatMessage = { role: 'assistant', content: respostaContent };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
+
+      this.logger.info(
+        `[ConversationManager] Final assistant response (depth ${depth}). ` +
+        `Response length: ${respostaContent.length} chars.`
+      );
+
+      return respostaContent;
+    }
+
+    // --- Passo C: Resposta contém tool_calls — processa ---
+    this.logger.info(
+      `[ConversationManager] Tool calls detected (depth ${depth}): ` +
+      `${respostaMessage.tool_calls!.length} tool call(s).`
+    );
+
+    // Guarda a mensagem do assistant contendo o pedido das ferramentas (crucial para contexto da LLM)
+    await this.sessionManager.adicionarMensagem(sessionId, respostaMessage);
+    this.logger.debug('[ConversationManager] Assistant message with tool_calls saved to session.');
+
+    // Itera sobre cada tool_call
+    const toolResultMessages: ChatMessage[] = [];
+
+    for (let i = 0; i < respostaMessage.tool_calls!.length; i++) {
+      const toolCall = respostaMessage.tool_calls![i] as {
+        id: string;
+        function: { name: string; arguments: Record<string, any> };
+      };
+      const toolName = toolCall.function.name;
+      const toolArgs = toolCall.function.arguments;
+      // Extrai o tool_call_id real emitido pelo LLM. O campo `id` foi validado
+      // e extraído durante o parse da resposta em OllamaProvider.
+      const toolCallId = toolCall.id;
+
+      this.logger.info(
+        `[ConversationManager] Executing tool "${toolName}" ` +
+        `with arguments: ${JSON.stringify(toolArgs)}`
+      );
+
+      let resultado: any;
+
+      if (this.toolRegistry) {
+        const ferramenta = this.toolRegistry.obter(toolName);
+
+        if (ferramenta) {
+          try {
+            resultado = await ferramenta.execute(toolArgs);
+            this.logger.info(
+              `[ConversationManager] Tool "${toolName}" executed successfully. ` +
+              `Result: ${JSON.stringify(resultado)}`
+            );
+          } catch (execError) {
+            const errorMsg = execError instanceof Error ? execError.message : String(execError);
+            this.logger.error(
+              `[ConversationManager] Tool "${toolName}" execution failed: ${errorMsg}`
+            );
+            resultado = { error: `Tool execution failed: ${errorMsg}` };
+          }
+        } else {
+          // Ferramenta não encontrada no registry
+          this.logger.error(
+            `[ConversationManager] Tool "${toolName}" not found in registry. ` +
+            `Available tools: ${this.toolRegistry.obterTodas().map((t) => `"${t.name}"`).join(', ')}`
+          );
+          resultado = { error: `Tool "${toolName}" not found. Available tools: ${this.toolRegistry.obterTodas().map((t) => t.name).join(', ')}` };
+        }
+      } else {
+        // ToolRegistry não configurado — cria mensagem de erro simulando a ferramenta
+        this.logger.warn(
+          `[ConversationManager] Tool "${toolName}" called but no ToolRegistry configured. ` +
+          `Returning simulated error.`
+        );
+        resultado = { error: `Tool "${toolName}" não está disponível porque nenhum ToolRegistry foi configurado.` };
+      }
+
+      // Cria uma ChatMessage com role: 'tool' contendo o resultado da execução em JSON
+      const toolResultMessage: ChatMessage = {
+        role: 'tool',
+        content: JSON.stringify(resultado),
+        tool_call_id: toolCallId,
+      };
+
+      // Adiciona ao array de resultados e guarda na sessão
+      toolResultMessages.push(toolResultMessage);
+      await this.sessionManager.adicionarMensagem(sessionId, toolResultMessage);
+      this.logger.debug(
+        `[ConversationManager] Tool result message saved for "${toolName}" (tool_call_id: ${toolCallId}).`
+      );
+    }
+
+    // --- Passo D: Rechama o motor com o histórico atualizado (sem tool definitions) ---
+    // Busca o histórico completo do SessionManager, que já contém a mensagem assistant
+    // com tool_calls e os tool results salvos nos passos anteriores (single source of truth).
+    // Isso elimina a duplicação: a mensagem NÃO é incluída manualmente no array de recursão.
+    const historicoAtualizado = await this.sessionManager.obterHistorico(sessionId);
+
+    // Guard defensive para o índice [0] — protege contra acesso inseguro (non-null assertion)
+    const primeiraMensagem = mensagens[0];
+    if (!primeiraMensagem) {
+      const fallbackMsg = '[SOBERANO] Erro interno: mensagem de sistema inválida no loop de ferramentas. A operação foi interrompida.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      return fallbackMsg;
+    }
+
+    const mensagensComResultados: ChatMessage[] = [primeiraMensagem, ...historicoAtualizado.filter(m => m.role !== 'system')];
+
+    this.logger.info(
+      `[ConversationManager] Re-invoking cognitive engine (depth ${depth + 1}) with updated context.`
+    );
+
+    // Chama recursivamente o loop SEM tool definitions (apenas para processar o resultado da ferramenta)
+    return this.executarToolLoop(
+      sessionId,
+      mensagensComResultados,
+      undefined, // Sem tool definitions na recursão
+      depth + 1,
+      signal
+    );
   }
 }
 </file>
@@ -4625,12 +6173,49 @@ export class OllamaProvider extends IMotorCognitivo {
 }
 </file>
 
+<file path="package.json">
+{
+  "name": "soberano",
+  "version": "0.7.0",
+  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez - Fase 7: Electron Desktop",
+  "type": "module",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "start": "node --experimental-transform-types src/main-cli.ts",
+    "build": "tsc && cp -r src/renderer dist/ && cp -r src/preload dist/",
+    "start:desktop": "npm run build && electron dist/main/main.js",
+    "test": "node --experimental-transform-types --test src/infra/*.test.ts src/infra/tools/*.test.ts",
+    "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
+    "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
+    "test:file": "node --experimental-transform-types src/infra/FileSensor.test.ts",
+    "test:http": "node --experimental-transform-types --test src/infra/NativeHttpServer.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "soberano",
+    "llm",
+    "ollama",
+    "electron",
+    "desktop"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^42.1.0",
+    "tsx": "^4.22.0",
+    "typescript": "^6.0.3"
+  }
+}
+</file>
+
 <file path="src/env.d.ts">
 /**
- * @file env.d.ts
- * @description Declarações de tipos mínimas para APIs nativas do Node.js.
- *              Necessário porque não podemos instalar @types/node (zero dependências externas).
- *              Apenas o essencial para eliminar erros de TypeScript no VS Code.
+* @file env.d.ts
+ * @description Declarações de tipos mínimas para APIs nativas do Node.js e Electron.
+ *              Necessário porque não podemos instalar @types/node nem @types/electron
+ *              (zero dependências externas). Apenas o essencial para eliminar erros
+ *              de TypeScript no VS Code.
+ *
+ *              Versão: 0.7.0 — Adicionados tipos Electron para IPC e Main Process.
  */
 
 // Buffer global (necessário para node:fs/promises overloads)
@@ -4638,6 +6223,12 @@ declare class Buffer {
   length: number;
   static from(data: string, encoding?: string): Buffer;
   toString(encoding?: string): string;
+}
+
+// TextDecoder (necessário para streaming de respostas do Ollama)
+declare class TextDecoder {
+  constructor(label?: string);
+  decode(input?: BufferSource, options?: { stream: boolean }): string;
 }
 
 // Process global
@@ -4672,6 +6263,80 @@ declare function setTimeout(
   ...args: unknown[]
 ): ReturnType<typeof setTimeout>;
 declare function clearTimeout(timeoutId: ReturnType<typeof setTimeout> | undefined): void;
+
+// === ELECTRON TYPES (mínimos para IPC Bridge) ===
+
+declare module 'electron' {
+  export interface BrowserWindowConstructorOptions {
+    width?: number;
+    height?: number;
+    title?: string;
+    webPreferences?: {
+      preload?: string;
+      contextIsolation?: boolean;
+      nodeIntegration?: boolean;
+    };
+  }
+
+  export class BrowserWindow {
+    constructor(options?: BrowserWindowConstructorOptions);
+    loadFile(path: string): void;
+    webContents: WebContents;
+    on(event: string, listener: (...args: unknown[]) => void): void;
+    close(): void;
+  }
+
+  export interface WebContents {
+    send(channel: string, ...args: unknown[]): void;
+  }
+
+  export interface IpcMain {
+    handle(channel: string, listener: (event: IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>): void;
+    on(channel: string, listener: (event: IpcMainEvent, ...args: unknown[]) => void): void;
+  }
+
+  export interface IpcMainInvokeEvent {
+    sender: WebContents;
+  }
+
+  export interface IpcMainEvent {
+    sender: WebContents;
+  }
+
+  export interface IpcRenderer {
+    invoke(channel: string, ...args: unknown[]): Promise<unknown>;
+    on(channel: string, listener: (event: unknown, ...args: unknown[]) => void): this;
+    removeAllListeners(channel?: string): void;
+    removeListener(channel: string, listener: (...args: unknown[]) => void): this;
+    send(channel: string, ...args: unknown[]): void;
+  }
+
+  export interface ContextBridge {
+    exposeInMainWorld(apiKey: string, api: Record<string, unknown>): void;
+  }
+
+  export interface App {
+    on(event: string, listener: (...args: unknown[]) => void): this;
+    quit(): void;
+    whenReady(): Promise<void>;
+    getPath(name: string): string;
+  }
+
+  export const app: App;
+  export const BrowserWindow: typeof BrowserWindow;
+  export const ipcMain: IpcMain;
+  export const ipcRenderer: IpcRenderer;
+  export const contextBridge: ContextBridge;
+
+  // Forma de exportar todos os símbolos
+  export default {
+    app,
+    BrowserWindow,
+    ipcMain,
+    ipcRenderer,
+    contextBridge,
+  };
+}
 
 // node:test
 declare module 'node:test' {
@@ -4755,6 +6420,11 @@ declare module 'node:path' {
   export function relative(from: string, to: string): string;
 }
 
+// node:crypto
+declare module 'node:crypto' {
+  export function randomUUID(): string;
+}
+
 // node:assert
 declare module 'node:assert' {
   interface Assert {
@@ -4781,7 +6451,7 @@ declare module 'node:assert' {
 <file path="README.md">
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.6.4 — Sprint 6.4 (Red Team Fixes & Electron Prep)
+**Versão:** 0.7.0 — Sprint 7.0 (Interface Desktop — Electron IPC Bridge)
 
 ## Stack
 
@@ -4798,43 +6468,54 @@ declare module 'node:assert' {
 
 ```
 src/
-├── core/              # Contratos e lógica de negócio pura ("A Alma")
-│   ├── ILogger.ts             # Abstração de logging + LogLevel enum
-│   ├── IMotorCognitivo.ts     # Abstração do motor cognitivo (LLM) + ChatMessage + IToolDefinition
-│   ├── ICircuitBreaker.ts     # Abstração do Circuit Breaker
-│   ├── IHttpServer.ts         # Abstração do servidor HTTP
-│   ├── ISensor.ts             # Abstração genérica de sensor (T)
-│   ├── IEmbeddings.ts         # Contrato para geração de embeddings vetoriais
-│   ├── IVectorStore.ts        # Contrato para armazenamento e busca vetorial
-│   ├── ISessionManager.ts     # Contrato para gestão de sessões de conversa
-│   ├── IConversationManager.ts # Contrato do Maestro (orquestração multi-turno)
-│   └── ITool.ts                # Contrato genérico de ferramenta (Tool Calling)
-├── infra/             # Implementações técnicas ("Os Músculos")
-│   ├── ConsoleLogger.ts            # Logger concreto (stdout)
+├── core/                    # Contratos e lógica de negócio pura ("A Alma")
+│   ├── ILogger.ts                     # Abstração de logging + LogLevel enum
+│   ├── IMotorCognitivo.ts             # Abstração do motor cognitivo (LLM) + ChatMessage + IToolDefinition
+│   ├── ICircuitBreaker.ts             # Abstração do Circuit Breaker
+│   ├── IHttpServer.ts                 # Abstração do servidor HTTP
+│   ├── ISensor.ts                     # Abstração genérica de sensor (T)
+│   ├── IEmbeddings.ts                 # Contrato para geração de embeddings vetoriais
+│   ├── IVectorStore.ts                # Contrato para armazenamento e busca vetorial
+│   ├── ISessionManager.ts             # Contrato para gestão de sessões de conversa
+│   ├── IConversationManager.ts        # Contrato do Maestro (orquestração multi-turno)
+│   └── ITool.ts                        # Contrato genérico de ferramenta (Tool Calling)
+├── infra/                   # Implementações técnicas ("Os Músculos")
+│   ├── ConsoleLogger.ts                # Logger concreto (stdout)
 │   ├── ConsoleLogger.test.ts
-│   ├── OllamaProvider.ts           # Provider Ollama via fetch nativo (endpoint /api/chat)
+│   ├── OllamaProvider.ts               # Provider Ollama via fetch nativo (endpoint /api/chat)
 │   ├── OllamaProvider.test.ts
-│   ├── validateOllamaResponse.test.ts # Testes de validação de schema da API
-│   ├── CircuitBreaker.ts           # Circuit Breaker (3 estados)
+│   ├── validateOllamaResponse.test.ts  # Testes de validação de schema da API
+│   ├── CircuitBreaker.ts               # Circuit Breaker (3 estados)
 │   ├── CircuitBreaker.test.ts
-│   ├── FileSensor.ts               # Sensor de arquivo (ISensor<string>)
+│   ├── FileSensor.ts                   # Sensor de arquivo (ISensor<string>)
 │   ├── FileSensor.test.ts
-│   ├── NativeHttpServer.ts         # Servidor HTTP nativo (IHttpServer)
+│   ├── NativeHttpServer.ts             # Servidor HTTP nativo (IHttpServer)
 │   ├── NativeHttpServer.test.ts
-│   ├── MockVectorStore.ts          # Vector Store mock (validação sem dependências externas)
-│   ├── InMemorySessionManager.ts   # Gestão de sessões em memória (ISessionManager)
+│   ├── MockVectorStore.ts              # Vector Store mock
+│   ├── InMemorySessionManager.ts       # Gestão de sessões em memória
 │   ├── InMemorySessionManager.test.ts
-│   ├── ConversationManager.ts      # Maestro: orquestra sessão + RAG + motor cognitivo
+│   ├── ConversationManager.ts          # Maestro: orquestra sessão + RAG + motor
 │   ├── ConversationManager.test.ts
-│   └── tools/                      # Arsenal de ferramentas do agente
-│       ├── SystemTimeTool.ts       # Retorna data/hora atual do sistema
+│   ├── ToolRegistry.ts                 # Registro de ferramentas
+│   ├── ToolRegistry.test.ts
+│   └── tools/                          # Arsenal de ferramentas do agente
+│       ├── SystemTimeTool.ts
 │       ├── SystemTimeTool.test.ts
-│       ├── CalculatorTool.ts       # Operações matemáticas básicas
+│       ├── CalculatorTool.ts
 │       ├── CalculatorTool.test.ts
-│       ├── ReadFileTool.ts         # Leitura de arquivos locais
+│       ├── ReadFileTool.ts
 │       └── ReadFileTool.test.ts
-├── env.d.ts           # Tipos manuais para APIs nativas do Node
-└── main.ts            # Orquestração, wiring manual, ponto de entrada
+├── main/                    # Processo principal do Electron (Fase 7)
+│   └── main.ts                         # BrowserWindow + IPC handlers + wiring
+├── preload/                 # Context Bridge seguro (Fase 7)
+│   └── preload.ts                      # window.soberanoAPI (enviarMensagem, onStream, onStreamEnd, cancelar)
+├── renderer/                # UI Desktop (Fase 7)
+│   ├── index.html                      # Chat UI (histórico, input, botões)
+│   ├── style.css                       # Tema escuro minimalista
+│   └── app.js                          # Lógica do renderer (zero dependências)
+├── env.d.ts                 # Tipos manuais para APIs nativas do Node + Electron
+├── main-cli.ts              # Ponto de entrada CLI (MVP original, renomeado)
+└── main.ts                  # Orquestração, wiring manual, ponto de entrada (CLI)
 ```
 
 ### Princípios
@@ -4891,7 +6572,11 @@ src/
 | Suporte a cancelamento via AbortSignal no conversar() | ✅ |
 | Contrato gerarRespostaStream() no IMotorCognitivo para suporte a streaming | ✅ |
 | Implementação base de gerarRespostaStream no OllamaProvider | ✅ |
-| ConversationManager.test.ts — 8 testes unitários cobrindo ReAct Loop (tool calls, fallback, cancelamento) | ✅ |
+| ConversationManager.test.ts — 10 testes unitários cobrindo ReAct Loop (tool calls, fallback, cancelamento, maxToolIterations) | ✅ |
+| MockVectorStore.test.ts — 9 testes unitários de cosineSimilarity (vetores idênticos, ortogonais, nulos, opostos, dimensões, limit, vazio, duplicatas) | ✅ |
+| SystemTimeTool.test.ts — 8 testes unitários (contrato, metadados, ISO 8601, execução, argumentos vazios) | ✅ |
+| ToolRegistry.test.ts — 8 testes unitários (registro, duplicatas com throw, consulta, case-sensitivity, collection) | ✅ |
+| Guard clause no Tool Loop — valida array de mensagens vazio/nulo antes de qualquer acesso indexado | ✅ |
 
 ## Como Executar
 
@@ -4901,18 +6586,18 @@ src/
 - Servidor Ollama em execução (`ollama serve`)
 - Modelo Ollama disponível (padrão: `qwen2.5-coder:3b`)
 
-### Comandos
+### Scripts do `package.json`
 
-```bash
-# Iniciar o sistema (CLI MVP)
-npm start
-
-# Rodar todos os testes
-npm test
-
-# Typecheck sem executar
-npm run typecheck
-```
+| Comando | Descrição |
+|---------|-----------|
+| `npm start` | Inicia o sistema (CLI MVP) — executa `src/main.ts` |
+| `npm start:desktop` | Abre o Electron Desktop — executa Electron a partir de `src/main/main.ts` |
+| `npm test` | Roda **todos** os testes unitários (`src/infra/*.test.ts` e `src/infra/tools/*.test.ts`) |
+| `npm run test:ollama` | Testes do OllamaProvider isoladamente |
+| `npm run test:circuit` | Testes do CircuitBreaker isoladamente |
+| `npm run test:file` | Testes do FileSensor isoladamente |
+| `npm run test:http` | Testes do NativeHttpServer isoladamente |
+| `npm run typecheck` | TypeScript type-check sem executar (`tsc --noEmit`) |
 
 ## Roadmap
 
@@ -4925,7 +6610,8 @@ npm run typecheck
 | **5** | Gerenciamento de contexto e sessões multi-turno | ✅ **Concluída** |
 | **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
 | **6.4** | Red Team Fixes (bugs críticos no loop ReAct) + Electron Prep (streaming, cancelamento) | ✅ **Concluída** |
-| **7** | Electron UI (n8n-style via IPC nativo) | 🔧 Em Preparação |
+| **6.5** | Blindagem Final — Degradação Graciosa RAG, Defensive Copy SessionManager, Shutdown Determinístico, Fallback ReAct Edge Case | ✅ **Concluída** |
+| **7** | Electron UI (n8n-style via IPC nativo) | ✅ **Concluída** |
 
 ## Contratos do Core
 
@@ -5066,7 +6752,7 @@ abstract class IConversationManager {
 <file path="src/main.ts">
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Sprint 6.3 (Expansao do Arsenal).
+ * @description Ponto de entrada do sistema SOBERANO - Sprint 6.5 (Zero Debt).
  *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
@@ -5082,6 +6768,7 @@ abstract class IConversationManager {
  *              - Simula 2 turnos de conversa para provar a retencao de memoria de sessao
  */
 
+import { randomUUID } from 'node:crypto';
 import { OllamaProvider } from './infra/OllamaProvider.ts';
 import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
 import { ConsoleLogger } from './infra/ConsoleLogger.ts';
@@ -5104,42 +6791,41 @@ import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
 import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
 
 let isShuttingDown = false;
+let shutdownInProgress = false;
 
 function registerShutdownHandlers(
   logger: ILogger,
   shutdownController: AbortController,
   httpServer: IHttpServer
 ): void {
-  const shutdown = async (signal: string) => {
-    if (isShuttingDown) {
-      logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
-      process.exit(1);
-    }
+    const shutdown = async (signal: string) => {
+      if (isShuttingDown) {
+        logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
+        process.exit(1);
+      }
 
-    isShuttingDown = true;
-    logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
+      isShuttingDown = true;
+      logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
 
-    const forceExitTimer = setTimeout(() => {
-      logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
-      process.exit(1);
-    }, 5_000);
+      const forceExitTimer = setTimeout(() => {
+        logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
+        process.exit(1);
+      }, 5_000);
 
-    process.removeAllListeners('SIGINT');
-    process.removeAllListeners('SIGTERM');
+      process.removeAllListeners('SIGINT');
+      process.removeAllListeners('SIGTERM');
 
-    shutdownController.abort();
-
-    try {
-      await httpServer.stop();
-      logger.info('[main] HTTP server stopped.');
-    } catch (err) {
-      logger.error('[main] Error stopping HTTP server: ' + err);
-    }
-
-    clearTimeout(forceExitTimer);
-    logger.info('[main] Resources released. Goodbye, SOBERANO.');
-    process.exit(0);
-  };
+      // Prevent race condition: ensure abort is called before cleanup
+      if (!shutdownInProgress) {
+        shutdownInProgress = true;
+        shutdownController.abort();
+        clearTimeout(forceExitTimer);
+        logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
+      } else {
+        clearTimeout(forceExitTimer);
+        logger.info('[main] Shutdown already in progress.');
+      }
+    };
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -5269,7 +6955,7 @@ async function bootstrap(): Promise<void> {
       toolRegistry,
     });
 
-    const sessionId = 'demo-sprint-5.3';
+    const sessionId = randomUUID();
 
     // Turno 1
     const input1 = 'Ola, quem es tu?';
@@ -5299,7 +6985,7 @@ async function bootstrap(): Promise<void> {
     const resposta4 = await conversationManager.conversar(sessionId, input4);
     logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 4 (Multi-tool) ===');
     logger.info(resposta4);
-    logger.info('[main] === Sprint 6.3 - Expansao do Arsenal test completed successfully. ===');
+    logger.info('[main] === Sprint 6.5 - Zero Debt test completed successfully. ===');
 
     // Verificacao da memoria de sessao
     const historicoFinal = await sessionManager.obterHistorico(sessionId);
@@ -5310,7 +6996,7 @@ async function bootstrap(): Promise<void> {
       logger.info('  [' + msg.role + '] ' + truncatedContent);
     }
 
-    logger.info('[main] === FASE 5 COMPLETA - Todos os testes OK ===');
+    logger.info('[main] === FASE 6.5 COMPLETA - Todos os testes OK ===');
   } catch (error) {
     if (shutdownController.signal.aborted) {
       logger.info('[main] Operation cancelled due to system shutdown.');
@@ -5330,9 +7016,18 @@ async function bootstrap(): Promise<void> {
 
     process.exit(1);
   } finally {
-    await httpServer.stop().catch((err) => {
-      logger.error('[main] Error stopping HTTP server: ' + err);
-    });
+    // Ensure httpServer.stop() is called exactly once to avoid race condition
+    if (!shutdownInProgress) {
+      shutdownInProgress = true;
+      await httpServer.stop().catch((err) => {
+        logger.error('[main] Error stopping HTTP server: ' + err);
+      });
+    }
+
+    if (isShuttingDown) {
+      logger.info('[main] Resources released. Goodbye, SOBERANO.');
+      process.exit(0);
+    }
   }
 }
 

@@ -34,11 +34,7 @@ export interface FileSensorOptions {
 
 export class FileSensor extends ISensor<string> {
   private readonly logger: ILogger;
-  private readonly readFile: {
-    (path: string): Promise<Buffer>;
-    (path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
-    (path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
-  };
+  private readonly readFile: FileSensorOptions['readFile'];
 
   /**
    * @param options - Objeto de configuração seguindo o padrão Options Object.
@@ -46,7 +42,8 @@ export class FileSensor extends ISensor<string> {
   constructor(options: FileSensorOptions) {
     super();
     this.logger = options.logger;
-    this.readFile = options.readFile ?? fsReadFile;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.readFile = options.readFile ?? (fsReadFile as any);
   }
 
   /**
@@ -61,7 +58,7 @@ export class FileSensor extends ISensor<string> {
     this.logger.debug(`[FileSensor] Attempting to read file: "${target}"`);
 
     try {
-      const content = await this.readFile(target, { encoding: 'utf-8', signal });
+      const content = await this.readFile!(target, { encoding: 'utf-8', signal });
       this.logger.debug(`[FileSensor] Successfully read file: "${target}" (${content.length} bytes)`);
       return content;
     } catch (error) {

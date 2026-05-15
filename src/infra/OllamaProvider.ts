@@ -445,7 +445,7 @@ export class OllamaProvider extends IMotorCognitivo {
 
   /**
    * Envia mensagens ao motor cognitivo e retorna um fluxo de chunks de texto
-   * (streaming), útil para enviar tokens progressivamente via IPC no Electron.
+   * (streaming), útil para consumo progressivo dos tokens gerados.
    *
    * @param mensagens - Array de mensagens no formato ChatMessage[].
    * @param tools - Array opcional de definições de ferramentas (tool calling).

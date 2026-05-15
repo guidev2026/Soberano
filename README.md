@@ -1,6 +1,6 @@
-# SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
+# SOBERANO — Microsserviço Local de IA Generativa (Tauri + Node.js HTTP/SSE)
 
-**Versão:** 0.6.6 — Sprint 6.6 (Blindagem Final - Guard Clauses & Testes)
+**Versão:** 0.7.0
 
 ## Stack
 
@@ -8,63 +8,117 @@
 |-----------|-----------|
 | Linguagem | TypeScript (Node.js nativo) |
 | Testes | `node:test`, `node:assert` |
-| Dependências | **Zero** — PROIBIDO bibliotecas externas |
-| HTTP | `fetch` global nativo |
+| Dependências | **Mínimas** — `@tauri-apps/cli`, `@types/node`, `typescript`, `tsx` |
+| HTTP | `node:http` servidor + `fetch` global nativo |
+| Streaming | SSE (Server-Sent Events) via `node:http` |
+| Shell Desktop | Tauri (aponta para `dist/renderer/`) |
 
-> **Nota sobre `src/env.d.ts`:** Para manter o compromisso de dependência externa zero, este projeto não utiliza `@types/node`. Em vez disso, o arquivo `src/env.d.ts` declara manualmente apenas os tipos necessários das APIs nativas (HTTP, filesystem, AbortSignal, etc.). Isso elimina a necessidade de instalar um pacote de tipos externo, mantendo o projeto autocontido e leve. Sempre que um novo módulo nativo for utilizado, seus tipos devem ser adicionados a este arquivo.
+> **Nota sobre tipos:** Diferentemente da Fase 6, agora utilizamos `@types/node` para tipagem completa dos módulos nativos Node.js. O arquivo `src/env.d.ts` foi simplificado, mantendo apenas declarações específicas do projeto.
 
-## Arquitetura (DIP + SOLID)
+## Arquitetura (DIP + SOLID + Microsserviço Local)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Tauri Shell                              │
+│  (WebView - aponta para dist/renderer/)                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              Frontend Vanilla (A Casca)                  │   │
+│  │  - index.html, app.js, style                            │   │
+│  │  - fetch() para POST /chat                              │   │
+│  │  - getReader() para SSE streaming                       │   │
+│  │  - Atualização do DOM em tempo real                     │   │
+│  └──────────────┬──────────────────────────────────────────┘   │
+└─────────────────┼───────────────────────────────────────────────┘
+                  │ HTTP (localhost:3000)
+                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              SOBERANO HTTP Server (Node.js nativo)              │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  src/main.ts  (Bootstrap / Wiring)                       │  │
+│  │  - AbortController global (graceful shutdown)            │  │
+│  │  - Injeção de dependências (Options Object)              │  │
+│  │  - Registro de ferramentas (ToolRegistry)                │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/NativeHttpServer.ts   (IHttpServer)           │  │
+│  │  - GET  /healthz   → health check                       │  │
+│  │  - GET  /chat-history?sessionId → histórico JSON         │  │
+│  │  - POST /chat      → SSE streaming (conversarStream)    │  │
+│  │  - Servir / (src/renderer/) → arquivos estáticos        │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/ConversationManager.ts  (IConversationManager)│  │
+│  │  - conversarStream(sessionId, input, signal) → SSE      │  │
+│  │  - ReAct Tool Loop (até 3 iterações)                    │  │
+│  │  - RAG com MockVectorStore                              │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/OllamaProvider.ts  (IMotorCognitivo)          │  │
+│  │  - fetch para http://localhost:11434/api/chat            │  │
+│  │  - Retry com backoff + Circuit Breaker                   │  │
+│  │  - Tool Calling (Fase 6)                                │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ```
 src/
-├── core/              # Contratos e lógica de negócio pura ("A Alma")
-│   ├── ILogger.ts             # Abstração de logging + LogLevel enum
-│   ├── IMotorCognitivo.ts     # Abstração do motor cognitivo (LLM) + ChatMessage + IToolDefinition
-│   ├── ICircuitBreaker.ts     # Abstração do Circuit Breaker
-│   ├── IHttpServer.ts         # Abstração do servidor HTTP
-│   ├── ISensor.ts             # Abstração genérica de sensor (T)
-│   ├── IEmbeddings.ts         # Contrato para geração de embeddings vetoriais
-│   ├── IVectorStore.ts        # Contrato para armazenamento e busca vetorial
-│   ├── ISessionManager.ts     # Contrato para gestão de sessões de conversa
-│   ├── IConversationManager.ts # Contrato do Maestro (orquestração multi-turno)
-│   └── ITool.ts                # Contrato genérico de ferramenta (Tool Calling)
-├── infra/             # Implementações técnicas ("Os Músculos")
-│   ├── ConsoleLogger.ts            # Logger concreto (stdout)
+├── core/                            # Contratos e lógica de negócio pura ("A Alma")
+│   ├── ILogger.ts                                 # Abstração de logging + LogLevel enum
+│   ├── IMotorCognitivo.ts                          # Abstração do motor cognitivo (LLM)
+│   ├── ICircuitBreaker.ts                          # Abstração do Circuit Breaker
+│   ├── IHttpServer.ts                              # Abstração do servidor HTTP
+│   ├── ISensor.ts                                  # Abstração genérica de sensor (T)
+│   ├── IEmbeddings.ts                              # Contrato para geração de embeddings vetoriais
+│   ├── IVectorStore.ts                             # Contrato para armazenamento e busca vetorial
+│   ├── ISessionManager.ts                          # Contrato para gestão de sessões de conversa
+│   ├── IConversationManager.ts                     # Contrato do Maestro (orquestração multi-turno)
+│   └── ITool.ts                                    # Contrato genérico de ferramenta (Tool Calling)
+├── infra/                            # Implementações técnicas ("Os Músculos")
+│   ├── ConsoleLogger.ts                            # Logger concreto (stdout)
 │   ├── ConsoleLogger.test.ts
-│   ├── OllamaProvider.ts           # Provider Ollama via fetch nativo (endpoint /api/chat)
+│   ├── OllamaProvider.ts                           # Provider Ollama via fetch nativo
 │   ├── OllamaProvider.test.ts
-│   ├── validateOllamaResponse.test.ts # Testes de validação de schema da API
-│   ├── CircuitBreaker.ts           # Circuit Breaker (3 estados)
+│   ├── validateOllamaResponse.test.ts             # Testes de validação de schema da API
+│   ├── CircuitBreaker.ts                           # Circuit Breaker (3 estados)
 │   ├── CircuitBreaker.test.ts
-│   ├── FileSensor.ts               # Sensor de arquivo (ISensor<string>)
+│   ├── FileSensor.ts                               # Sensor de arquivo (ISensor<string>)
 │   ├── FileSensor.test.ts
-│   ├── NativeHttpServer.ts         # Servidor HTTP nativo (IHttpServer)
+│   ├── NativeHttpServer.ts                         # Servidor HTTP nativo (IHttpServer) c/ SSE
 │   ├── NativeHttpServer.test.ts
-│   ├── MockVectorStore.ts          # Vector Store mock (validação sem dependências externas)
-│   ├── InMemorySessionManager.ts   # Gestão de sessões em memória (ISessionManager)
+│   ├── MockVectorStore.ts                          # Vector Store mock
+│   ├── InMemorySessionManager.ts                   # Gestão de sessões em memória
 │   ├── InMemorySessionManager.test.ts
-│   ├── ConversationManager.ts      # Maestro: orquestra sessão + RAG + motor cognitivo
+│   ├── ConversationManager.ts                      # Maestro: orquestra sessão + RAG + motor
 │   ├── ConversationManager.test.ts
-│   ├── ToolRegistry.ts             # Registro de ferramentas (lança Error se duplicado)
+│   ├── ToolRegistry.ts                             # Registro de ferramentas
 │   ├── ToolRegistry.test.ts
-│   └── tools/                      # Arsenal de ferramentas do agente
-│       ├── SystemTimeTool.ts       # Retorna data/hora atual do sistema
+│   └── tools/                                      # Arsenal de ferramentas do agente
+│       ├── SystemTimeTool.ts
 │       ├── SystemTimeTool.test.ts
-│       ├── CalculatorTool.ts       # Operações matemáticas básicas
+│       ├── CalculatorTool.ts
 │       ├── CalculatorTool.test.ts
-│       ├── ReadFileTool.ts         # Leitura de arquivos locais
+│       ├── ReadFileTool.ts
 │       └── ReadFileTool.test.ts
-├── env.d.ts           # Tipos manuais para APIs nativas do Node
-└── main.ts            # Orquestração, wiring manual, ponto de entrada
+├── renderer/                         # Frontend Vanilla ("A Casca" — servido como estático)
+│   ├── index.html                    # Interface do chat (dark mode, responsivo)
+│   └── app.js                        # Consumidor SSE via fetch/getReader
+├── env.d.ts                          # Tipos manuais para APIs nativas do Node
+├── main.ts                           # Bootstrap: wiring + servidor HTTP (ponto de entrada)
+└── main-cli.ts                       # Ponto de entrada CLI (MVP original, legado)
 ```
 
 ### Princípios
 
 - **Abstração Primeiro:** Interfaces/classes abstratas em `src/core` antes de qualquer implementação
 - **Inversão de Dependência:** Módulos de alto nível (`main.ts`) dependem de abstrações, não de implementações
-- **Injeção via Construtor/Options Object:** Dependências são injetadas no construtor (não Service Locator)
-- **Options Object:** Classes com múltiplas configurações usam objeto de configuração tipado
+- **Injeção via Options Object:** Dependências são injetadas via objeto de configuração tipado (nunca parâmetros posicionais)
 - **Desacoplamento:** Detalhes técnicos nunca vazam para `src/core`
+- **Streaming Nativo:** SSE (Server-Sent Events) via `node:http` — sem bibliotecas de terceiros
+- **Microsserviço Local:** Backend Node.js puro na porta 3000; Tauri é apenas o shell desktop
 
 ## Funcionalidades Implementadas
 
@@ -83,15 +137,20 @@ src/
 | Sensor de arquivo (FileSensor) com `node:fs/promises` | ✅ Estabilizada |
 | Contrato genérico ISensor\<T\> (preparação para novos sensores) | ✅ |
 | Servidor HTTP nativo (IHttpServer) com rota /healthz | ✅ |
+| **POST /chat com SSE streaming** — `conversarStream` transmite chunks em tempo real | ✅ **Nova na Fase 7** |
+| GET /chat-history — retorna histórico JSON de uma sessão | ✅ **Nova na Fase 7** |
+| **Frontend Vanilla (renderer/)** — fetch + getReader para SSE | ✅ **Nova na Fase 7** |
+| Servir arquivos estáticos (src/renderer/) via NativeHttpServer | ✅ **Nova na Fase 7** |
+| **Electron removido** — substituído por Tauri como shell desktop | ✅ **Nova na Fase 7** |
 | Contrato IEmbeddings para geração de vetores | ✅ |
 | Contrato IVectorStore para armazenamento e busca vetorial | ✅ |
 | MockVectorStore — implementação em memória com similaridade cosseno | ✅ |
 | Contrato ISessionManager — gestão de sessões de conversa | ✅ |
 | InMemorySessionManager — implementação em memória com limite de mensagens | ✅ |
 | Contrato IConversationManager — Maestro de orquestração multi-turno | ✅ |
+| **conversarStream()** — streaming de chunks via AsyncIterable | ✅ **Nova na Fase 7** |
 | ConversationManager — pipeline: salva -> RAG -> funde contexto -> envia -> salva resposta | ✅ |
 | Embedding Heurístico — vetor de 10 dimensões sem dependência externa | ✅ |
-| Demonstração integrada no main.ts (2 turnos de conversa com sessão) | ✅ |
 | Interface IToolDefinition para definição de ferramentas no request /api/chat | ✅ |
 | Contrato ITool — interface genérica para ferramentas executáveis (getDefinition, execute) | ✅ |
 | OllamaProvider envia tools[] no payload de /api/chat quando fornecido | ✅ |
@@ -102,7 +161,6 @@ src/
 | SystemTimeTool — ferramenta concreta que retorna data/hora ISO 8601 | ✅ |
 | CalculatorTool — ferramenta de cálculo matemático (soma, subtração, multiplicação, divisão) | ✅ |
 | ReadFileTool — ferramenta de leitura de arquivos locais (fail-safe) | ✅ |
-| Demonstração multi-ferramenta no main.ts (calculator + get_system_time) | ✅ |
 | ReAct/Tool Calling Loop no ConversationManager (até 3 iterações, segurança anti-loop) | ✅ |
 | Detecção e execução de tool_calls com guarda de contexto no SessionManager | ✅ |
 | Tratamento de erros: ferramenta não encontrada, falha de execução, sem registry | ✅ |
@@ -122,21 +180,39 @@ src/
 
 ### Pré-requisitos
 
-- Node.js >= 18 (fetch nativo)
+- Node.js >= 20 (fetch nativo, `node:test`)
 - Servidor Ollama em execução (`ollama serve`)
-- Modelo Ollama disponível (padrão: `qwen2.5-coder:3b`)
+- Modelo Ollama disponível (padrão: `llama3.2:1b`)
+- **Tauri CLI** (opcional, para build desktop)
 
 ### Scripts do `package.json`
 
 | Comando | Descrição |
 |---------|-----------|
-| `npm start` | Inicia o sistema (CLI MVP) — executa `src/main.ts` |
+| `npm run start:server` | Inicia o servidor HTTP SOBERANO na porta 3000 |
+| `npm run start:server:dev` | Inicia com `--watch` para recarregar automático em desenvolvimento |
+| `npm run tauri:dev` | Inicia o Tauri em modo dev (abre janela desktop apontando para `http://localhost:3000`) |
+| `npm run tauri:build` | Compila o binário desktop Tauri |
+| `npm run tauri:init` | Inicializa a configuração do Tauri no projeto |
 | `npm test` | Roda **todos** os testes unitários (`src/infra/*.test.ts` e `src/infra/tools/*.test.ts`) |
 | `npm run test:ollama` | Testes do OllamaProvider isoladamente |
 | `npm run test:circuit` | Testes do CircuitBreaker isoladamente |
 | `npm run test:file` | Testes do FileSensor isoladamente |
 | `npm run test:http` | Testes do NativeHttpServer isoladamente |
 | `npm run typecheck` | TypeScript type-check sem executar (`tsc --noEmit`) |
+
+### Fluxo de Desenvolvimento
+
+```bash
+# Terminal 1: Iniciar servidor backend
+npm run start:server
+
+# Terminal 2: Iniciar Tauri (opcional — ou acessar http://localhost:3000 no navegador)
+npm run tauri:dev
+
+# Testes
+npm test
+```
 
 ## Roadmap
 
@@ -150,139 +226,4 @@ src/
 | **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
 | **6.4** | Red Team Fixes (bugs críticos no loop ReAct) + Electron Prep (streaming, cancelamento) | ✅ **Concluída** |
 | **6.5** | Blindagem Final — Degradação Graciosa RAG, Defensive Copy SessionManager, Shutdown Determinístico, Fallback ReAct Edge Case | ✅ **Concluída** |
-| **7** | Electron UI (n8n-style via IPC nativo) | 🔧 Em Preparação |
-
-## Contratos do Core
-
-### `ILogger`
-
-```typescript
-enum LogLevel { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3 }
-
-abstract class ILogger {
-  abstract info(message: string): void;
-  abstract warn(message: string): void;
-  abstract error(message: string): void;
-  abstract debug(message: string): void;
-}
-```
-
-### `IMotorCognitivo`
-
-```typescript
-interface IToolDefinition {
-  type: 'function';
-  function: {
-    name: string;
-    description: string;
-    parameters: Record<string, any>;
-  };
-}
-
-interface ChatMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
-  tool_calls?: Array<{
-    id: string;
-    function: { name: string; arguments: Record<string, any> };
-  }>;
-  tool_call_id?: string;
-}
-
-abstract class IMotorCognitivo {
-  abstract setAbortSignal(signal: AbortSignal): void;
-  abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
-  abstract gerarRespostaStream(
-    mensagens: ChatMessage[],
-    tools?: IToolDefinition[],
-    signal?: AbortSignal
-  ): AsyncIterable<string>;
-}
-```
-
-### `ICircuitBreaker`
-
-```typescript
-enum CircuitState { CLOSED, OPEN, HALF_OPEN }
-
-abstract class ICircuitBreaker {
-  abstract readonly state: CircuitState;
-  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
-  abstract recordFailure(): void;
-  abstract reset(): void;
-}
-```
-
-### `ISensor<T>`
-
-```typescript
-abstract class ISensor<T> {
-  abstract ler(target: string, signal?: AbortSignal): Promise<T>;
-}
-```
-
-### `IToolRegistry`
-
-```typescript
-abstract class IToolRegistry {
-  abstract registrar(tool: ITool): void;
-  abstract obter(nome: string): ITool | undefined;
-  abstract obterTodas(): ITool[];
-}
-```
-
-### `ITool`
-
-```typescript
-abstract class ITool {
-  abstract readonly name: string;
-  abstract readonly description: string;
-  abstract readonly parametersSchema: Record<string, any>;
-  abstract execute(args: Record<string, any>): Promise<any>;
-  abstract getDefinition(): IToolDefinition;
-}
-```
-
-### `IEmbeddings`
-
-```typescript
-abstract class IEmbeddings {
-  abstract gerarVector(text: string): Promise<number[]>;
-}
-```
-
-### `IVectorStore<M>`
-
-```typescript
-abstract class IVectorStore<M = any> {
-  abstract adicionar(id: string, vector: number[], metadata: M): Promise<void>;
-  abstract buscarSimilares(vector: number[], limit: number): Promise<
-    { id: string; metadata: M; score: number }[]
-  >;
-}
-```
-
-### `ISessionManager`
-
-```typescript
-abstract class ISessionManager {
-  abstract adicionarMensagem(sessionId: string, message: ChatMessage): Promise<void>;
-  abstract obterHistorico(sessionId: string): Promise<ChatMessage[]>;
-  abstract limparSessao(sessionId: string): Promise<void>;
-}
-```
-
-### `IConversationManager`
-
-```typescript
-abstract class IConversationManager {
-  abstract conversar(sessionId: string, input: string, signal?: AbortSignal): Promise<string>;
-}
-```
-
-## Convenções
-
-- **Código e logs internos:** Inglês
-- **Mensagens para o usuário:** PT-BR
-- **Testes:** `node:test` nativo com `mock.method()` para isolamento
-- **Commits:** Descritivos em inglês, seguindo conventional commits
+| **7** | **Pivot: Microsserviço Local (HTTP/SSE + Tauri)** <br><br> • Electron removido (incompatível com Ubuntu 22.04 — SIGSEGV Chromium)<br> • Backend Node.js como servidor HTTP puro na porta 3000<br> • Rota POST /chat com SSE streaming (conversarStream)<br> • Frontend Vanilla (renderer/) — fetch + getReader para SSE<br> • Tauri como shell desktop (aponta para dist/renderer/)<br> • Graceful shutdown com AbortController global<br> • `@tauri-apps/cli` + `@types/node` | ✅ **Concluída** |

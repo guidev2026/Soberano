@@ -233,6 +233,159 @@ export class ConversationManager extends IConversationManager {
   }
 
   /**
+   * Versão streaming de conversar. Processa uma interação e retorna chunks
+   * de texto em tempo real via AsyncIterable, ideal para SSE (Server-Sent Events).
+   *
+   * Fluxo:
+   * 1. Guarda inputUsuario no SessionManager (role: user).
+   * 2. Se IVectorStore existir, gera embedding heurístico e busca contextos similares.
+   * 3. Obtém o histórico atualizado do SessionManager.
+   * 4. Constrói mensagem system fundindo regras do SOBERANO com documentos recuperados.
+   * 5. Chama motor.gerarRespostaStream() e faz yield de cada chunk.
+   * 6. Guarda a resposta completa (role: assistant) no SessionManager ao final.
+   *
+   * NOTA: Tool Calling Loop NÃO é executado em modo streaming, pois o ReAct
+   * requer múltiplos round-trips (LLM → tool → LLM) que são incompatíveis
+   * com um fluxo contínuo de SSE. Tools ainda são expostas via toolDefinitions
+   * no payload, mas tool_calls na resposta não são processados.
+   *
+   * @param sessionId    - Identificador único da sessão.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @param signal       - Sinal opcional para abortar a operação.
+   * @yields Chunks de texto da resposta em tempo real.
+   */
+  async *conversarStream(
+    sessionId: string,
+    inputUsuario: string,
+    signal?: AbortSignal
+  ): AsyncIterable<string> {
+    this.logger.info(
+      `[ConversationManager] Streaming turn for session "${sessionId}". Input: "${inputUsuario}"`
+    );
+
+    // --- Guard: valida entrada vazia ---
+    if (inputUsuario.length === 0) {
+      const fallbackMsg = '[SOBERANO] Nenhuma mensagem foi fornecida. Por favor, digite algo para conversarmos.';
+      yield fallbackMsg;
+      return;
+    }
+
+    // --- Passo 1: Guarda o input do usuário na sessão ---
+    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
+    this.logger.debug('[ConversationManager] User message saved to session.');
+
+    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
+    let documentosRecuperados: string[] = [];
+    if (this.vectorStore) {
+      try {
+        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
+        this.logger.debug(
+          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
+        );
+
+        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
+
+        if (resultados.length > 0) {
+          documentosRecuperados = resultados.map((r) => {
+            const metadata = r.metadata as Record<string, unknown>;
+            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
+          });
+          this.logger.info(
+            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
+          );
+        } else {
+          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
+        }
+      } catch (ragError) {
+        this.logger.error(
+          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
+        );
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
+    }
+
+    // --- Passo 3: Obtém o histórico completo da sessão ---
+    const historico = await this.sessionManager.obterHistorico(sessionId);
+    this.logger.debug(
+      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
+    );
+
+    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
+    let systemContent =
+      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
+      `Responda em Português do Brasil de forma clara e objetiva. ` +
+      `Mantenha o contexto da conversa ao responder.`;
+
+    if (documentosRecuperados.length > 0) {
+      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
+      systemContent +=
+        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
+        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
+        `mas não invente informações que não estejam presentes.`;
+    }
+
+    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
+
+    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
+    const historicoFiltrado = historico.filter(m => m.role !== 'system');
+
+    // --- Passo 5: Obtém definições das ferramentas se ToolRegistry estiver disponível ---
+    let toolDefinitions: IToolDefinition[] | undefined = undefined;
+    if (this.toolRegistry) {
+      const ferramentas = this.toolRegistry.obterTodas();
+      if (ferramentas.length > 0) {
+        toolDefinitions = ferramentas.map((f) => f.getDefinition());
+        this.logger.info(
+          `[ConversationManager] Exposing ${toolDefinitions.length} tool(s) to cognitive engine: ` +
+          ferramentas.map((f) => `"${f.name}"`).join(', ')
+        );
+      } else {
+        this.logger.debug('[ConversationManager] ToolRegistry has no tools registered.');
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No ToolRegistry configured. Tool Calling disabled.');
+    }
+
+    // Monta array inicial de mensagens para enviar ao motor
+    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
+
+    this.logger.info(
+      `[ConversationManager] Streaming ${mensagensParaMotor.length} messages to cognitive engine ` +
+      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'})` +
+      (toolDefinitions ? ` with ${toolDefinitions.length} tool(s).` : '.')
+    );
+
+    // --- Passo 6: Chama o motor em modo streaming e faz yield de cada chunk ---
+    // Propaga o AbortSignal externo para o motor cognitivo
+    if (signal) {
+      this.motor.setAbortSignal(signal);
+    }
+
+    const respostaCompleta: string[] = [];
+
+    for await (const chunk of this.motor.gerarRespostaStream(
+      mensagensParaMotor,
+      toolDefinitions,
+      signal
+    )) {
+      respostaCompleta.push(chunk);
+      yield chunk;
+    }
+
+    // --- Passo 7: Guarda a resposta completa no SessionManager ---
+    const respostaFinal = respostaCompleta.join('');
+    const mensagemAssistant: ChatMessage = { role: 'assistant', content: respostaFinal };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
+
+    this.logger.info(
+      `[ConversationManager] Stream complete for session "${sessionId}". ` +
+      `Response length: ${respostaFinal.length} chars.`
+    );
+  }
+
+  /**
    * Executa o ReAct/Tool Calling Loop recursivo.
    *
    * 1. Envia as mensagens (com tool definitions, se for a primeira chamada) ao motor.
