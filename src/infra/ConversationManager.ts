@@ -115,7 +115,7 @@ export class ConversationManager extends IConversationManager {
    * @param inputUsuario - Texto de entrada do usuário.
    * @returns A resposta gerada pelo motor cognitivo.
    */
-  async conversar(sessionId: string, inputUsuario: string): Promise<string> {
+  async conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string> {
     this.logger.info(
       `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
     );
@@ -212,7 +212,9 @@ export class ConversationManager extends IConversationManager {
     const respostaFinal = await this.executarToolLoop(
       sessionId,
       mensagensParaMotor,
-      toolDefinitions
+      toolDefinitions,
+      0,
+      signal
     );
 
     return respostaFinal;
@@ -239,29 +241,34 @@ export class ConversationManager extends IConversationManager {
     sessionId: string,
     mensagens: ChatMessage[],
     toolDefinitions?: IToolDefinition[],
-    depth: number = 0
+    depth: number = 0,
+    signal?: AbortSignal
   ): Promise<string> {
     if (depth >= this.maxToolIterations) {
       this.logger.warn(
         `[ConversationManager] Tool loop reached maximum depth (${this.maxToolIterations}). ` +
-        `Returning last assistant response without further tool execution.`
+        `Returning safe fallback message.`
       );
 
-      // Guarda a última mensagem do assistant como fallback
-      const ultimaAssistant = mensagens.filter(m => m.role === 'assistant').pop();
-      if (ultimaAssistant) {
-        const mensagemFallback: ChatMessage = {
-          role: 'assistant',
-          content: ultimaAssistant.content,
-        };
-        await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      // Fallback seguro: busca a última mensagem assistant no SessionManager
+      // Se não encontrar, retorna mensagem limpa informando o corte da execução
+      const historico = await this.sessionManager.obterHistorico(sessionId);
+      const ultimaAssistant = historico.filter(m => m.role === 'assistant').pop();
+      if (ultimaAssistant && ultimaAssistant.content) {
         return ultimaAssistant.content;
       }
 
-      return '[SOBERANO] Limite de iterações de ferramentas atingido.';
+      const fallbackMsg = '[SOBERANO] Limite de iterações de ferramentas atingido. A execução foi interrompida para garantir estabilidade.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      return fallbackMsg;
     }
 
     // --- Passo A: Envia as mensagens ao motor ---
+    // Propaga o AbortSignal externo para o motor cognitivo
+    if (signal) {
+      this.motor.setAbortSignal(signal);
+    }
     const respostaMessage = await this.motor.gerarResposta(mensagens, toolDefinitions);
 
     // --- Passo B: Verifica se a resposta contém tool_calls ---
@@ -296,11 +303,14 @@ export class ConversationManager extends IConversationManager {
 
     for (let i = 0; i < respostaMessage.tool_calls!.length; i++) {
       const toolCall = respostaMessage.tool_calls![i] as {
+        id: string;
         function: { name: string; arguments: Record<string, any> };
       };
       const toolName = toolCall.function.name;
       const toolArgs = toolCall.function.arguments;
-      const toolCallId = `toolcall_${depth}_${i}`;
+      // Extrai o tool_call_id real emitido pelo LLM. O campo `id` foi validado
+      // e extraído durante o parse da resposta em OllamaProvider.
+      const toolCallId = toolCall.id;
 
       this.logger.info(
         `[ConversationManager] Executing tool "${toolName}" ` +
@@ -359,12 +369,11 @@ export class ConversationManager extends IConversationManager {
     }
 
     // --- Passo D: Rechama o motor com o histórico atualizado (sem tool definitions) ---
-    // Constrói o novo array de mensagens incluindo os resultados das ferramentas
-    const mensagensComResultados: ChatMessage[] = [
-      ...mensagens,
-      respostaMessage,
-      ...toolResultMessages,
-    ];
+    // Busca o histórico completo do SessionManager, que já contém a mensagem assistant
+    // com tool_calls e os tool results salvos nos passos anteriores (single source of truth).
+    // Isso elimina a duplicação: a mensagem NÃO é incluída manualmente no array de recursão.
+    const historicoAtualizado = await this.sessionManager.obterHistorico(sessionId);
+    const mensagensComResultados: ChatMessage[] = [mensagens[0]!, ...historicoAtualizado.filter(m => m.role !== 'system')];
 
     this.logger.info(
       `[ConversationManager] Re-invoking cognitive engine (depth ${depth + 1}) with updated context.`
@@ -375,7 +384,8 @@ export class ConversationManager extends IConversationManager {
       sessionId,
       mensagensComResultados,
       undefined, // Sem tool definitions na recursão
-      depth + 1
+      depth + 1,
+      signal
     );
   }
 }

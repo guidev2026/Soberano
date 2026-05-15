@@ -13,12 +13,14 @@ export abstract class IConversationManager {
    * 3. Obtém o histórico completo da sessão.
    * 4. Constrói uma mensagem system fundindo regras do SOBERANO com documentos recuperados.
    * 5. Envia o array de mensagens ao motor cognitivo.
-   * 6. Guarda a resposta (role: assistant) no SessionManager.
-   * 7. Retorna a resposta ao chamador.
+   * 6. Executa o ReAct/Tool Calling Loop se houver tool_calls.
+   * 7. Guarda a resposta (role: assistant) no SessionManager.
+   * 8. Retorna a resposta ao chamador.
    *
    * @param sessionId    - Identificador único da sessão de conversa.
    * @param inputUsuario - Texto de entrada do usuário.
+   * @param signal       - Sinal opcional para abortar a operação (graceful shutdown / cancelamento).
    * @returns A resposta gerada pelo motor cognitivo (role: assistant).
    */
-  abstract conversar(sessionId: string, inputUsuario: string): Promise<string>;
+  abstract conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string>;
 }

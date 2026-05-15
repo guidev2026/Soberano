@@ -16,7 +16,10 @@ export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   /** Chamadas de ferramenta emitidas pelo assistant (tool_calls do Ollama/OpenAI). */
-  tool_calls?: Array<{ function: { name: string; arguments: Record<string, any> } }>;
+  tool_calls?: Array<{
+    id: string;
+    function: { name: string; arguments: Record<string, any> };
+  }>;
   /** ID de correlação para tool call (formato OpenAI/Ollama compatível). */
   tool_call_id?: string;
 }
@@ -50,4 +53,19 @@ export abstract class IMotorCognitivo {
    *          tool_calls se o modelo decidir chamar uma ferramenta.
    */
   abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
+
+  /**
+   * Envia mensagens ao motor cognitivo e retorna um fluxo de chunks de texto
+   * (streaming), compatível com AsyncIterable para envio progressivo via IPC.
+   *
+   * @param mensagens - Array de mensagens no formato ChatMessage[].
+   * @param tools - Array opcional de definições de ferramentas (tool calling).
+   * @param signal - Sinal opcional para cancelamento do stream.
+   * @returns AsyncIterable<string> — cada chunk é um fragmento de texto da resposta.
+   */
+  abstract gerarRespostaStream(
+    mensagens: ChatMessage[],
+    tools?: IToolDefinition[],
+    signal?: AbortSignal
+  ): AsyncIterable<string>;
 }

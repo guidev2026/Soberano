@@ -300,6 +300,7 @@ describe('validateOllamaResponse (função pura) - /api/chat', () => {
           content: '',
           tool_calls: [
             {
+              id: 'call_abc123',
               function: {
                 name: 'get_weather',
                 arguments: { city: 'São Paulo' },
@@ -345,12 +346,14 @@ describe('validateOllamaResponse (função pura) - /api/chat', () => {
           content: '',
           tool_calls: [
             {
+              id: 'call_abc123',
               function: {
                 name: 'get_weather',
                 arguments: { city: 'São Paulo' },
               },
             },
             {
+              id: 'call_def456',
               function: {
                 name: 'get_time',
                 arguments: { timezone: 'America/Sao_Paulo' },

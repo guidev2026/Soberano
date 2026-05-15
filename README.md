@@ -1,6 +1,6 @@
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.6.3 — Sprint 6.3 (Expansão do Arsenal)
+**Versão:** 0.6.4 — Sprint 6.4 (Red Team Fixes & Electron Prep)
 
 ## Stack
 
@@ -87,7 +87,7 @@ src/
 | Contrato ISessionManager — gestão de sessões de conversa | ✅ |
 | InMemorySessionManager — implementação em memória com limite de mensagens | ✅ |
 | Contrato IConversationManager — Maestro de orquestração multi-turno | ✅ |
-| ConversationManager — pipeline: salva → RAG → funde contexto → envia → salva resposta | ✅ |
+| ConversationManager — pipeline: salva -> RAG -> funde contexto -> envia -> salva resposta | ✅ |
 | Embedding Heurístico — vetor de 10 dimensões sem dependência externa | ✅ |
 | Demonstração integrada no main.ts (2 turnos de conversa com sessão) | ✅ |
 | Interface IToolDefinition para definição de ferramentas no request /api/chat | ✅ |
@@ -104,6 +104,13 @@ src/
 | ReAct/Tool Calling Loop no ConversationManager (até 3 iterações, segurança anti-loop) | ✅ |
 | Detecção e execução de tool_calls com guarda de contexto no SessionManager | ✅ |
 | Tratamento de erros: ferramenta não encontrada, falha de execução, sem registry | ✅ |
+| Bugfix: Tool Call ID real extraído da resposta do LLM e repassado corretamente na mensagem tool | ✅ |
+| Bugfix: Eliminação de duplicação de mensagens assistant no histórico do SessionManager | ✅ |
+| Bugfix: Fallback seguro com mensagem de corte quando maxToolIterations é atingido | ✅ |
+| Suporte a cancelamento via AbortSignal no conversar() | ✅ |
+| Contrato gerarRespostaStream() no IMotorCognitivo para suporte a streaming | ✅ |
+| Implementação base de gerarRespostaStream no OllamaProvider | ✅ |
+| ConversationManager.test.ts — 8 testes unitários cobrindo ReAct Loop (tool calls, fallback, cancelamento) | ✅ |
 
 ## Como Executar
 
@@ -113,18 +120,17 @@ src/
 - Servidor Ollama em execução (`ollama serve`)
 - Modelo Ollama disponível (padrão: `qwen2.5-coder:3b`)
 
-### Comandos
+### Scripts do `package.json`
 
-```bash
-# Iniciar o sistema (CLI MVP)
-npm start
-
-# Rodar todos os testes
-npm test
-
-# Typecheck sem executar
-npm run typecheck
-```
+| Comando | Descrição |
+|---------|-----------|
+| `npm start` | Inicia o sistema (CLI MVP) — executa `src/main.ts` |
+| `npm test` | Roda **todos** os testes unitários (`src/infra/*.test.ts` e `src/infra/tools/*.test.ts`) |
+| `npm run test:ollama` | Testes do OllamaProvider isoladamente |
+| `npm run test:circuit` | Testes do CircuitBreaker isoladamente |
+| `npm run test:file` | Testes do FileSensor isoladamente |
+| `npm run test:http` | Testes do NativeHttpServer isoladamente |
+| `npm run typecheck` | TypeScript type-check sem executar (`tsc --noEmit`) |
 
 ## Roadmap
 
@@ -136,7 +142,8 @@ npm run typecheck
 | **4** | Qualidade de Teste e Determinismo — timeouts mínimos, mock.fn, assertions de retry | ✅ **Concluída** |
 | **5** | Gerenciamento de contexto e sessões multi-turno | ✅ **Concluída** |
 | **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
-| **7** | Web UI (React) + WebSocket | ⏳ Planejada |
+| **6.4** | Red Team Fixes (bugs críticos no loop ReAct) + Electron Prep (streaming, cancelamento) | ✅ **Concluída** |
+| **7** | Electron UI (n8n-style via IPC nativo) | 🔧 Em Preparação |
 
 ## Contratos do Core
 
@@ -169,6 +176,7 @@ interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   tool_calls?: Array<{
+    id: string;
     function: { name: string; arguments: Record<string, any> };
   }>;
   tool_call_id?: string;
@@ -177,6 +185,11 @@ interface ChatMessage {
 abstract class IMotorCognitivo {
   abstract setAbortSignal(signal: AbortSignal): void;
   abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
+  abstract gerarRespostaStream(
+    mensagens: ChatMessage[],
+    tools?: IToolDefinition[],
+    signal?: AbortSignal
+  ): AsyncIterable<string>;
 }
 ```
 
@@ -256,7 +269,7 @@ abstract class ISessionManager {
 
 ```typescript
 abstract class IConversationManager {
-  abstract conversar(sessionId: string, input: string): Promise<string>;
+  abstract conversar(sessionId: string, input: string, signal?: AbortSignal): Promise<string>;
 }
 ```
 

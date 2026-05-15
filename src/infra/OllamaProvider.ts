@@ -30,7 +30,10 @@ export interface OllamaChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   images?: string[];
-  tool_calls?: Array<{ function: { name: string; arguments: Record<string, any> } }>;
+  tool_calls?: Array<{
+    id: string;
+    function: { name: string; arguments: Record<string, any> };
+  }>;
 }
 
 export interface OllamaChatResponse {
@@ -112,7 +115,10 @@ export function validateOllamaResponse(data: unknown): OllamaChatResponse {
   }
 
   // Valida tool_calls se presente
-  let validatedToolCalls: Array<{ function: { name: string; arguments: Record<string, any> } }> | undefined;
+  let validatedToolCalls: Array<{
+    id: string;
+    function: { name: string; arguments: Record<string, any> }
+  }> | undefined;
   if (hasToolCalls) {
     validatedToolCalls = [];
     for (const tc of messageRecord.tool_calls as Array<unknown>) {
@@ -120,6 +126,9 @@ export function validateOllamaResponse(data: unknown): OllamaChatResponse {
         throw new Error(`[OllamaProvider] Invalid tool_call entry: expected object`);
       }
       const tcRecord = tc as Record<string, unknown>;
+      if (typeof tcRecord.id !== 'string') {
+        throw new Error(`[OllamaProvider] Invalid tool_call.id: expected string, received ${typeof tcRecord.id}`);
+      }
       if (tcRecord.function === null || tcRecord.function === undefined || typeof tcRecord.function !== 'object') {
         throw new Error(`[OllamaProvider] Invalid tool_call.function: expected object`);
       }
@@ -131,6 +140,7 @@ export function validateOllamaResponse(data: unknown): OllamaChatResponse {
         throw new Error(`[OllamaProvider] Invalid tool_call.function.arguments: expected object`);
       }
       validatedToolCalls.push({
+        id: tcRecord.id,
         function: {
           name: fnRecord.name,
           arguments: fnRecord.arguments as Record<string, any>,
@@ -431,5 +441,110 @@ export class OllamaProvider extends IMotorCognitivo {
 
     // Se chegou aqui, todas as tentativas falharam
     throw lastError ?? new Error('[OllamaProvider] Unknown failure after retry');
+  }
+
+  /**
+   * Envia mensagens ao motor cognitivo e retorna um fluxo de chunks de texto
+   * (streaming), útil para enviar tokens progressivamente via IPC no Electron.
+   *
+   * @param mensagens - Array de mensagens no formato ChatMessage[].
+   * @param tools - Array opcional de definições de ferramentas (tool calling).
+   * @param signal - Sinal opcional para cancelamento do stream.
+   * @returns AsyncIterable<string> — cada chunk é um fragmento de texto da resposta.
+   */
+  async *gerarRespostaStream(
+    mensagens: ChatMessage[],
+    tools?: IToolDefinition[],
+    signal?: AbortSignal
+  ): AsyncIterable<string> {
+    const url = `${this.baseUrl}/api/chat`;
+
+    const payload: Record<string, any> = {
+      model: this.model,
+      messages: mensagens,
+      stream: true,
+    };
+
+    if (tools && tools.length > 0) {
+      payload.tools = tools;
+    }
+
+    const controller = new AbortController();
+
+    // Propagate external signal if provided
+    if (signal) {
+      signal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+    if (this.externalSignal) {
+      this.externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+
+    this.logger.info(
+      `[OllamaProvider] Starting stream for model "${this.model}"` +
+      (tools ? ` with ${tools.length} tool(s) defined` : '')
+    );
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => 'No error body available');
+      throw new Error(
+        `[OllamaProvider] HTTP error ${response.status} during stream.\n` +
+        `  URL: ${url}\n  Model: ${this.model}\n  Details: ${errorBody}`
+      );
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('[OllamaProvider] Response body is not readable for streaming');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Ollama NDJSON: each line is a separate JSON object
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? ''; // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const chunk = JSON.parse(line) as { message?: { content?: string } };
+            if (chunk.message?.content) {
+              yield chunk.message.content;
+            }
+          } catch {
+            // Silently skip malformed JSON lines
+          }
+        }
+      }
+
+      // Process remaining buffer
+      if (buffer.trim()) {
+        try {
+          const chunk = JSON.parse(buffer) as { message?: { content?: string } };
+          if (chunk.message?.content) {
+            yield chunk.message.content;
+          }
+        } catch {
+          // Silently skip
+        }
+      }
+    } finally {
+      reader.releaseLock();
+      this.logger.info(`[OllamaProvider] Stream completed for model "${this.model}"`);
+    }
   }
 }

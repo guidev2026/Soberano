@@ -51,12 +51,20 @@ src/
     ISensor.ts
     ISessionManager.ts
     ITool.ts
+    IToolRegistry.ts
     IVectorStore.ts
   infra/
+    tools/
+      CalculatorTool.test.ts
+      CalculatorTool.ts
+      ReadFileTool.test.ts
+      ReadFileTool.ts
+      SystemTimeTool.ts
     CircuitBreaker.test.ts
     CircuitBreaker.ts
     ConsoleLogger.test.ts
     ConsoleLogger.ts
+    ConversationManager.test.ts
     ConversationManager.ts
     FileSensor.test.ts
     FileSensor.ts
@@ -67,6 +75,7 @@ src/
     NativeHttpServer.ts
     OllamaProvider.test.ts
     OllamaProvider.ts
+    ToolRegistry.ts
     validateOllamaResponse.test.ts
   env.d.ts
   main.ts
@@ -79,6 +88,289 @@ tsconfig.json
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/infra/ConversationManager.test.ts">
+/**
+ * @file ConversationManager.test.ts
+ * @description Testes unitários para o ConversationManager com foco no ReAct/Tool Calling Loop.
+ *              Utiliza node:test com classes mock concretas para garantir isolamento e determinismo.
+ *              Zero dependências externas.
+ *
+ * Cobertura:
+ * - Fluxo sem tool calling (resposta direta)
+ * - Fluxo com tool calling bem-sucedido (1 iteração)
+ * - Tool calling com ferramenta não encontrada
+ * - Tool calling que atinge maxToolIterations (fallback)
+ * - Tool calling com ToolRegistry ausente
+ * - Cancelamento via AbortSignal
+ */
+
+import { describe, it, mock } from 'node:test';
+import assert from 'node:assert';
+
+import { ConversationManager } from './ConversationManager.ts';
+import { IMotorCognitivo, type ChatMessage, type IToolDefinition } from '../core/IMotorCognitivo.ts';
+import { ISessionManager } from '../core/ISessionManager.ts';
+import { ILogger } from '../core/ILogger.ts';
+import { IToolRegistry } from '../core/IToolRegistry.ts';
+import { ITool } from '../core/ITool.ts';
+
+// ---------- Mocks concretos (classes que estendem as abstratas) ----------
+
+class MockLogger extends ILogger {
+  info = mock.fn();
+  warn = mock.fn();
+  error = mock.fn();
+  debug = mock.fn();
+}
+
+class MockSessionManager extends ISessionManager {
+  private historico: ChatMessage[] = [];
+
+  adicionarMensagem = mock.fn(async (_sessionId: string, mensagem: ChatMessage): Promise<void> => {
+    this.historico.push(mensagem);
+  });
+
+  obterHistorico = mock.fn(async (_sessionId: string): Promise<ReadonlyArray<ChatMessage>> => {
+    return [...this.historico];
+  });
+
+  limparSessao = mock.fn(async (_sessionId: string): Promise<void> => {
+    this.historico = [];
+  });
+}
+
+class MockMotor extends IMotorCognitivo {
+  private callIndex = 0;
+
+  constructor(private readonly respostas: ChatMessage[]) {
+    super();
+  }
+
+  setAbortSignal = mock.fn();
+
+  gerarResposta = mock.fn(async (_mensagens: ChatMessage[], _tools?: IToolDefinition[]): Promise<ChatMessage> => {
+    const r = this.respostas[this.callIndex];
+    if (!r) throw new Error('[MockMotor] No more responses configured');
+    this.callIndex++;
+    return r;
+  });
+
+  gerarRespostaStream = mock.fn(async function* (..._args: any[]): AsyncIterable<string> {
+    yield '';
+  });
+}
+
+class MockToolRegistry extends IToolRegistry {
+  private readonly map: Map<string, ITool>;
+
+  constructor(tools: ITool[]) {
+    super();
+    this.map = new Map(tools.map(t => [t.name, t]));
+  }
+
+  registrar = mock.fn();
+  obter = mock.fn((nome: string): ITool | undefined => this.map.get(nome));
+  obterTodas = mock.fn((): ITool[] => [...this.map.values()]);
+}
+
+/** Cria uma tool fake concreta que estende ITool */
+function criaToolFake(nome: string, resultado: any): ITool & { executeMock: ReturnType<typeof mock.fn> } {
+  const executeMock = mock.fn(async (_args: Record<string, any>) => resultado);
+  const tool = new (class extends ITool {
+    get name() { return nome; }
+    get description() { return `Ferramenta fake ${nome}`; }
+    get parametersSchema() { return { type: 'object' as const, properties: {} }; }
+    execute = executeMock;
+  })();
+  return Object.assign(tool, { executeMock });
+}
+
+// ---------- Testes ----------
+
+describe('ConversationManager - ReAct Loop', () => {
+  describe('fluxo sem tool calling', () => {
+    it('deve retornar resposta direta do assistant quando não há tool_calls', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const motor = new MockMotor([
+        { role: 'assistant', content: 'Resposta final.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager });
+      const resposta = await cm.conversar('sessao-1', 'Olá');
+
+      assert.strictEqual(resposta, 'Resposta final.');
+      assert.strictEqual(sessionManager.adicionarMensagem.mock.callCount(), 2); // user + assistant
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 1);
+    });
+  });
+
+  describe('fluxo com tool calling bem-sucedido', () => {
+    it('deve executar tool, salvar resultado e retornar resposta final', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolCalc = criaToolFake('calculadora', { resultado: 42 });
+      const toolRegistry = new MockToolRegistry([toolCalc]);
+
+      const motor = new MockMotor([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'call_abc123', function: { name: 'calculadora', arguments: { a: 1, b: 2 } } }],
+        },
+        { role: 'assistant', content: 'Resultado é 42.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
+      const resposta = await cm.conversar('sessao-2', 'Quanto é 1+2?');
+
+      assert.strictEqual(resposta, 'Resultado é 42.');
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2); // 1ª com tools, 2ª sem
+      assert.strictEqual(toolCalc.executeMock.mock.callCount(), 1);
+
+      // Verifica que o tool_call_id real foi usado na mensagem tool
+      const historico = await sessionManager.obterHistorico('sessao-2');
+      const toolMessages = historico.filter(m => m.role === 'tool');
+      assert.ok(toolMessages.some(m => m.tool_call_id === 'call_abc123'));
+    });
+  });
+
+  describe('tool calling com ferramenta não encontrada', () => {
+    it('deve retornar erro simulado quando ferramenta não existe no registry', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolRegistry = new MockToolRegistry([]);
+
+      const motor = new MockMotor([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'call_xyz', function: { name: 'toolInexistente', arguments: {} } }],
+        },
+        { role: 'assistant', content: 'Ferramenta não encontrada.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
+      const resposta = await cm.conversar('sessao-3', 'Execute toolInexistente');
+
+      assert.strictEqual(resposta, 'Ferramenta não encontrada.');
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2);
+    });
+  });
+
+  describe('maxToolIterations atingido', () => {
+    it('deve retornar fallback seguro quando excede o limite de iterações', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolCalc = criaToolFake('loopTool', { ok: true });
+      const toolRegistry = new MockToolRegistry([toolCalc]);
+
+      // Cada resposta pede tool novamente — simula loop infinito
+      const motor = new MockMotor([
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'loopTool', arguments: {} } }] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_2', function: { name: 'loopTool', arguments: {} } }] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_3', function: { name: 'loopTool', arguments: {} } }] },
+        // depth 3 >= maxToolIterations(3) — deve cair no fallback antes da 4ª chamada
+        { role: 'assistant', content: 'Nunca vou ser chamado.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry, maxToolIterations: 3 });
+      const resposta = await cm.conversar('sessao-4', 'Loop infinito');
+
+      // Deve ter chamado o motor 3 vezes (depth 0, 1, 2) e parado no fallback
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 3);
+      // A resposta é do tipo string (fallback seguro)
+      assert.strictEqual(typeof resposta, 'string');
+    });
+
+    it('deve retornar mensagem de corte quando fallback não encontra assistant com conteúdo', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolCalc = criaToolFake('loopTool', { ok: true });
+      const toolRegistry = new MockToolRegistry([toolCalc]);
+
+      // Apenas 1 resposta com tool_call (content vazio)
+      const motor = new MockMotor([
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'loopTool', arguments: {} } }] },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry, maxToolIterations: 1 });
+      const resposta = await cm.conversar('sessao-5', 'Loop');
+
+      // maxToolIterations=1, depth 0 < 1, depth 1 >= 1 — 1 chamada, fallback
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 1);
+      assert.strictEqual(
+        resposta,
+        '[SOBERANO] Limite de iterações de ferramentas atingido. A execução foi interrompida para garantir estabilidade.'
+      );
+    });
+  });
+
+  describe('ToolRegistry ausente', () => {
+    it('deve funcionar quando tool_calls são recebidas sem ToolRegistry', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+
+      const motor = new MockMotor([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'call_noop', function: { name: 'semRegistry', arguments: {} } }],
+        },
+        { role: 'assistant', content: 'ToolRegistry não configurado, mas segui em frente.' },
+      ]);
+
+      const cm = new ConversationManager({ logger, motor, sessionManager });
+      const resposta = await cm.conversar('sessao-6', 'Teste sem registry');
+
+      assert.strictEqual(resposta, 'ToolRegistry não configurado, mas segui em frente.');
+      assert.strictEqual(motor.gerarResposta.mock.callCount(), 2);
+    });
+  });
+
+  describe('cancelamento via AbortSignal', () => {
+    it('deve propagar o signal para o motor cognitivo', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const motor = new MockMotor([
+        { role: 'assistant', content: 'Resposta antes do abort.' },
+      ]);
+
+      const ac = new AbortController();
+      const cm = new ConversationManager({ logger, motor, sessionManager });
+      const resposta = await cm.conversar('sessao-7', 'Mensagem normal', ac.signal);
+
+      assert.strictEqual(resposta, 'Resposta antes do abort.');
+      assert.strictEqual(motor.setAbortSignal.mock.callCount(), 1);
+    });
+
+    it('deve propagar o signal na recursão do tool loop', async () => {
+      const logger = new MockLogger();
+      const sessionManager = new MockSessionManager();
+      const toolCalc = criaToolFake('calc', { resultado: 10 });
+      const toolRegistry = new MockToolRegistry([toolCalc]);
+
+      const motor = new MockMotor([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'call_1', function: { name: 'calc', arguments: {} } }],
+        },
+        { role: 'assistant', content: 'Recursão concluída.' },
+      ]);
+
+      const ac = new AbortController();
+      const cm = new ConversationManager({ logger, motor, sessionManager, toolRegistry });
+      const resposta = await cm.conversar('sessao-8', 'Teste com signal', ac.signal);
+
+      assert.strictEqual(resposta, 'Recursão concluída.');
+      // setAbortSignal foi chamado em cada depth (2 vezes)
+      assert.strictEqual(motor.setAbortSignal.mock.callCount(), 2);
+    });
+  });
+});
+</file>
 
 <file path="src/core/ICircuitBreaker.ts">
 /**
@@ -136,14 +428,16 @@ export abstract class IConversationManager {
    * 3. Obtém o histórico completo da sessão.
    * 4. Constrói uma mensagem system fundindo regras do SOBERANO com documentos recuperados.
    * 5. Envia o array de mensagens ao motor cognitivo.
-   * 6. Guarda a resposta (role: assistant) no SessionManager.
-   * 7. Retorna a resposta ao chamador.
+   * 6. Executa o ReAct/Tool Calling Loop se houver tool_calls.
+   * 7. Guarda a resposta (role: assistant) no SessionManager.
+   * 8. Retorna a resposta ao chamador.
    *
    * @param sessionId    - Identificador único da sessão de conversa.
    * @param inputUsuario - Texto de entrada do usuário.
+   * @param signal       - Sinal opcional para abortar a operação (graceful shutdown / cancelamento).
    * @returns A resposta gerada pelo motor cognitivo (role: assistant).
    */
-  abstract conversar(sessionId: string, inputUsuario: string): Promise<string>;
+  abstract conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string>;
 }
 </file>
 
@@ -247,6 +541,420 @@ export abstract class ITool {
         parameters: this.parametersSchema,
       },
     };
+  }
+}
+</file>
+
+<file path="src/core/IToolRegistry.ts">
+/**
+ * @file IToolRegistry.ts
+ * @description Contrato abstrato para o registro central de ferramentas (Tool Registry).
+ *              Segue o DIP: módulos de alto nível dependem desta abstração.
+ */
+
+import { ITool } from './ITool.ts';
+
+export abstract class IToolRegistry {
+  /**
+   * Registra uma ferramenta no registry.
+   * @param tool - Instância concreta de ITool a ser registrada.
+   */
+  abstract registrar(tool: ITool): void;
+
+  /**
+   * Obtém uma ferramenta pelo nome único.
+   * @param nome - Nome único da ferramenta (case-sensitive).
+   * @returns A instância de ITool ou undefined se não encontrada.
+   */
+  abstract obter(nome: string): ITool | undefined;
+
+  /**
+   * Retorna todas as ferramentas registradas.
+   * @returns Array de ITool.
+   */
+  abstract obterTodas(): ITool[];
+}
+</file>
+
+<file path="src/infra/tools/CalculatorTool.test.ts">
+/**
+ * @file CalculatorTool.test.ts
+ * @description Testes unitários para CalculatorTool utilizando node:test e node:assert.
+ *
+ * Como executar:
+ *   node --experimental-transform-types --test src/infra/tools/CalculatorTool.test.ts
+ */
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import { CalculatorTool } from './CalculatorTool.ts';
+
+describe('CalculatorTool', () => {
+  const tool = new CalculatorTool();
+
+  describe('Metadados da ferramenta', () => {
+    it('deve ter o nome "calculator"', () => {
+      assert.strictEqual(tool.name, 'calculator');
+    });
+
+    it('deve ter uma descrição não vazia', () => {
+      assert.ok(tool.description.length > 0);
+    });
+
+    it('deve ter um parametersSchema com operacao, a, b como required', () => {
+      const schema = tool.parametersSchema;
+      assert.strictEqual(schema.type, 'object');
+      assert.ok(Array.isArray(schema.required));
+      assert.ok(schema.required.includes('operacao'));
+      assert.ok(schema.required.includes('a'));
+      assert.ok(schema.required.includes('b'));
+    });
+  });
+
+  describe('Operação: soma', () => {
+    it('deve somar 2 + 3 e retornar 5', async () => {
+      const result = await tool.execute({ operacao: 'soma', a: 2, b: 3 });
+      assert.strictEqual(result.operacao, 'soma');
+      assert.strictEqual(result.a, 2);
+      assert.strictEqual(result.b, 3);
+      assert.strictEqual(result.resultado, 5);
+    });
+
+    it('deve somar números negativos', async () => {
+      const result = await tool.execute({ operacao: 'soma', a: -10, b: 5 });
+      assert.strictEqual(result.resultado, -5);
+    });
+  });
+
+  describe('Operação: subtracao', () => {
+    it('deve subtrair 10 - 3 e retornar 7', async () => {
+      const result = await tool.execute({ operacao: 'subtracao', a: 10, b: 3 });
+      assert.strictEqual(result.resultado, 7);
+    });
+
+    it('deve subtrair resultando negativo', async () => {
+      const result = await tool.execute({ operacao: 'subtracao', a: 3, b: 10 });
+      assert.strictEqual(result.resultado, -7);
+    });
+  });
+
+  describe('Operação: multiplicacao', () => {
+    it('deve multiplicar 4 * 5 e retornar 20', async () => {
+      const result = await tool.execute({ operacao: 'multiplicacao', a: 4, b: 5 });
+      assert.strictEqual(result.resultado, 20);
+    });
+
+    it('deve multiplicar por zero', async () => {
+      const result = await tool.execute({ operacao: 'multiplicacao', a: 9, b: 0 });
+      assert.strictEqual(result.resultado, 0);
+    });
+  });
+
+  describe('Operação: divisao', () => {
+    it('deve dividir 10 / 2 e retornar 5', async () => {
+      const result = await tool.execute({ operacao: 'divisao', a: 10, b: 2 });
+      assert.strictEqual(result.resultado, 5);
+    });
+
+    it('deve retornar erro ao dividir por zero', async () => {
+      const result = await tool.execute({ operacao: 'divisao', a: 10, b: 0 });
+      assert.ok(result.error);
+      assert.ok(result.error.includes('zero'));
+    });
+
+    it('deve retornar resultado decimal para divisão não exata', async () => {
+      const result = await tool.execute({ operacao: 'divisao', a: 7, b: 3 });
+      assert.ok(typeof result.resultado === 'number');
+      assert.ok(result.resultado > 0);
+    });
+  });
+
+  describe('Operação inválida', () => {
+    it('deve retornar erro para operação desconhecida', async () => {
+      const result = await tool.execute({ operacao: 'potencia', a: 2, b: 3 });
+      assert.ok(result.error);
+      assert.ok(result.error.includes('inválida'));
+    });
+  });
+
+  describe('Validação de tipos', () => {
+    it('deve retornar erro se "a" não for número', async () => {
+      const result = await tool.execute({ operacao: 'soma', a: 'dois', b: 3 });
+      assert.ok(result.error);
+      assert.ok(result.error.includes('número'));
+    });
+
+    it('deve retornar erro se "operacao" não for string', async () => {
+      const result = await tool.execute({ operacao: 123, a: 2, b: 3 });
+      assert.ok(result.error);
+      assert.ok(result.error.includes('string'));
+    });
+  });
+});
+</file>
+
+<file path="src/infra/tools/CalculatorTool.ts">
+/**
+ * @file CalculatorTool.ts
+ * @description Implementação concreta de ITool que realiza operações matemáticas
+ *              básicas entre dois números (soma, subtração, multiplicação, divisão).
+ *              Trata divisão por zero retornando erro em vez de lançar exceção.
+ */
+
+import { ITool } from '../../core/ITool.ts';
+
+export class CalculatorTool extends ITool {
+  get name(): string {
+    return 'calculator';
+  }
+
+  get description(): string {
+    return 'Realiza operações matemáticas básicas entre dois números.';
+  }
+
+  get parametersSchema(): Record<string, any> {
+    return {
+      type: 'object',
+      properties: {
+        operacao: {
+          type: 'string',
+          enum: ['soma', 'subtracao', 'multiplicacao', 'divisao'],
+          description: 'Operação matemática a ser realizada.',
+        },
+        a: {
+          type: 'number',
+          description: 'Primeiro número da operação.',
+        },
+        b: {
+          type: 'number',
+          description: 'Segundo número da operação.',
+        },
+      },
+      required: ['operacao', 'a', 'b'],
+    };
+  }
+
+  async execute(args: Record<string, any>): Promise<any> {
+    const { operacao, a, b } = args;
+
+    if (typeof a !== 'number' || typeof b !== 'number') {
+      return { error: 'Ambos os parâmetros "a" e "b" devem ser números.' };
+    }
+
+    if (typeof operacao !== 'string') {
+      return { error: 'O parâmetro "operacao" deve ser uma string.' };
+    }
+
+    switch (operacao) {
+      case 'soma': {
+        const resultado = a + b;
+        return { operacao, a, b, resultado };
+      }
+      case 'subtracao': {
+        const resultado = a - b;
+        return { operacao, a, b, resultado };
+      }
+      case 'multiplicacao': {
+        const resultado = a * b;
+        return { operacao, a, b, resultado };
+      }
+      case 'divisao': {
+        if (b === 0) {
+          return { error: 'Divisão por zero não é permitida.' };
+        }
+        const resultado = a / b;
+        return { operacao, a, b, resultado };
+      }
+      default:
+        return {
+          error: `Operação inválida: "${operacao}". Use uma das: soma, subtracao, multiplicacao, divisao.`,
+        };
+    }
+  }
+}
+</file>
+
+<file path="src/infra/tools/ReadFileTool.test.ts">
+/**
+ * @file ReadFileTool.test.ts
+ * @description Testes unitários para ReadFileTool utilizando node:test e node:assert.
+ *
+ * Como executar:
+ *   node --experimental-transform-types --test src/infra/tools/ReadFileTool.test.ts
+ */
+
+import { describe, it, beforeEach, afterEach } from 'node:test';
+import assert from 'node:assert';
+import { mkdtempSync, writeFileSync, mkdirSync, rmdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ReadFileTool } from './ReadFileTool.ts';
+
+describe('ReadFileTool', () => {
+  const tool = new ReadFileTool();
+  let tempDir: string;
+  let tempFilePath: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'readfile-test-'));
+    tempFilePath = join(tempDir, 'teste.txt');
+    writeFileSync(tempFilePath, 'Conteudo de teste do arquivo.', 'utf-8');
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  describe('Metadados da ferramenta', () => {
+    it('deve ter o nome "read_file"', () => {
+      assert.strictEqual(tool.name, 'read_file');
+    });
+
+    it('deve ter uma descrição não vazia', () => {
+      assert.ok(tool.description.length > 0);
+    });
+
+    it('deve ter um parametersSchema com caminho como required', () => {
+      const schema = tool.parametersSchema;
+      assert.strictEqual(schema.type, 'object');
+      assert.ok(Array.isArray(schema.required));
+      assert.ok(schema.required.includes('caminho'));
+    });
+  });
+
+  describe('Leitura bem-sucedida', () => {
+    it('deve ler o conteúdo de um arquivo existente', async () => {
+      const result = await tool.execute({ caminho: tempFilePath });
+      assert.strictEqual(result.caminho, tempFilePath);
+      assert.strictEqual(result.conteudo, 'Conteudo de teste do arquivo.');
+      assert.strictEqual(result.tamanho, result.conteudo.length);
+    });
+
+    it('deve retornar o tamanho correto em bytes', async () => {
+      const content = 'Hello, World!';
+      const filePath = join(tempDir, 'hello.txt');
+      writeFileSync(filePath, content, 'utf-8');
+      const result = await tool.execute({ caminho: filePath });
+      assert.strictEqual(result.tamanho, content.length);
+    });
+  });
+
+  describe('Tratamento de erros (fail-safe)', () => {
+    it('deve retornar erro para arquivo inexistente', async () => {
+      const result = await tool.execute({ caminho: join(tempDir, 'nao-existe.txt') });
+      assert.ok(result.error);
+      assert.ok(result.error.includes('não encontrado'));
+    });
+
+    it('deve retornar erro para caminho vazio', async () => {
+      const result = await tool.execute({ caminho: '' });
+      assert.ok(result.error);
+    });
+
+    it('deve retornar erro para caminho que é um diretório', async () => {
+      const result = await tool.execute({ caminho: tempDir });
+      assert.ok(result.error);
+      // Pode ser "é um diretório" ou "permissão negada" dependendo do SO
+      assert.ok(result.error);
+    });
+  });
+});
+</file>
+
+<file path="src/infra/tools/ReadFileTool.ts">
+/**
+ * @file ReadFileTool.ts
+ * @description Implementação concreta de ITool que lê o conteúdo de um arquivo
+ *              local no sistema utilizando node:fs/promises.
+ *              É fail-safe: retorna objeto de erro em vez de lançar exceção.
+ */
+
+import { ITool } from '../../core/ITool.ts';
+import { readFile } from 'node:fs/promises';
+
+export class ReadFileTool extends ITool {
+  get name(): string {
+    return 'read_file';
+  }
+
+  get description(): string {
+    return 'Lê o conteúdo de um arquivo local no sistema.';
+  }
+
+  get parametersSchema(): Record<string, any> {
+    return {
+      type: 'object',
+      properties: {
+        caminho: {
+          type: 'string',
+          description: 'Caminho absoluto ou relativo do arquivo a ser lido.',
+        },
+      },
+      required: ['caminho'],
+    };
+  }
+
+  async execute(args: Record<string, any>): Promise<any> {
+    const { caminho } = args;
+
+    if (typeof caminho !== 'string' || caminho.trim() === '') {
+      return { error: 'O parâmetro "caminho" deve ser uma string não vazia.' };
+    }
+
+    try {
+      const conteudo = await readFile(caminho, { encoding: 'utf-8' });
+      return { caminho, conteudo, tamanho: conteudo.length };
+    } catch (err: any) {
+      let mensagem: string;
+      if (err && typeof err === 'object') {
+        if (err.code === 'ENOENT') {
+          mensagem = `Arquivo não encontrado: "${caminho}".`;
+        } else if (err.code === 'EACCES') {
+          mensagem = `Permissão negada para ler o arquivo: "${caminho}".`;
+        } else if (err.code === 'EISDIR') {
+          mensagem = `"${caminho}" é um diretório, não um arquivo.`;
+        } else {
+          mensagem = err.message ?? `Erro desconhecido ao ler arquivo "${caminho}".`;
+        }
+      } else {
+        mensagem = `Erro ao ler arquivo: "${caminho}".`;
+      }
+      return { error: mensagem };
+    }
+  }
+}
+</file>
+
+<file path="src/infra/tools/SystemTimeTool.ts">
+/**
+ * @file SystemTimeTool.ts
+ * @description Implementação concreta de ITool que retorna a data e hora atual
+ *              do sistema no formato ISO 8601.
+ *              Serve como ferramenta real de teste para o Tool Calling Loop.
+ */
+
+import { ITool } from '../../core/ITool.ts';
+
+export class SystemTimeTool extends ITool {
+  get name(): string {
+    return 'get_system_time';
+  }
+
+  get description(): string {
+    return 'Retorna a data e hora atual do sistema no formato ISO 8601.';
+  }
+
+  get parametersSchema(): Record<string, any> {
+    return {
+      type: 'object',
+      properties: {},
+      required: [],
+    };
+  }
+
+  async execute(_args: Record<string, any>): Promise<any> {
+    const now = new Date().toISOString();
+    return now;
   }
 }
 </file>
@@ -642,6 +1350,83 @@ describe('InMemorySessionManager', () => {
     });
   });
 });
+</file>
+
+<file path="src/infra/ToolRegistry.ts">
+/**
+ * @file ToolRegistry.ts
+ * @description Implementação concreta de IToolRegistry.
+ *              Gerencia o registro e consulta de ferramentas (ITool) em memória.
+ *              Segue o padrão Options Object para injeção de dependências.
+ *
+ *              Depende de abstrações (DIP): ILogger.
+ */
+
+import { IToolRegistry } from '../core/IToolRegistry.ts';
+import { ITool } from '../core/ITool.ts';
+import { ILogger } from '../core/ILogger.ts';
+
+export interface ToolRegistryOptions {
+  /** Instância obrigatória de ILogger para logging estruturado */
+  logger: ILogger;
+}
+
+export class ToolRegistry extends IToolRegistry {
+  private readonly tools: Map<string, ITool>;
+  private readonly logger: ILogger;
+
+  /**
+   * @param options - Options Object (ToolRegistryOptions).
+   *                  Apenas `logger` é obrigatório.
+   */
+  constructor(options: ToolRegistryOptions) {
+    super();
+    this.logger = options.logger;
+    this.tools = new Map();
+  }
+
+  /**
+   * Registra uma ferramenta no registry.
+   * Se uma ferramenta com o mesmo nome já existir, emite um aviso e sobrescreve.
+   *
+   * @param tool - Instância concreta de ITool a ser registrada.
+   */
+  registrar(tool: ITool): void {
+    const nome = tool.name;
+
+    if (this.tools.has(nome)) {
+      this.logger.warn(
+        `[ToolRegistry] Tool "${nome}" is already registered. Overwriting previous registration.`
+      );
+    }
+
+    this.tools.set(nome, tool);
+    this.logger.info(`[ToolRegistry] Tool registered: "${nome}"`);
+  }
+
+  /**
+   * Obtém uma ferramenta pelo nome único.
+   *
+   * @param nome - Nome único da ferramenta (case-sensitive).
+   * @returns A instância de ITool ou undefined se não encontrada.
+   */
+  obter(nome: string): ITool | undefined {
+    const tool = this.tools.get(nome);
+    if (!tool) {
+      this.logger.debug(`[ToolRegistry] Tool "${nome}" not found.`);
+    }
+    return tool;
+  }
+
+  /**
+   * Retorna todas as ferramentas registradas.
+   *
+   * @returns Array de ITool.
+   */
+  obterTodas(): ITool[] {
+    return Array.from(this.tools.values());
+  }
+}
 </file>
 
 <file path=".gitignore">
@@ -1131,203 +1916,6 @@ export class ConsoleLogger extends ILogger {
     if (this.level <= LogLevel.DEBUG) {
       console.log(this.formatMessage('DEBUG', message));
     }
-  }
-}
-</file>
-
-<file path="src/infra/ConversationManager.ts">
-/**
- * @file ConversationManager.ts
- * @description Implementação do Maestro — orquestrador central que concretiza
- *              a Sprint 5.3 (Fusão de Contexto). Une a Memória Vetorial (RAG)
- *              e a Memória de Curto Prazo (Sessões) em um único fluxo.
- *
- *              Depende de abstrações (DIP): ILogger, IMotorCognitivo,
- *              ISessionManager e opcionalmente IVectorStore.
- *
- *              Fluxo do método conversar():
- *              1. Guarda inputUsuario no SessionManager (role: user).
- *              2. Se IVectorStore existir, gera um embedding heurístico simples
- *                 (baseado no comprimento do texto) para buscar contextos similares.
- *              3. Obtém o histórico atualizado do SessionManager.
- *              4. Constrói mensagem system fundindo regras do SOBERANO
- *                 com os documentos recuperados do VectorStore (Context Fusion).
- *              5. Envia [SystemMessage, ...Historico] para IMotorCognitivo.gerarResposta().
- *              6. Guarda resposta (role: assistant) no SessionManager.
- *              7. Retorna resposta ao chamador.
- */
-
-import { IConversationManager } from '../core/IConversationManager.ts';
-import type { ChatMessage } from '../core/IMotorCognitivo.ts';
-import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
-import { ISessionManager } from '../core/ISessionManager.ts';
-import { IVectorStore } from '../core/IVectorStore.ts';
-import { ILogger } from '../core/ILogger.ts';
-
-export interface ConversationManagerOptions {
-  /** Instância obrigatória de ILogger para logging estruturado */
-  logger: ILogger;
-  /** Instância obrigatória do motor cognitivo (LLM) */
-  motor: IMotorCognitivo;
-  /** Instância obrigatória do gerenciador de sessões */
-  sessionManager: ISessionManager;
-  /** Instância opcional do Vector Store para RAG (Memória Vetorial).
-   *  Se não fornecida, o RAG é desabilitado. */
-  vectorStore?: IVectorStore;
-  /** Nome do sistema SOBERANO para a mensagem de system prompt */
-  systemName?: string;
-}
-
-export class ConversationManager extends IConversationManager {
-  private readonly logger: ILogger;
-  private readonly motor: IMotorCognitivo;
-  private readonly sessionManager: ISessionManager;
-  private readonly vectorStore?: IVectorStore;
-  private readonly systemName: string;
-
-  /**
-   * @param options - Options Object (ConversationManagerOptions).
-   *                  Apenas `logger`, `motor` e `sessionManager` são obrigatórios.
-   */
-  constructor(options: ConversationManagerOptions) {
-    super();
-    this.logger = options.logger;
-    this.motor = options.motor;
-    this.sessionManager = options.sessionManager;
-    this.vectorStore = options.vectorStore;
-    this.systemName = options.systemName ?? 'SOBERANO';
-  }
-
-  /**
-   * Gera um embedding heurístico simples a partir de um texto.
-   * Cada palavra contribui com uma dimensão baseada no hash do caractere.
-   * Isso permite buscas no VectorStore mesmo sem um provedor de embeddings real.
-   *
-   * @param text - Texto a ser convertido em vetor
-   * @returns Vetor numérico de 10 dimensões
-   */
-  private gerarEmbeddingHeuristico(text: string): number[] {
-    const words = text.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
-    const dimensions = 10;
-    const vector = new Array(dimensions).fill(0);
-
-    for (let i = 0; i < words.length; i++) {
-      const word = words[i] as string;
-      for (let j = 0; j < word.length; j++) {
-        const dim = j % dimensions;
-        vector[dim] = (vector[dim] as number) + (word.charCodeAt(j) % 10) + 1;
-      }
-    }
-
-    // Normaliza para evitar valores muito grandes
-    const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
-    if (magnitude > 0) {
-      for (let i = 0; i < dimensions; i++) {
-        vector[i] = (vector[i] as number) / magnitude;
-      }
-    }
-
-    return vector;
-  }
-
-  /**
-   * Processa uma interação completa de conversa multi-turno com RAG.
-   *
-   * @param sessionId    - Identificador único da sessão.
-   * @param inputUsuario - Texto de entrada do usuário.
-   * @returns A resposta gerada pelo motor cognitivo.
-   */
-  async conversar(sessionId: string, inputUsuario: string): Promise<string> {
-    this.logger.info(
-      `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
-    );
-
-    // --- Passo 1: Guarda o input do usuário na sessão ---
-    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
-    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
-    this.logger.debug('[ConversationManager] User message saved to session.');
-
-    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
-    let documentosRecuperados: string[] = [];
-    if (this.vectorStore) {
-      try {
-        // Gera embedding heurístico para a consulta do usuário
-        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
-        this.logger.debug(
-          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
-        );
-
-        // Busca os 3 documentos mais similares
-        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
-
-        if (resultados.length > 0) {
-          documentosRecuperados = resultados.map((r) => {
-            const metadata = r.metadata as Record<string, unknown>;
-            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
-          });
-          this.logger.info(
-            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
-          );
-        } else {
-          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
-        }
-      } catch (ragError) {
-        this.logger.error(
-          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
-        );
-        throw ragError;
-      }
-    } else {
-      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
-    }
-
-    // --- Passo 3: Obtém o histórico completo da sessão ---
-    const historico = await this.sessionManager.obterHistorico(sessionId);
-    this.logger.debug(
-      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
-    );
-
-    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
-    let systemContent =
-      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
-      `Responda em Português do Brasil de forma clara e objetiva. ` +
-      `Mantenha o contexto da conversa ao responder.`;
-
-    if (documentosRecuperados.length > 0) {
-      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
-      systemContent +=
-        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
-        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
-        `mas não invente informações que não estejam presentes.`;
-    }
-
-    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
-
-    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
-    const historicoFiltrado = historico.filter(m => m.role !== 'system');
-
-    // --- Passo 5: Monta array final e envia ao motor cognitivo ---
-    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
-
-    this.logger.info(
-      `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +
-      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'}).`
-    );
-
-    const respostaMessage = await this.motor.gerarResposta(mensagensParaMotor);
-
-    // --- Passo 6: Guarda a resposta (assistant) na sessão ---
-    const respostaContent = respostaMessage.content;
-    const mensagemAssistant: ChatMessage = { role: 'assistant', content: respostaContent };
-    await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
-
-    this.logger.info(
-      `[ConversationManager] Assistant response saved to session "${sessionId}". ` +
-      `Response length: ${respostaContent.length} chars.`
-    );
-
-    // --- Passo 7: Retorna a resposta ---
-    return respostaContent;
   }
 }
 </file>
@@ -2278,6 +2866,7 @@ describe('validateOllamaResponse (função pura) - /api/chat', () => {
           content: '',
           tool_calls: [
             {
+              id: 'call_abc123',
               function: {
                 name: 'get_weather',
                 arguments: { city: 'São Paulo' },
@@ -2323,12 +2912,14 @@ describe('validateOllamaResponse (função pura) - /api/chat', () => {
           content: '',
           tool_calls: [
             {
+              id: 'call_abc123',
               function: {
                 name: 'get_weather',
                 arguments: { city: 'São Paulo' },
               },
             },
             {
+              id: 'call_def456',
               function: {
                 name: 'get_time',
                 arguments: { timezone: 'America/Sao_Paulo' },
@@ -2389,7 +2980,10 @@ export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   /** Chamadas de ferramenta emitidas pelo assistant (tool_calls do Ollama/OpenAI). */
-  tool_calls?: Array<{ function: { name: string; arguments: Record<string, any> } }>;
+  tool_calls?: Array<{
+    id: string;
+    function: { name: string; arguments: Record<string, any> };
+  }>;
   /** ID de correlação para tool call (formato OpenAI/Ollama compatível). */
   tool_call_id?: string;
 }
@@ -2423,6 +3017,21 @@ export abstract class IMotorCognitivo {
    *          tool_calls se o modelo decidir chamar uma ferramenta.
    */
   abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
+
+  /**
+   * Envia mensagens ao motor cognitivo e retorna um fluxo de chunks de texto
+   * (streaming), compatível com AsyncIterable para envio progressivo via IPC.
+   *
+   * @param mensagens - Array de mensagens no formato ChatMessage[].
+   * @param tools - Array opcional de definições de ferramentas (tool calling).
+   * @param signal - Sinal opcional para cancelamento do stream.
+   * @returns AsyncIterable<string> — cada chunk é um fragmento de texto da resposta.
+   */
+  abstract gerarRespostaStream(
+    mensagens: ChatMessage[],
+    tools?: IToolDefinition[],
+    signal?: AbortSignal
+  ): AsyncIterable<string>;
 }
 </file>
 
@@ -2575,6 +3184,400 @@ export class CircuitBreaker extends ICircuitBreaker {
 
     this.logger.info(
       `[CircuitBreaker] State transition: ${oldState} -> ${newState}`
+    );
+  }
+}
+</file>
+
+<file path="src/infra/ConversationManager.ts">
+/**
+ * @file ConversationManager.ts
+ * @description Implementação do Maestro — orquestrador central que concretiza
+ *              a Sprint 5.3 (Fusão de Contexto). Une a Memória Vetorial (RAG)
+ *              e a Memória de Curto Prazo (Sessões) em um único fluxo.
+ *
+ *              A partir da Fase 6, implementa o ReAct/Tool Calling Loop:
+ *              - Se um ToolRegistry for fornecido, expõe as ferramentas ao LLM.
+ *              - Detecta tool_calls na resposta, executa as ferramentas localmente,
+ *                realimenta o resultado e repete o ciclo até o LLM gerar a resposta final
+ *                (máximo de 3 iterações por segurança).
+ *
+ *              Depende de abstrações (DIP): ILogger, IMotorCognitivo,
+ *              ISessionManager, IToolRegistry (opcional) e IVectorStore (opcional).
+ */
+
+import { IConversationManager } from '../core/IConversationManager.ts';
+import type { ChatMessage, IToolDefinition } from '../core/IMotorCognitivo.ts';
+import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
+import { ISessionManager } from '../core/ISessionManager.ts';
+import { IVectorStore } from '../core/IVectorStore.ts';
+import { ILogger } from '../core/ILogger.ts';
+import { IToolRegistry } from '../core/IToolRegistry.ts';
+
+export interface ConversationManagerOptions {
+  /** Instância obrigatória de ILogger para logging estruturado */
+  logger: ILogger;
+  /** Instância obrigatória do motor cognitivo (LLM) */
+  motor: IMotorCognitivo;
+  /** Instância obrigatória do gerenciador de sessões */
+  sessionManager: ISessionManager;
+  /** Instância opcional do Vector Store para RAG (Memória Vetorial).
+   *  Se não fornecida, o RAG é desabilitado. */
+  vectorStore?: IVectorStore;
+  /** Instância opcional do Tool Registry para Tool Calling.
+   *  Se não fornecida, o Tool Calling é desabilitado. */
+  toolRegistry?: IToolRegistry;
+  /** Nome do sistema SOBERANO para a mensagem de system prompt */
+  systemName?: string;
+  /** Número máximo de iterações do Tool Calling Loop (segurança anti-loop infinito).
+   *  Padrão: 3 */
+  maxToolIterations?: number;
+}
+
+export class ConversationManager extends IConversationManager {
+  private readonly logger: ILogger;
+  private readonly motor: IMotorCognitivo;
+  private readonly sessionManager: ISessionManager;
+  private readonly vectorStore?: IVectorStore;
+  private readonly toolRegistry?: IToolRegistry;
+  private readonly systemName: string;
+  private readonly maxToolIterations: number;
+
+  /**
+   * @param options - Options Object (ConversationManagerOptions).
+   *                  Apenas `logger`, `motor` e `sessionManager` são obrigatórios.
+   */
+  constructor(options: ConversationManagerOptions) {
+    super();
+    this.logger = options.logger;
+    this.motor = options.motor;
+    this.sessionManager = options.sessionManager;
+    this.vectorStore = options.vectorStore;
+    this.toolRegistry = options.toolRegistry;
+    this.systemName = options.systemName ?? 'SOBERANO';
+    this.maxToolIterations = options.maxToolIterations ?? 3;
+  }
+
+  /**
+   * Gera um embedding heurístico simples a partir de um texto.
+   * Cada palavra contribui com uma dimensão baseada no hash do caractere.
+   * Isso permite buscas no VectorStore mesmo sem um provedor de embeddings real.
+   *
+   * @param text - Texto a ser convertido em vetor
+   * @returns Vetor numérico de 10 dimensões
+   */
+  private gerarEmbeddingHeuristico(text: string): number[] {
+    const words = text.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
+    const dimensions = 10;
+    const vector = new Array(dimensions).fill(0);
+
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i] as string;
+      for (let j = 0; j < word.length; j++) {
+        const dim = j % dimensions;
+        vector[dim] = (vector[dim] as number) + (word.charCodeAt(j) % 10) + 1;
+      }
+    }
+
+    // Normaliza para evitar valores muito grandes
+    const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
+    if (magnitude > 0) {
+      for (let i = 0; i < dimensions; i++) {
+        vector[i] = (vector[i] as number) / magnitude;
+      }
+    }
+
+    return vector;
+  }
+
+  /**
+   * Processa uma interação completa de conversa multi-turno com RAG e Tool Calling.
+   *
+   * Fluxo:
+   * 1. Guarda inputUsuario no SessionManager (role: user).
+   * 2. Se IVectorStore existir, gera embedding heurístico e busca contextos similares.
+   * 3. Obtém o histórico atualizado do SessionManager.
+   * 4. Constrói mensagem system fundindo regras do SOBERANO com documentos recuperados.
+   * 5. Se ToolRegistry existir, obtém definições das ferramentas para expor ao LLM.
+   * 6. Chama o motor cognitivo com as definições de ferramentas.
+   * 7. Executa o ReAct/Tool Calling Loop (se houver tool_calls).
+   * 8. Quando não houver mais tool_calls, guarda e retorna a resposta final.
+   *
+   * @param sessionId    - Identificador único da sessão.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @returns A resposta gerada pelo motor cognitivo.
+   */
+  async conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string> {
+    this.logger.info(
+      `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
+    );
+
+    // --- Passo 1: Guarda o input do usuário na sessão ---
+    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
+    this.logger.debug('[ConversationManager] User message saved to session.');
+
+    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
+    let documentosRecuperados: string[] = [];
+    if (this.vectorStore) {
+      try {
+        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
+        this.logger.debug(
+          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
+        );
+
+        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
+
+        if (resultados.length > 0) {
+          documentosRecuperados = resultados.map((r) => {
+            const metadata = r.metadata as Record<string, unknown>;
+            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
+          });
+          this.logger.info(
+            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
+          );
+        } else {
+          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
+        }
+      } catch (ragError) {
+        this.logger.error(
+          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
+        );
+        throw ragError;
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
+    }
+
+    // --- Passo 3: Obtém o histórico completo da sessão ---
+    const historico = await this.sessionManager.obterHistorico(sessionId);
+    this.logger.debug(
+      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
+    );
+
+    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
+    let systemContent =
+      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
+      `Responda em Português do Brasil de forma clara e objetiva. ` +
+      `Mantenha o contexto da conversa ao responder.`;
+
+    if (documentosRecuperados.length > 0) {
+      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
+      systemContent +=
+        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
+        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
+        `mas não invente informações que não estejam presentes.`;
+    }
+
+    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
+
+    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
+    const historicoFiltrado = historico.filter(m => m.role !== 'system');
+
+    // --- Passo 5: Obtém definições das ferramentas se ToolRegistry estiver disponível ---
+    let toolDefinitions: IToolDefinition[] | undefined = undefined;
+    if (this.toolRegistry) {
+      const ferramentas = this.toolRegistry.obterTodas();
+      if (ferramentas.length > 0) {
+        toolDefinitions = ferramentas.map((f) => f.getDefinition());
+        this.logger.info(
+          `[ConversationManager] Exposing ${toolDefinitions.length} tool(s) to cognitive engine: ` +
+          ferramentas.map((f) => `"${f.name}"`).join(', ')
+        );
+      } else {
+        this.logger.debug('[ConversationManager] ToolRegistry has no tools registered.');
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No ToolRegistry configured. Tool Calling disabled.');
+    }
+
+    // Monta array inicial de mensagens para enviar ao motor
+    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
+
+    this.logger.info(
+      `[ConversationManager] Sending ${mensagensParaMotor.length} messages to cognitive engine ` +
+      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'})` +
+      (toolDefinitions ? ` with ${toolDefinitions.length} tool(s)` : '.')
+    );
+
+    // --- Passo 6: Executa o ReAct/Tool Calling Loop ---
+    const respostaFinal = await this.executarToolLoop(
+      sessionId,
+      mensagensParaMotor,
+      toolDefinitions,
+      0,
+      signal
+    );
+
+    return respostaFinal;
+  }
+
+  /**
+   * Executa o ReAct/Tool Calling Loop recursivo.
+   *
+   * 1. Envia as mensagens (com tool definitions, se for a primeira chamada) ao motor.
+   * 2. Se a resposta contiver tool_calls:
+   *    a. Guarda a mensagem do assistant (com tool_calls) no SessionManager.
+   *    b. Itera sobre cada tool_call, executa ou cria erro simulado.
+   *    c. Cria mensagens tool com os resultados e guarda no SessionManager.
+   *    d. Rechama recursivamente SEM tool definitions para o LLM processar os resultados.
+   * 3. Se não houver tool_calls, guarda a resposta final e retorna.
+   *
+   * @param sessionId      - Identificador da sessão.
+   * @param mensagens      - Array de mensagens para enviar ao motor.
+   * @param toolDefinitions - Definições de ferramentas (opcional, apenas na 1ª chamada).
+   * @param depth          - Profundidade atual do loop (controle anti-loop infinito).
+   * @returns O texto da resposta final do assistente.
+   */
+  private async executarToolLoop(
+    sessionId: string,
+    mensagens: ChatMessage[],
+    toolDefinitions?: IToolDefinition[],
+    depth: number = 0,
+    signal?: AbortSignal
+  ): Promise<string> {
+    if (depth >= this.maxToolIterations) {
+      this.logger.warn(
+        `[ConversationManager] Tool loop reached maximum depth (${this.maxToolIterations}). ` +
+        `Returning safe fallback message.`
+      );
+
+      // Fallback seguro: busca a última mensagem assistant no SessionManager
+      // Se não encontrar, retorna mensagem limpa informando o corte da execução
+      const historico = await this.sessionManager.obterHistorico(sessionId);
+      const ultimaAssistant = historico.filter(m => m.role === 'assistant').pop();
+      if (ultimaAssistant && ultimaAssistant.content) {
+        return ultimaAssistant.content;
+      }
+
+      const fallbackMsg = '[SOBERANO] Limite de iterações de ferramentas atingido. A execução foi interrompida para garantir estabilidade.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      return fallbackMsg;
+    }
+
+    // --- Passo A: Envia as mensagens ao motor ---
+    // Propaga o AbortSignal externo para o motor cognitivo
+    if (signal) {
+      this.motor.setAbortSignal(signal);
+    }
+    const respostaMessage = await this.motor.gerarResposta(mensagens, toolDefinitions);
+
+    // --- Passo B: Verifica se a resposta contém tool_calls ---
+    const hasToolCalls = respostaMessage.tool_calls && respostaMessage.tool_calls.length > 0;
+
+    if (!hasToolCalls) {
+      // --- Passo E: Sem tool_calls — guarda e retorna resposta final ---
+      const respostaContent = respostaMessage.content;
+      const mensagemAssistant: ChatMessage = { role: 'assistant', content: respostaContent };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
+
+      this.logger.info(
+        `[ConversationManager] Final assistant response (depth ${depth}). ` +
+        `Response length: ${respostaContent.length} chars.`
+      );
+
+      return respostaContent;
+    }
+
+    // --- Passo C: Resposta contém tool_calls — processa ---
+    this.logger.info(
+      `[ConversationManager] Tool calls detected (depth ${depth}): ` +
+      `${respostaMessage.tool_calls!.length} tool call(s).`
+    );
+
+    // Guarda a mensagem do assistant contendo o pedido das ferramentas (crucial para contexto da LLM)
+    await this.sessionManager.adicionarMensagem(sessionId, respostaMessage);
+    this.logger.debug('[ConversationManager] Assistant message with tool_calls saved to session.');
+
+    // Itera sobre cada tool_call
+    const toolResultMessages: ChatMessage[] = [];
+
+    for (let i = 0; i < respostaMessage.tool_calls!.length; i++) {
+      const toolCall = respostaMessage.tool_calls![i] as {
+        id: string;
+        function: { name: string; arguments: Record<string, any> };
+      };
+      const toolName = toolCall.function.name;
+      const toolArgs = toolCall.function.arguments;
+      // Extrai o tool_call_id real emitido pelo LLM. O campo `id` foi validado
+      // e extraído durante o parse da resposta em OllamaProvider.
+      const toolCallId = toolCall.id;
+
+      this.logger.info(
+        `[ConversationManager] Executing tool "${toolName}" ` +
+        `with arguments: ${JSON.stringify(toolArgs)}`
+      );
+
+      let resultado: any;
+
+      if (this.toolRegistry) {
+        const ferramenta = this.toolRegistry.obter(toolName);
+
+        if (ferramenta) {
+          try {
+            resultado = await ferramenta.execute(toolArgs);
+            this.logger.info(
+              `[ConversationManager] Tool "${toolName}" executed successfully. ` +
+              `Result: ${JSON.stringify(resultado)}`
+            );
+          } catch (execError) {
+            const errorMsg = execError instanceof Error ? execError.message : String(execError);
+            this.logger.error(
+              `[ConversationManager] Tool "${toolName}" execution failed: ${errorMsg}`
+            );
+            resultado = { error: `Tool execution failed: ${errorMsg}` };
+          }
+        } else {
+          // Ferramenta não encontrada no registry
+          this.logger.error(
+            `[ConversationManager] Tool "${toolName}" not found in registry. ` +
+            `Available tools: ${this.toolRegistry.obterTodas().map((t) => `"${t.name}"`).join(', ')}`
+          );
+          resultado = { error: `Tool "${toolName}" not found. Available tools: ${this.toolRegistry.obterTodas().map((t) => t.name).join(', ')}` };
+        }
+      } else {
+        // ToolRegistry não configurado — cria mensagem de erro simulando a ferramenta
+        this.logger.warn(
+          `[ConversationManager] Tool "${toolName}" called but no ToolRegistry configured. ` +
+          `Returning simulated error.`
+        );
+        resultado = { error: `Tool "${toolName}" não está disponível porque nenhum ToolRegistry foi configurado.` };
+      }
+
+      // Cria uma ChatMessage com role: 'tool' contendo o resultado da execução em JSON
+      const toolResultMessage: ChatMessage = {
+        role: 'tool',
+        content: JSON.stringify(resultado),
+        tool_call_id: toolCallId,
+      };
+
+      // Adiciona ao array de resultados e guarda na sessão
+      toolResultMessages.push(toolResultMessage);
+      await this.sessionManager.adicionarMensagem(sessionId, toolResultMessage);
+      this.logger.debug(
+        `[ConversationManager] Tool result message saved for "${toolName}" (tool_call_id: ${toolCallId}).`
+      );
+    }
+
+    // --- Passo D: Rechama o motor com o histórico atualizado (sem tool definitions) ---
+    // Busca o histórico completo do SessionManager, que já contém a mensagem assistant
+    // com tool_calls e os tool results salvos nos passos anteriores (single source of truth).
+    // Isso elimina a duplicação: a mensagem NÃO é incluída manualmente no array de recursão.
+    const historicoAtualizado = await this.sessionManager.obterHistorico(sessionId);
+    const mensagensComResultados: ChatMessage[] = [mensagens[0]!, ...historicoAtualizado.filter(m => m.role !== 'system')];
+
+    this.logger.info(
+      `[ConversationManager] Re-invoking cognitive engine (depth ${depth + 1}) with updated context.`
+    );
+
+    // Chama recursivamente o loop SEM tool definitions (apenas para processar o resultado da ferramenta)
+    return this.executarToolLoop(
+      sessionId,
+      mensagensComResultados,
+      undefined, // Sem tool definitions na recursão
+      depth + 1,
+      signal
     );
   }
 }
@@ -2832,33 +3835,6 @@ describe('CircuitBreaker', () => {
 });
 </file>
 
-<file path="package.json">
-{
-  "name": "soberano",
-  "version": "0.3.0",
-  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
-  "type": "module",
-  "scripts": {
-    "start": "node --experimental-transform-types src/main.ts",
-    "test": "node --experimental-transform-types --test src/infra/*.test.ts",
-    "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
-    "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
-    "test:file": "node --experimental-transform-types src/infra/FileSensor.test.ts",
-    "test:http": "node --experimental-transform-types --test src/infra/NativeHttpServer.test.ts",
-    "typecheck": "tsc --noEmit"
-  },
-  "keywords": [
-    "soberano",
-    "llm",
-    "ollama"
-  ],
-  "license": "MIT",
-  "devDependencies": {
-    "typescript": "^6.0.3"
-  }
-}
-</file>
-
 <file path="src/infra/OllamaProvider.test.ts">
 /**
  * @file OllamaProvider.test.ts
@@ -3069,6 +4045,33 @@ describe('OllamaProvider', () => {
 });
 </file>
 
+<file path="package.json">
+{
+  "name": "soberano",
+  "version": "0.6.4",
+  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-transform-types src/main.ts",
+    "test": "node --experimental-transform-types --test src/infra/*.test.ts src/infra/tools/*.test.ts",
+    "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
+    "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
+    "test:file": "node --experimental-transform-types src/infra/FileSensor.test.ts",
+    "test:http": "node --experimental-transform-types --test src/infra/NativeHttpServer.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "soberano",
+    "llm",
+    "ollama"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
+</file>
+
 <file path="src/infra/OllamaProvider.ts">
 /**
  * @file OllamaProvider.ts
@@ -3102,7 +4105,10 @@ export interface OllamaChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   images?: string[];
-  tool_calls?: Array<{ function: { name: string; arguments: Record<string, any> } }>;
+  tool_calls?: Array<{
+    id: string;
+    function: { name: string; arguments: Record<string, any> };
+  }>;
 }
 
 export interface OllamaChatResponse {
@@ -3184,7 +4190,10 @@ export function validateOllamaResponse(data: unknown): OllamaChatResponse {
   }
 
   // Valida tool_calls se presente
-  let validatedToolCalls: Array<{ function: { name: string; arguments: Record<string, any> } }> | undefined;
+  let validatedToolCalls: Array<{
+    id: string;
+    function: { name: string; arguments: Record<string, any> }
+  }> | undefined;
   if (hasToolCalls) {
     validatedToolCalls = [];
     for (const tc of messageRecord.tool_calls as Array<unknown>) {
@@ -3192,6 +4201,9 @@ export function validateOllamaResponse(data: unknown): OllamaChatResponse {
         throw new Error(`[OllamaProvider] Invalid tool_call entry: expected object`);
       }
       const tcRecord = tc as Record<string, unknown>;
+      if (typeof tcRecord.id !== 'string') {
+        throw new Error(`[OllamaProvider] Invalid tool_call.id: expected string, received ${typeof tcRecord.id}`);
+      }
       if (tcRecord.function === null || tcRecord.function === undefined || typeof tcRecord.function !== 'object') {
         throw new Error(`[OllamaProvider] Invalid tool_call.function: expected object`);
       }
@@ -3203,6 +4215,7 @@ export function validateOllamaResponse(data: unknown): OllamaChatResponse {
         throw new Error(`[OllamaProvider] Invalid tool_call.function.arguments: expected object`);
       }
       validatedToolCalls.push({
+        id: tcRecord.id,
         function: {
           name: fnRecord.name,
           arguments: fnRecord.arguments as Record<string, any>,
@@ -3504,6 +4517,111 @@ export class OllamaProvider extends IMotorCognitivo {
     // Se chegou aqui, todas as tentativas falharam
     throw lastError ?? new Error('[OllamaProvider] Unknown failure after retry');
   }
+
+  /**
+   * Envia mensagens ao motor cognitivo e retorna um fluxo de chunks de texto
+   * (streaming), útil para enviar tokens progressivamente via IPC no Electron.
+   *
+   * @param mensagens - Array de mensagens no formato ChatMessage[].
+   * @param tools - Array opcional de definições de ferramentas (tool calling).
+   * @param signal - Sinal opcional para cancelamento do stream.
+   * @returns AsyncIterable<string> — cada chunk é um fragmento de texto da resposta.
+   */
+  async *gerarRespostaStream(
+    mensagens: ChatMessage[],
+    tools?: IToolDefinition[],
+    signal?: AbortSignal
+  ): AsyncIterable<string> {
+    const url = `${this.baseUrl}/api/chat`;
+
+    const payload: Record<string, any> = {
+      model: this.model,
+      messages: mensagens,
+      stream: true,
+    };
+
+    if (tools && tools.length > 0) {
+      payload.tools = tools;
+    }
+
+    const controller = new AbortController();
+
+    // Propagate external signal if provided
+    if (signal) {
+      signal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+    if (this.externalSignal) {
+      this.externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+
+    this.logger.info(
+      `[OllamaProvider] Starting stream for model "${this.model}"` +
+      (tools ? ` with ${tools.length} tool(s) defined` : '')
+    );
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => 'No error body available');
+      throw new Error(
+        `[OllamaProvider] HTTP error ${response.status} during stream.\n` +
+        `  URL: ${url}\n  Model: ${this.model}\n  Details: ${errorBody}`
+      );
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('[OllamaProvider] Response body is not readable for streaming');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Ollama NDJSON: each line is a separate JSON object
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? ''; // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const chunk = JSON.parse(line) as { message?: { content?: string } };
+            if (chunk.message?.content) {
+              yield chunk.message.content;
+            }
+          } catch {
+            // Silently skip malformed JSON lines
+          }
+        }
+      }
+
+      // Process remaining buffer
+      if (buffer.trim()) {
+        try {
+          const chunk = JSON.parse(buffer) as { message?: { content?: string } };
+          if (chunk.message?.content) {
+            yield chunk.message.content;
+          }
+        } catch {
+          // Silently skip
+        }
+      }
+    } finally {
+      reader.releaseLock();
+      this.logger.info(`[OllamaProvider] Stream completed for model "${this.model}"`);
+    }
+  }
 }
 </file>
 
@@ -3615,6 +4733,28 @@ declare module 'node:fs/promises' {
   export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
 }
 
+// node:fs
+declare module 'node:fs' {
+  export function mkdtempSync(prefix: string): string;
+  export function writeFileSync(path: string, data: string, encoding?: string): void;
+  export function mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined;
+  export function rmdirSync(path: string, options?: { recursive?: boolean }): void;
+  export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
+  export function existsSync(path: string): boolean;
+}
+
+// node:os
+declare module 'node:os' {
+  export function tmpdir(): string;
+}
+
+// node:path
+declare module 'node:path' {
+  export function join(...paths: string[]): string;
+  export function resolve(...paths: string[]): string;
+  export function relative(from: string, to: string): string;
+}
+
 // node:assert
 declare module 'node:assert' {
   interface Assert {
@@ -3641,7 +4781,7 @@ declare module 'node:assert' {
 <file path="README.md">
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.6.0 — Fase 6 (Sistema de Agentes e Ferramentas)
+**Versão:** 0.6.4 — Sprint 6.4 (Red Team Fixes & Electron Prep)
 
 ## Stack
 
@@ -3685,7 +4825,14 @@ src/
 │   ├── InMemorySessionManager.ts   # Gestão de sessões em memória (ISessionManager)
 │   ├── InMemorySessionManager.test.ts
 │   ├── ConversationManager.ts      # Maestro: orquestra sessão + RAG + motor cognitivo
-│   └── ConversationManager.test.ts
+│   ├── ConversationManager.test.ts
+│   └── tools/                      # Arsenal de ferramentas do agente
+│       ├── SystemTimeTool.ts       # Retorna data/hora atual do sistema
+│       ├── SystemTimeTool.test.ts
+│       ├── CalculatorTool.ts       # Operações matemáticas básicas
+│       ├── CalculatorTool.test.ts
+│       ├── ReadFileTool.ts         # Leitura de arquivos locais
+│       └── ReadFileTool.test.ts
 ├── env.d.ts           # Tipos manuais para APIs nativas do Node
 └── main.ts            # Orquestração, wiring manual, ponto de entrada
 ```
@@ -3721,7 +4868,7 @@ src/
 | Contrato ISessionManager — gestão de sessões de conversa | ✅ |
 | InMemorySessionManager — implementação em memória com limite de mensagens | ✅ |
 | Contrato IConversationManager — Maestro de orquestração multi-turno | ✅ |
-| ConversationManager — pipeline: salva → RAG → funde contexto → envia → salva resposta | ✅ |
+| ConversationManager — pipeline: salva -> RAG -> funde contexto -> envia -> salva resposta | ✅ |
 | Embedding Heurístico — vetor de 10 dimensões sem dependência externa | ✅ |
 | Demonstração integrada no main.ts (2 turnos de conversa com sessão) | ✅ |
 | Interface IToolDefinition para definição de ferramentas no request /api/chat | ✅ |
@@ -3729,6 +4876,22 @@ src/
 | OllamaProvider envia tools[] no payload de /api/chat quando fornecido | ✅ |
 | Retorno de ChatMessage completo de gerarResposta (permite processar tool_calls) | ✅ |
 | validação de respostas com tool_calls (content vazio permitido se houver tool_calls) | ✅ |
+| Contrato IToolRegistry — registro e consulta de ferramentas | ✅ |
+| ToolRegistry — implementação concreta com Map<string, ITool> | ✅ |
+| SystemTimeTool — ferramenta concreta que retorna data/hora ISO 8601 | ✅ |
+| CalculatorTool — ferramenta de cálculo matemático (soma, subtração, multiplicação, divisão) | ✅ |
+| ReadFileTool — ferramenta de leitura de arquivos locais (fail-safe) | ✅ |
+| Demonstração multi-ferramenta no main.ts (calculator + get_system_time) | ✅ |
+| ReAct/Tool Calling Loop no ConversationManager (até 3 iterações, segurança anti-loop) | ✅ |
+| Detecção e execução de tool_calls com guarda de contexto no SessionManager | ✅ |
+| Tratamento de erros: ferramenta não encontrada, falha de execução, sem registry | ✅ |
+| Bugfix: Tool Call ID real extraído da resposta do LLM e repassado corretamente na mensagem tool | ✅ |
+| Bugfix: Eliminação de duplicação de mensagens assistant no histórico do SessionManager | ✅ |
+| Bugfix: Fallback seguro com mensagem de corte quando maxToolIterations é atingido | ✅ |
+| Suporte a cancelamento via AbortSignal no conversar() | ✅ |
+| Contrato gerarRespostaStream() no IMotorCognitivo para suporte a streaming | ✅ |
+| Implementação base de gerarRespostaStream no OllamaProvider | ✅ |
+| ConversationManager.test.ts — 8 testes unitários cobrindo ReAct Loop (tool calls, fallback, cancelamento) | ✅ |
 
 ## Como Executar
 
@@ -3761,7 +4924,8 @@ npm run typecheck
 | **4** | Qualidade de Teste e Determinismo — timeouts mínimos, mock.fn, assertions de retry | ✅ **Concluída** |
 | **5** | Gerenciamento de contexto e sessões multi-turno | ✅ **Concluída** |
 | **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
-| **7** | Web UI (React) + WebSocket | ⏳ Planejada |
+| **6.4** | Red Team Fixes (bugs críticos no loop ReAct) + Electron Prep (streaming, cancelamento) | ✅ **Concluída** |
+| **7** | Electron UI (n8n-style via IPC nativo) | 🔧 Em Preparação |
 
 ## Contratos do Core
 
@@ -3794,6 +4958,7 @@ interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   tool_calls?: Array<{
+    id: string;
     function: { name: string; arguments: Record<string, any> };
   }>;
   tool_call_id?: string;
@@ -3802,6 +4967,11 @@ interface ChatMessage {
 abstract class IMotorCognitivo {
   abstract setAbortSignal(signal: AbortSignal): void;
   abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
+  abstract gerarRespostaStream(
+    mensagens: ChatMessage[],
+    tools?: IToolDefinition[],
+    signal?: AbortSignal
+  ): AsyncIterable<string>;
 }
 ```
 
@@ -3823,6 +4993,16 @@ abstract class ICircuitBreaker {
 ```typescript
 abstract class ISensor<T> {
   abstract ler(target: string, signal?: AbortSignal): Promise<T>;
+}
+```
+
+### `IToolRegistry`
+
+```typescript
+abstract class IToolRegistry {
+  abstract registrar(tool: ITool): void;
+  abstract obter(nome: string): ITool | undefined;
+  abstract obterTodas(): ITool[];
 }
 ```
 
@@ -3871,7 +5051,7 @@ abstract class ISessionManager {
 
 ```typescript
 abstract class IConversationManager {
-  abstract conversar(sessionId: string, input: string): Promise<string>;
+  abstract conversar(sessionId: string, input: string, signal?: AbortSignal): Promise<string>;
 }
 ```
 
@@ -3886,7 +5066,7 @@ abstract class IConversationManager {
 <file path="src/main.ts">
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Fase 5 (Gerenciamento de Contexto).
+ * @description Ponto de entrada do sistema SOBERANO - Sprint 6.3 (Expansao do Arsenal).
  *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
@@ -3917,6 +5097,11 @@ import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
 import { ISessionManager } from './core/ISessionManager.ts';
 import { ConversationManager } from './infra/ConversationManager.ts';
 import { IConversationManager } from './core/IConversationManager.ts';
+import { ToolRegistry } from './infra/ToolRegistry.ts';
+import { IToolRegistry } from './core/IToolRegistry.ts';
+import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
+import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
+import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
 
 let isShuttingDown = false;
 
@@ -4062,11 +5247,26 @@ async function bootstrap(): Promise<void> {
       maxMessagesPerSession: 20,
     });
 
+    // --- Tool Registry (Fase 6) ---
+    const toolRegistry: IToolRegistry = new ToolRegistry({ logger });
+    const systemTimeTool = new SystemTimeTool();
+    toolRegistry.registrar(systemTimeTool);
+    logger.info('[main] SystemTimeTool registered in ToolRegistry.');
+
+    const calculatorTool = new CalculatorTool();
+    toolRegistry.registrar(calculatorTool);
+    logger.info('[main] CalculatorTool registered in ToolRegistry.');
+
+    const readFileTool = new ReadFileTool();
+    toolRegistry.registrar(readFileTool);
+    logger.info('[main] ReadFileTool registered in ToolRegistry.');
+
     const conversationManager: IConversationManager = new ConversationManager({
       logger,
       motor,
       sessionManager,
       vectorStore,
+      toolRegistry,
     });
 
     const sessionId = 'demo-sprint-5.3';
@@ -4084,6 +5284,22 @@ async function bootstrap(): Promise<void> {
     const resposta2 = await conversationManager.conversar(sessionId, input2);
     logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 2 ===');
     logger.info(resposta2);
+
+    // Turno 3 - Força o uso da ferramenta get_system_time
+    const input3 = 'Que horas sao exatamente agora?';
+    logger.info('[main] CONVERSATION - Turno 3/4 (Tool Calling): "' + input3 + '"');
+    const resposta3 = await conversationManager.conversar(sessionId, input3);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 3 (Tool Calling) ===');
+    logger.info(resposta3);
+    logger.info('[main] === Tool Call test completed successfully. ===');
+
+    // Turno 4 - Uso multiplo de ferramentas (calculator + get_system_time)
+    const input4 = 'Soberano, calcule quanto e 1450 dividido por 5 e depois me diga que horas sao';
+    logger.info('[main] CONVERSATION - Turno 4/4 (Multi-tool): "' + input4 + '"');
+    const resposta4 = await conversationManager.conversar(sessionId, input4);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 4 (Multi-tool) ===');
+    logger.info(resposta4);
+    logger.info('[main] === Sprint 6.3 - Expansao do Arsenal test completed successfully. ===');
 
     // Verificacao da memoria de sessao
     const historicoFinal = await sessionManager.obterHistorico(sessionId);
