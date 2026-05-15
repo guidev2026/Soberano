@@ -256,6 +256,17 @@ export class ConversationManager extends IConversationManager {
     depth: number = 0,
     signal?: AbortSignal
   ): Promise<string> {
+    // --- Guard: valida se o array de mensagens é válido antes de qualquer acesso indexado ---
+    if (!mensagens || mensagens.length === 0) {
+      this.logger.warn(
+        `[ConversationManager] Tool loop called with empty or null messages array (depth ${depth}, session "${sessionId}"). Returning fallback.`
+      );
+      const fallbackMsg = '[SOBERANO] Erro interno: estado de conversa inválido. A operação foi interrompida para garantir estabilidade.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      return fallbackMsg;
+    }
+
     if (depth >= this.maxToolIterations) {
       this.logger.warn(
         `[ConversationManager] Tool loop reached maximum depth (${this.maxToolIterations}). ` +
@@ -389,7 +400,17 @@ export class ConversationManager extends IConversationManager {
     // com tool_calls e os tool results salvos nos passos anteriores (single source of truth).
     // Isso elimina a duplicação: a mensagem NÃO é incluída manualmente no array de recursão.
     const historicoAtualizado = await this.sessionManager.obterHistorico(sessionId);
-    const mensagensComResultados: ChatMessage[] = [mensagens[0]!, ...historicoAtualizado.filter(m => m.role !== 'system')];
+
+    // Guard defensive para o índice [0] — protege contra acesso inseguro (non-null assertion)
+    const primeiraMensagem = mensagens[0];
+    if (!primeiraMensagem) {
+      const fallbackMsg = '[SOBERANO] Erro interno: mensagem de sistema inválida no loop de ferramentas. A operação foi interrompida.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      return fallbackMsg;
+    }
+
+    const mensagensComResultados: ChatMessage[] = [primeiraMensagem, ...historicoAtualizado.filter(m => m.role !== 'system')];
 
     this.logger.info(
       `[ConversationManager] Re-invoking cognitive engine (depth ${depth + 1}) with updated context.`

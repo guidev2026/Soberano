@@ -1,6 +1,6 @@
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.6.5 — Sprint 6.5 (Blindagem Final)
+**Versão:** 0.6.6 — Sprint 6.6 (Blindagem Final - Guard Clauses & Testes)
 
 ## Stack
 
@@ -45,6 +45,8 @@ src/
 │   ├── InMemorySessionManager.test.ts
 │   ├── ConversationManager.ts      # Maestro: orquestra sessão + RAG + motor cognitivo
 │   ├── ConversationManager.test.ts
+│   ├── ToolRegistry.ts             # Registro de ferramentas (lança Error se duplicado)
+│   ├── ToolRegistry.test.ts
 │   └── tools/                      # Arsenal de ferramentas do agente
 │       ├── SystemTimeTool.ts       # Retorna data/hora atual do sistema
 │       ├── SystemTimeTool.test.ts
@@ -112,6 +114,9 @@ src/
 | Implementação base de gerarRespostaStream no OllamaProvider | ✅ |
 | ConversationManager.test.ts — 10 testes unitários cobrindo ReAct Loop (tool calls, fallback, cancelamento, maxToolIterations) | ✅ |
 | MockVectorStore.test.ts — 9 testes unitários de cosineSimilarity (vetores idênticos, ortogonais, nulos, opostos, dimensões, limit, vazio, duplicatas) | ✅ |
+| SystemTimeTool.test.ts — 8 testes unitários (contrato, metadados, ISO 8601, execução, argumentos vazios) | ✅ |
+| ToolRegistry.test.ts — 8 testes unitários (registro, duplicatas com throw, consulta, case-sensitivity, collection) | ✅ |
+| Guard clause no Tool Loop — valida array de mensagens vazio/nulo antes de qualquer acesso indexado | ✅ |
 
 ## Como Executar
 
