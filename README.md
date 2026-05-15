@@ -1,6 +1,6 @@
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.6.4 — Sprint 6.4 (Red Team Fixes & Electron Prep)
+**Versão:** 0.6.5 — Sprint 6.5 (Blindagem Final)
 
 ## Stack
 
@@ -143,6 +143,7 @@ src/
 | **5** | Gerenciamento de contexto e sessões multi-turno | ✅ **Concluída** |
 | **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
 | **6.4** | Red Team Fixes (bugs críticos no loop ReAct) + Electron Prep (streaming, cancelamento) | ✅ **Concluída** |
+| **6.5** | Blindagem Final — Degradação Graciosa RAG, Defensive Copy SessionManager, Shutdown Determinístico, Fallback ReAct Edge Case | ✅ **Concluída** |
 | **7** | Electron UI (n8n-style via IPC nativo) | 🔧 Em Preparação |
 
 ## Contratos do Core

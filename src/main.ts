@@ -44,36 +44,28 @@ function registerShutdownHandlers(
   shutdownController: AbortController,
   httpServer: IHttpServer
 ): void {
-  const shutdown = async (signal: string) => {
-    if (isShuttingDown) {
-      logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
-      process.exit(1);
-    }
+    const shutdown = async (signal: string) => {
+      if (isShuttingDown) {
+        logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
+        process.exit(1);
+      }
 
-    isShuttingDown = true;
-    logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
+      isShuttingDown = true;
+      logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
 
-    const forceExitTimer = setTimeout(() => {
-      logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
-      process.exit(1);
-    }, 5_000);
+      const forceExitTimer = setTimeout(() => {
+        logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
+        process.exit(1);
+      }, 5_000);
 
-    process.removeAllListeners('SIGINT');
-    process.removeAllListeners('SIGTERM');
+      process.removeAllListeners('SIGINT');
+      process.removeAllListeners('SIGTERM');
 
-    shutdownController.abort();
+      shutdownController.abort();
 
-    try {
-      await httpServer.stop();
-      logger.info('[main] HTTP server stopped.');
-    } catch (err) {
-      logger.error('[main] Error stopping HTTP server: ' + err);
-    }
-
-    clearTimeout(forceExitTimer);
-    logger.info('[main] Resources released. Goodbye, SOBERANO.');
-    process.exit(0);
-  };
+      clearTimeout(forceExitTimer);
+      logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
+    };
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -267,6 +259,11 @@ async function bootstrap(): Promise<void> {
     await httpServer.stop().catch((err) => {
       logger.error('[main] Error stopping HTTP server: ' + err);
     });
+
+    if (isShuttingDown) {
+      logger.info('[main] Resources released. Goodbye, SOBERANO.');
+      process.exit(0);
+    }
   }
 }
 

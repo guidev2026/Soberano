@@ -151,7 +151,8 @@ export class ConversationManager extends IConversationManager {
         this.logger.error(
           `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
         );
-        throw ragError;
+        // RAG failure is non-fatal — conversation continues without retrieved context.
+        // The error was already logged above for diagnostics.
       }
     } else {
       this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
@@ -250,14 +251,18 @@ export class ConversationManager extends IConversationManager {
         `Returning safe fallback message.`
       );
 
-      // Fallback seguro: busca a última mensagem assistant no SessionManager
-      // Se não encontrar, retorna mensagem limpa informando o corte da execução
+      // Fallback seguro: busca no histórico a última mensagem assistant com conteúdo
+      // textual não vazio (edge case: content pode ser "" quando só há tool_calls)
       const historico = await this.sessionManager.obterHistorico(sessionId);
-      const ultimaAssistant = historico.filter(m => m.role === 'assistant').pop();
-      if (ultimaAssistant && ultimaAssistant.content) {
-        return ultimaAssistant.content;
+      const mensagensAssistant = historico.filter(m => m.role === 'assistant');
+      for (let i = mensagensAssistant.length - 1; i >= 0; i--) {
+        const msg = mensagensAssistant[i]!;
+        if (msg.content && msg.content.length > 0) {
+          return msg.content;
+        }
       }
 
+      // Nenhuma mensagem assistant com conteúdo encontrada — retorna fallback genérico
       const fallbackMsg = '[SOBERANO] Limite de iterações de ferramentas atingido. A execução foi interrompida para garantir estabilidade.';
       const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
       await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);

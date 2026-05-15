@@ -91,7 +91,7 @@ export class InMemorySessionManager extends ISessionManager {
       );
       return [];
     }
-    return historico; // retorna a referência direta; imutabilidade garantida pelo TypeScript (ReadonlyArray)
+    return [...historico]; // cópia defensiva para evitar corrupção acidental do estado interno
   }
 
   /**
