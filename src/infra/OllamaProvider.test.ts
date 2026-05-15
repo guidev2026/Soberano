@@ -76,7 +76,7 @@ describe('OllamaProvider', () => {
         JSON.stringify({ message: { content: '' }, done: true }),
       ].join('\n');
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         const stream = new ReadableStream({
           start(controller) {
             controller.enqueue(new TextEncoder().encode(ndjsonResponse));
@@ -103,7 +103,7 @@ describe('OllamaProvider', () => {
     it('deve lançar erro HTTP quando resposta não for ok no stream', async () => {
       const mockLogger = new MockLogger();
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         return new Response('Not Found', { status: 404 });
       });
 
@@ -132,7 +132,7 @@ describe('OllamaProvider', () => {
       const ac = new AbortController();
       ac.abort();
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         throw new Error('fetch should not be called with pre-aborted signal');
       });
 
@@ -156,7 +156,7 @@ describe('OllamaProvider', () => {
       let capturedUrl: string | undefined;
       let capturedOptions: RequestInit | undefined;
 
-      fetchMock = mock.method(globalThis, 'fetch', (url: RequestInfo | URL, options?: RequestInit) => {
+      fetchMock = mock.method(globalThis, 'fetch', async (url: RequestInfo | URL, options?: RequestInit) => {
         capturedUrl = typeof url === 'string' ? url : url.toString();
         capturedOptions = options;
 
@@ -211,7 +211,7 @@ describe('OllamaProvider', () => {
     it('deve lançar erro HTTP quando resposta não for ok', async () => {
       const mockLogger = new MockLogger();
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         return new Response(JSON.stringify({ error: 'Model not found' }), {
           status: 404,
           headers: { 'Content-Type': 'application/json' },
@@ -235,7 +235,7 @@ describe('OllamaProvider', () => {
       const mockLogger = new MockLogger();
 
       // Fetch que sempre falha com TypeError (erro de conexão)
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         throw new TypeError('fetch failed: connection refused');
       });
 
@@ -277,7 +277,7 @@ describe('OllamaProvider', () => {
 
       let callCount = 0;
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         callCount++;
         return new Response('Bad Request', { status: 400 });
       });

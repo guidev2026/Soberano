@@ -39,7 +39,7 @@ describe('FileSensor', () => {
       const fakeContent = 'conteúdo simulado do arquivo';
       const mockReadFile = async () => fakeContent;
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
       const result = await sensor.ler('/fake/path/file.txt');
 
       assert.strictEqual(result, fakeContent);
@@ -53,7 +53,7 @@ describe('FileSensor', () => {
       (enoentError as Error & { code: string }).code = 'ENOENT';
       const mockReadFile = async () => { throw enoentError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/not/found.txt'));
 
@@ -71,7 +71,7 @@ describe('FileSensor', () => {
       (eaccesError as Error & { code: string }).code = 'EACCES';
       const mockReadFile = async () => { throw eaccesError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/no/perm.txt'));
 
@@ -89,7 +89,7 @@ describe('FileSensor', () => {
       (eisdirError as Error & { code: string }).code = 'EISDIR';
       const mockReadFile = async () => { throw eisdirError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/path/to/dir'));
 
@@ -107,7 +107,7 @@ describe('FileSensor', () => {
       (genericError as Error & { code: string }).code = 'EREMOTE';
       const mockReadFile = async () => { throw genericError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/some/file.bin'));
 
@@ -123,7 +123,7 @@ describe('FileSensor', () => {
       const logger = new MockLogger();
       const mockReadFile = async () => { throw 'string error'; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/weird.txt'));
 
@@ -141,7 +141,7 @@ describe('FileSensor', () => {
       (abortError as Error & { code: string }).code = 'ABORT_ERR';
       const mockReadFile = async (_path: string, _options?: { encoding?: string; signal?: AbortSignal }) => { throw abortError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/aborted.txt'));
 
@@ -161,7 +161,7 @@ describe('FileSensor', () => {
         return fakeContent;
       };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
       const controller = new AbortController();
       const signal = controller.signal;
 

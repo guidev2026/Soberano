@@ -67,6 +67,8 @@ src/
     ConsoleLogger.ts
     ConversationManager.test.ts
     ConversationManager.ts
+    DeepSeekProvider.test.ts
+    DeepSeekProvider.ts
     FileSensor.test.ts
     FileSensor.ts
     InMemorySessionManager.test.ts
@@ -80,1063 +82,732 @@ src/
     ToolRegistry.test.ts
     ToolRegistry.ts
     validateOllamaResponse.test.ts
-  main/
-    main.ts
-  preload/
-    preload.ts
   renderer/
     app.js
     index.html
-    style.css
   env.d.ts
   main-cli.ts
   main.ts
+src-tauri/
+  icons/
+    128x128.png
+    128x128@2x.png
+    32x32.png
+    icon.icns
+    icon.ico
+    icon.png
+    Square107x107Logo.png
+    Square142x142Logo.png
+    Square150x150Logo.png
+    Square284x284Logo.png
+    Square30x30Logo.png
+    Square310x310Logo.png
+    Square44x44Logo.png
+    Square71x71Logo.png
+    Square89x89Logo.png
+    StoreLogo.png
+  src/
+    main.rs
+  .gitignore
+  build.rs
+  Cargo.toml
+  tauri.conf.json
 .clinerules
 .gitignore
 package.json
 README.md
 tsconfig.json
+tsconfig.test.json
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
-<file path="src/main/main.ts">
+<file path="src/infra/DeepSeekProvider.test.ts">
 /**
- * @file main/main.ts
- * @description Processo principal do Electron para o SOBERANO Desktop.
- *
- *              Responsabilidades:
- *              1. Criar a janela do BrowserWindow com contextIsolation ativado
- *                 e o preload script configurado.
- *              2. Inicializar o ConversationManager (infra) e toda a cadeia
- *                 de dependências (OllamaProvider, Logger, etc.) via Options Objects.
- *              3. Registrar os handlers do ipcMain para:
- *                 - 'soberano:mensagem' (invoke): recebe input, chama
- *                   ConversationManager.conversar(), envia resultado via IPC.
- *                 - 'soberano:cancelar' (on): aborta o AbortController ativo.
- *              4. Graceful shutdown ao fechar a janela.
- *
- *              Dependências injetadas manualmente (DIP com Options Objects):
- *              - ConsoleLogger (ILogger)
- *              - OllamaProvider (IMotorCognitivo)
- *              - CircuitBreaker (ICircuitBreaker)
- *              - InMemorySessionManager (ISessionManager)
- *              - ToolRegistry (IToolRegistry)
- *              - ConversationManager
- *
- *              Nota: O streaming token-por-token será implementado na Sprint 7.1
- *              quando adicionarmos gerarRespostaStream ao ConversationManager.
- *              Por enquanto, usamos conversar() e enviamos a resposta completa.
- *
- *              Paths: Compilado pelo tsc para dist/. Os imports via .js
- *              referem-se aos arquivos compilados em dist/.
+ * @file DeepSeekProvider.test.ts
+ * @description Testes unitários para DeepSeekProvider
  */
 
-import { app, BrowserWindow, ipcMain } from 'electron';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
+import assert from 'node:assert/strict';
+import { DeepSeekProvider } from './DeepSeekProvider.ts';
+import { ConsoleLogger } from './ConsoleLogger.ts';
+import { CircuitBreaker } from './CircuitBreaker.ts';
+import type { ChatMessage } from '../core/IMotorCognitivo.ts';
 
-// === Infra imports ===
-import { ConsoleLogger } from '../infra/ConsoleLogger.js';
-import { OllamaProvider } from '../infra/OllamaProvider.js';
-import { CircuitBreaker } from '../infra/CircuitBreaker.js';
-import { InMemorySessionManager } from '../infra/InMemorySessionManager.js';
-import { ToolRegistry } from '../infra/ToolRegistry.js';
-import { ConversationManager } from '../infra/ConversationManager.js';
+describe('DeepSeekProvider', () => {
+  let logger: ConsoleLogger;
+  let circuitBreaker: CircuitBreaker;
+  const originalFetch = globalThis.fetch;
 
-// === Core imports (apenas contratos para referência, apenas types) ===
-import type { ILogger } from '../core/ILogger.js';
-import type { IMotorCognitivo } from '../core/IMotorCognitivo.js';
-import type { ICircuitBreaker } from '../core/ICircuitBreaker.js';
-import type { ISessionManager } from '../core/ISessionManager.js';
-import type { IToolRegistry } from '../core/IToolRegistry.js';
+  beforeEach(() => {
+    logger = new ConsoleLogger();
+    // Silencia o logger para testes
+    logger.info = () => {};
+    logger.warn = () => {};
+    logger.error = () => {};
+    logger.debug = () => {};
 
-// __dirname equivalent for ESM
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// ============================================================
-// 1. Bootstrap de Dependências (Wiring Manual via Options Objects)
-// ============================================================
-
-const logger: ILogger = new ConsoleLogger();
-
-const circuitBreaker: ICircuitBreaker = new CircuitBreaker({
-  logger,
-  failureThreshold: 5,
-  openTimeoutMs: 30_000,
-});
-
-const sessionManager: ISessionManager = new InMemorySessionManager({
-  logger,
-  maxMessagesPerSession: 50,
-});
-
-const toolRegistry: IToolRegistry = new ToolRegistry({
-  logger,
-});
-
-const motorCognitivo: IMotorCognitivo = new OllamaProvider({
-  logger,
-  baseUrl: 'http://localhost:11434',
-  model: 'llama3.2:latest',
-  maxRetries: 3,
-  delayBase: 1000,
-  timeoutMs: 120_000,
-  circuitBreaker,
-});
-
-// AbortController ativo para cancelamento
-let currentAbortController: AbortController | null = null;
-
-// Instância global do ConversationManager
-const conversationManager = new ConversationManager({
-  logger,
-  motor: motorCognitivo,
-  sessionManager,
-  toolRegistry,
-  systemName: 'SOBERANO',
-  maxToolIterations: 3,
-});
-
-// ============================================================
-// 2. IPC Handlers
-// ============================================================
-
-/**
- * Handler principal de mensagem (invoke → await retorna void).
- * A resposta completa é enviada via webContents.send (fire-and-forget).
- */
-ipcMain.handle('soberano:mensagem', async (event, input: string) => {
-  const sessionId = 'electron-session';
-  currentAbortController = new AbortController();
-  const signal = currentAbortController.signal;
-
-  try {
-    // Chama o orchestrator completo (RAG, sessão, tool calling)
-    const resposta = await conversationManager.conversar(sessionId, input, signal);
-
-    // Envia a resposta completa como um único chunk
-    event.sender.send('soberano:stream-chunk', resposta);
-
-    // Sinaliza fim do stream
-    event.sender.send('soberano:stream-end', 'complete');
-  } catch (error: unknown) {
-    const err = error as Error;
-    if (err.name === 'AbortError') {
-      event.sender.send(
-        'soberano:stream-end',
-        'cancelled',
-        'Geração cancelada pelo usuário.',
-      );
-    } else {
-      logger.error(`Erro na conversa: ${err.message ?? err}`);
-      event.sender.send(
-        'soberano:stream-end',
-        'error',
-        err.message ?? 'Erro interno.',
-      );
-    }
-  } finally {
-    currentAbortController = null;
-  }
-});
-
-/**
- * Handler de cancelamento (mensagem simples, sem resposta).
- */
-ipcMain.on('soberano:cancelar', () => {
-  if (currentAbortController) {
-    currentAbortController.abort();
-    currentAbortController = null;
-  }
-});
-
-// ============================================================
-// 3. Criação da Janela (BrowserWindow)
-// ============================================================
-
-function createWindow(): BrowserWindow {
-  const mainWindow = new BrowserWindow({
-    width: 900,
-    height: 700,
-    title: 'SOBERANO Desktop',
-    webPreferences: {
-      // preload.js compilado pelo tsc
-      preload: join(__dirname, '..', 'preload', 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
+    circuitBreaker = new CircuitBreaker({ logger, failureThreshold: 3, openTimeoutMs: 1000 });
   });
 
-  // Carrega o HTML direto da pasta src/renderer/
-  mainWindow.loadFile(join(__dirname, '..', 'renderer', 'index.html'));
-
-  return mainWindow;
-}
-
-// ============================================================
-// 4. App Lifecycle
-// ============================================================
-
-app.whenReady().then(() => {
-  logger.info('SOBERANO Desktop iniciado.');
-
-  const mainWindow = createWindow();
-
-  // Graceful shutdown: limpar resources ao fechar a janela
-  mainWindow.on('closed', () => {
-    logger.info('Janela fechada. Encerrando...');
-    app.quit();
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    mock.restoreAll();
   });
-});
 
-app.on('window-all-closed', () => {
-  app.quit();
-});
+  it('deve lançar erro se não passar apiKey', () => {
+    assert.throws(
+      () => new DeepSeekProvider({ logger, apiKey: '', circuitBreaker }),
+      /API Key is required/
+    );
+  });
 
-app.on('before-quit', () => {
-  logger.info('before-quit: limpando resources...');
-  if (currentAbortController) {
-    currentAbortController.abort();
-    currentAbortController = null;
-  }
-});
-</file>
+  it('deve lançar erro se não passar circuitBreaker', () => {
+    assert.throws(
+      () => new DeepSeekProvider({ logger, apiKey: 'fake', circuitBreaker: undefined as any }),
+      /CircuitBreaker is required/
+    );
+  });
 
-<file path="src/preload/preload.ts">
-/**
- * @file preload.ts
- * @description Context Bridge seguro do Electron para o SOBERANO.
- *              Expõe uma API restrita (window.soberanoAPI) para o renderer,
- *              utilizando contextBridge com contextIsolation: true.
- *
- *              API exposta:
- *              - enviarMensagem(input): Invoca o handler IPC para iniciar streaming
- *              - onStream(callback): Registra listener para chunks de texto
- *              - onStreamEnd(callback): Registra listener para fim do stream
- *              - cancelar(): Envia sinal de aborto para o main process
- *              - cleanup(): Remove todos os listeners IPC
- */
+  it('deve retornar mensagem correta em caso de sucesso', async () => {
+    const provider = new DeepSeekProvider({
+      logger,
+      apiKey: 'fake-key',
+      circuitBreaker,
+    });
 
-import { contextBridge, ipcRenderer } from 'electron';
-
-/**
- * Interface da API exposta para o mundo renderer.
- * Declarada aqui e também no app.ts para type-safety.
- */
-export interface SoberanoAPI {
-  enviarMensagem(input: string): Promise<void>;
-  onStream(callback: (chunk: string) => void): void;
-  onStreamEnd(callback: (reason: 'complete' | 'error' | 'cancelled', message?: string) => void): void;
-  cancelar(): void;
-  cleanup(): void;
-}
-
-// Lista de funções de remoção de listeners para cleanup
-type ListenerEntry = {
-  channel: string;
-  handler: (...args: any[]) => void;
-};
-
-const registeredListeners: ListenerEntry[] = [];
-
-contextBridge.exposeInMainWorld('soberanoAPI', {
-  /**
-   * Envia uma mensagem do usuário para o main process e inicia o streaming.
-   * O main process responde com chunks via 'soberano:stream-chunk'
-   * e sinaliza fim via 'soberano:stream-end'.
-   */
-  enviarMensagem: async (input: string): Promise<void> => {
-    await ipcRenderer.invoke('soberano:mensagem', input);
-  },
-
-  /**
-   * Registra um callback para receber chunks de texto do stream.
-   */
-  onStream: (callback: (chunk: string) => void): void => {
-    const handler = (_event: unknown, chunk: string) => {
-      callback(chunk);
+    const mockResponse = {
+      id: 'test-id',
+      object: 'chat.completion',
+      created: 12345,
+      model: 'deepseek-chat',
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: 'Olá do DeepSeek!'
+        },
+        finish_reason: 'stop'
+      }]
     };
-    ipcRenderer.on('soberano:stream-chunk', handler);
-    registeredListeners.push({ channel: 'soberano:stream-chunk', handler });
-  },
 
-  /**
-   * Registra um callback para ser notificado quando o streaming terminar.
-   */
-  onStreamEnd: (callback: (reason: 'complete' | 'error' | 'cancelled', message?: string) => void): void => {
-    const handler = (_event: unknown, reason: string, message?: string) => {
-      callback(reason as 'complete' | 'error' | 'cancelled', message);
+    globalThis.fetch = mock.fn(async () => {
+      return {
+        ok: true,
+        json: async () => mockResponse
+      } as Response;
+    });
+
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Oi' }];
+    const response = await provider.gerarResposta(messages);
+
+    assert.equal(response.role, 'assistant');
+    assert.equal(response.content, 'Olá do DeepSeek!');
+  });
+
+  it('deve lidar corretamente com tool_calls', async () => {
+    const provider = new DeepSeekProvider({
+      logger,
+      apiKey: 'fake-key',
+      circuitBreaker,
+    });
+
+    const mockResponse = {
+      id: 'test-id',
+      object: 'chat.completion',
+      created: 12345,
+      model: 'deepseek-chat',
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_123',
+            type: 'function',
+            function: {
+              name: 'getWeather',
+              arguments: '{"city":"São Paulo"}'
+            }
+          }]
+        },
+        finish_reason: 'tool_calls'
+      }]
     };
-    ipcRenderer.on('soberano:stream-end', handler);
-    registeredListeners.push({ channel: 'soberano:stream-end', handler });
-  },
 
-  /**
-   * Cancela a operação de streaming em andamento.
-   * Envia um sinal para o main process abortar o AbortController.
-   */
-  cancelar: (): void => {
-    ipcRenderer.send('soberano:cancelar');
-  },
+    globalThis.fetch = mock.fn(async () => {
+      return {
+        ok: true,
+        json: async () => mockResponse
+      } as Response;
+    });
 
-  /**
-   * Remove todos os listeners IPC registrados.
-   * Deve ser chamado quando a UI for destruída ou reinicializada.
-   */
-  cleanup: (): void => {
-    for (const entry of registeredListeners) {
-      ipcRenderer.removeListener(entry.channel, entry.handler);
-    }
-    registeredListeners.length = 0;
-    ipcRenderer.removeAllListeners('soberano:stream-chunk');
-    ipcRenderer.removeAllListeners('soberano:stream-end');
-  },
-} satisfies SoberanoAPI);
+    const response = await provider.gerarResposta([{ role: 'user', content: 'Qual o clima?' }]);
+
+    assert.equal(response.role, 'assistant');
+    assert.ok(response.tool_calls);
+    assert.equal(response.tool_calls!.length, 1);
+    assert.equal(response.tool_calls![0]!.id, 'call_123');
+    assert.equal(response.tool_calls![0]!.function.name, 'getWeather');
+    assert.deepEqual(response.tool_calls![0]!.function.arguments, { city: 'São Paulo' });
+  });
+
+  it('deve falhar após retries em caso de erro 500', async () => {
+    const provider = new DeepSeekProvider({
+      logger,
+      apiKey: 'fake-key',
+      maxRetries: 2,
+      delayBase: 10,
+      circuitBreaker,
+    });
+
+    globalThis.fetch = mock.fn(async () => {
+      return {
+        ok: false,
+        status: 500,
+        text: async () => 'Internal Server Error'
+      } as Response;
+    });
+
+    await assert.rejects(
+      async () => provider.gerarResposta([{ role: 'user', content: 'Oi' }]),
+      /HTTP error 500/
+    );
+
+    // O fetch deve ser chamado maxRetries vezes (2 vezes)
+    assert.equal((globalThis.fetch as any).mock.callCount(), 2);
+  });
+
+  it('não deve fazer retry em erro 401', async () => {
+    const provider = new DeepSeekProvider({
+      logger,
+      apiKey: 'fake-key',
+      maxRetries: 3,
+      circuitBreaker,
+    });
+
+    globalThis.fetch = mock.fn(async () => {
+      return {
+        ok: false,
+        status: 401,
+        text: async () => 'Unauthorized'
+      } as Response;
+    });
+
+    await assert.rejects(
+      async () => provider.gerarResposta([{ role: 'user', content: 'Oi' }]),
+      /HTTP error 401/
+    );
+
+    // Deve ser chamado apenas uma vez, pois 401 é irrecuperável
+    assert.equal((globalThis.fetch as any).mock.callCount(), 1);
+  });
+
+  it('deve fazer retry em erro 429', async () => {
+    const provider = new DeepSeekProvider({
+      logger,
+      apiKey: 'fake-key',
+      maxRetries: 2,
+      delayBase: 10,
+      circuitBreaker,
+    });
+
+    globalThis.fetch = mock.fn(async () => {
+      return {
+        ok: false,
+        status: 429,
+        text: async () => 'Too Many Requests'
+      } as Response;
+    });
+
+    await assert.rejects(
+      async () => provider.gerarResposta([{ role: 'user', content: 'Oi' }]),
+      /HTTP error 429/
+    );
+
+    assert.equal((globalThis.fetch as any).mock.callCount(), 2);
+  });
+});
 </file>
 
-<file path="src/renderer/app.js">
+<file path="src/infra/DeepSeekProvider.ts">
 /**
- * @file renderer/app.js
- * @description UI logic for SOBERANO Desktop renderer process.
- *              Communicates with the main process via window.soberanoAPI
- *              (exposed by preload Context Bridge).
- *
- *              Zero external dependencies. Pure vanilla JS.
+ * @file DeepSeekProvider.ts
+ * @description Implementação concreta de IMotorCognitivo que se comunica
+ *              com a API do DeepSeek via HTTP (fetch nativo).
+ *              - Depende da abstração IMotorCognitivo (DIP).
+ *              - Retry automático com maxRetries e delayBase configuráveis.
+ *              - Timeout configurável via AbortController.
+ *              - Aceita AbortSignal externo para graceful shutdown.
+ *              - Validação de schema da resposta.
+ *              - Logger injetado via construtor.
  */
 
-/* global window, document */
+import { IMotorCognitivo } from '../core/IMotorCognitivo.ts';
+import type { ChatMessage, IToolDefinition } from '../core/IMotorCognitivo.ts';
+import { ILogger } from '../core/ILogger.ts';
+import { ICircuitBreaker } from '../core/ICircuitBreaker.ts';
 
-(function () {
-  'use strict';
-
-  // ============================================================
-  // DOM References
-  // ============================================================
-  const chatHistory = document.getElementById('chat-history');
-  const messageInput = document.getElementById('message-input');
-  const sendBtn = document.getElementById('send-btn');
-  const cancelBtn = document.getElementById('cancel-btn');
-  const statusBar = document.getElementById('status-bar');
-
-  // State
-  let isLoading = false;
-
-  // ============================================================
-  // Helper: Adicionar mensagem ao chat
-  // ============================================================
-  function addMessage(role, content) {
-    const div = document.createElement('div');
-    div.className = 'message ' + role;
-
-    const contentDiv = document.createElement('div');
-    contentDiv.className = 'message-content';
-    contentDiv.textContent = content;
-
-    div.appendChild(contentDiv);
-    chatHistory.appendChild(div);
-
-    // Scroll para o final
-    chatHistory.scrollTop = chatHistory.scrollHeight;
-
-    return contentDiv;
-  }
-
-  function setStatus(text, className) {
-    statusBar.textContent = text;
-    statusBar.className = 'status-' + className;
-  }
-
-  function setLoadingState(loading) {
-    isLoading = loading;
-    sendBtn.disabled = loading;
-    messageInput.disabled = loading;
-
-    if (loading) {
-      cancelBtn.classList.remove('hidden');
-      setStatus('Gerando...', 'loading');
-    } else {
-      cancelBtn.classList.add('hidden');
-      setStatus('Pronto', 'idle');
-    }
-  }
-
-  // ============================================================
-  // Enviar mensagem
-  // ============================================================
-  async function sendMessage() {
-    const text = messageInput.value.trim();
-    if (!text || isLoading) return;
-
-    // Limpa o input
-    messageInput.value = '';
-
-    // Mostra mensagem do usuário
-    addMessage('user', text);
-
-    // Adiciona indicador de loading
-    const loadingDiv = addMessage('loading', 'Aguardando resposta...');
-
-    setLoadingState(true);
-
-    try {
-      // Aguarda resposta completa (invoke)
-      await window.soberanoAPI.enviarMensagem(text);
-      // A resposta chegará via listener onChunk/onEnd
-    } catch (err) {
-      // Remove loading e mostra erro
-      loadingDiv.parentNode.removeChild(loadingDiv);
-      addMessage('system', 'Erro ao enviar mensagem: ' + (err.message || err));
-      setStatus('Erro', 'error');
-      setLoadingState(false);
-    }
-  }
-
-  // ============================================================
-  // IPC Listeners (via Context Bridge)
-  // ============================================================
-
-  /**
-   * Listener para cada chunk de streaming.
-   * Por enquanto, como usamos conversar() que retorna a resposta
-   * completa, recebemos um único chunk com o texto completo.
-   */
-  window.soberanoAPI.onStream(function (chunkText) {
-    // Procura o último elemento .loading para substituir
-    const loadingMsg = chatHistory.querySelector('.message.loading');
-    if (loadingMsg) {
-      loadingMsg.parentNode.removeChild(loadingMsg);
-    }
-
-    // Adiciona como mensagem do assistente
-    addMessage('assistant', chunkText);
-    setStatus('Completo', 'success');
-  });
-
-  /**
-   * Listener de fim de stream.
-   * status: 'complete' | 'cancelled' | 'error'
-   */
-  window.soberanoAPI.onStreamEnd(function (status, detail) {
-    setLoadingState(false);
-
-    // Remove loading se ainda existir
-    const loadingMsg = chatHistory.querySelector('.message.loading');
-    if (loadingMsg) {
-      loadingMsg.parentNode.removeChild(loadingMsg);
-    }
-
-    if (status === 'cancelled') {
-      addMessage('system', 'Geração cancelada.');
-      setStatus('Cancelado', 'idle');
-    } else if (status === 'error') {
-      addMessage('system', 'Erro: ' + (detail || 'Ocorreu um erro na geração.'));
-      setStatus('Erro', 'error');
-    }
-  });
-
-  // ============================================================
-  // Cancelar geração
-  // ============================================================
-  cancelBtn.addEventListener('click', function () {
-    if (!isLoading) return;
-    window.soberanoAPI.cancelar();
-    // O listener onEnd irá tratar o estado 'cancelled'
-  });
-
-  // ============================================================
-  // Event Listeners
-  // ============================================================
-
-  // Botão Enviar
-  sendBtn.addEventListener('click', sendMessage);
-
-  // Enter para enviar (Shift+Enter para nova linha)
-  messageInput.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  });
-
-  // Foco inicial no input
-  messageInput.focus();
-})();
-</file>
-
-<file path="src/renderer/index.html">
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';" />
-  <title>SOBERANO Desktop</title>
-  <link rel="stylesheet" href="style.css" />
-</head>
-<body>
-  <div id="app">
-    <!-- Header -->
-    <header id="header">
-      <h1>SOBERANO</h1>
-      <p class="subtitle">Sistema de Orquestração com Engenharia de Software de Alta Robustez</p>
-    </header>
-
-    <!-- Chat History Area -->
-    <div id="chat-history" role="log" aria-live="polite" aria-label="Histórico do chat">
-      <div class="message system">
-        <div class="message-content">
-          Bem-vindo ao SOBERANO Desktop. Digite sua mensagem abaixo para iniciar a conversa.
-        </div>
-      </div>
-    </div>
-
-    <!-- Input Area -->
-    <div id="input-area">
-      <textarea
-        id="message-input"
-        placeholder="Digite sua mensagem..."
-        rows="2"
-        aria-label="Campo de mensagem"
-      ></textarea>
-      <button id="send-btn" aria-label="Enviar mensagem">Enviar</button>
-      <button id="cancel-btn" class="hidden" aria-label="Cancelar geração">Cancelar</button>
-      <div id="status-bar" class="status-idle">Pronto</div>
-    </div>
-  </div>
-
-  <script src="app.js"></script>
-</body>
-</html>
-</file>
-
-<file path="src/renderer/style.css">
-/* ============================================================
-   SOBERANO Desktop — UI Stylesheet
-   Minimalista, responsivo e sem dependências externas.
-   ============================================================ */
-
-/* --- Reset básico --- */
-*, *::before, *::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+export interface DeepSeekConfig {
+  logger: ILogger;
+  apiKey: string;
+  baseUrl?: string;
+  model?: string;
+  maxRetries?: number;
+  delayBase?: number;
+  timeoutMs?: number;
+  circuitBreaker?: ICircuitBreaker;
 }
 
-:root {
-  --bg-primary: #1a1a2e;
-  --bg-secondary: #16213e;
-  --bg-tertiary: #0f3460;
-  --text-primary: #e0e0e0;
-  --text-secondary: #a0a0b0;
-  --accent: #4fc3f7;
-  --accent-hover: #29b6f6;
-  --danger: #ef5350;
-  --danger-hover: #e53935;
-  --success: #66bb6a;
-  --warning: #ffa726;
-  --border: #2a2a4a;
-  --radius: 8px;
-  --font: 'Segoe UI', 'Roboto', system-ui, -apple-system, sans-serif;
+export interface DeepSeekMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
 }
 
-html, body {
-  height: 100%;
-  font-family: var(--font);
-  background: var(--bg-primary);
-  color: var(--text-primary);
+export interface DeepSeekChatResponse {
+  id: string;
+  object: string;
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    message: DeepSeekMessage;
+    finish_reason: string | null;
+  }>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
 }
 
-#app {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  max-width: 900px;
-  margin: 0 auto;
-  padding: 0 16px;
-}
-
-/* --- Header --- */
-#header {
-  padding: 16px 0 8px;
-  border-bottom: 1px solid var(--border);
-  text-align: center;
-  flex-shrink: 0;
-}
-
-#header h1 {
-  font-size: 1.5rem;
-  font-weight: 700;
-  color: var(--accent);
-  letter-spacing: 1px;
-}
-
-#header .subtitle {
-  font-size: 0.8rem;
-  color: var(--text-secondary);
-  margin-top: 2px;
-}
-
-/* --- Chat History --- */
-#chat-history {
-  flex: 1;
-  overflow-y: auto;
-  padding: 16px 0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.message {
-  display: flex;
-  max-width: 85%;
-}
-
-.message.user {
-  align-self: flex-end;
-}
-
-.message.assistant {
-  align-self: flex-start;
-}
-
-.message.system {
-  align-self: center;
-  font-style: italic;
-  opacity: 0.8;
-}
-
-.message-content {
-  padding: 10px 14px;
-  border-radius: var(--radius);
-  line-height: 1.5;
-  font-size: 0.95rem;
-  word-wrap: break-word;
-  white-space: pre-wrap;
-}
-
-.message.user .message-content {
-  background: var(--accent);
-  color: #000;
-  border-bottom-right-radius: 2px;
-}
-
-.message.assistant .message-content {
-  background: var(--bg-tertiary);
-  border-bottom-left-radius: 2px;
-}
-
-.message.system .message-content {
-  background: transparent;
-  color: var(--text-secondary);
-  border: 1px dashed var(--border);
-  text-align: center;
-  font-size: 0.85rem;
-}
-
-.message.loading .message-content {
-  background: var(--bg-secondary);
-  border-bottom-left-radius: 2px;
-  color: var(--text-secondary);
-  animation: pulse 1.5s infinite;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 0.6; }
-  50% { opacity: 1; }
-}
-
-/* --- Input Area --- */
-#input-area {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 12px 0 16px;
-  border-top: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-#message-input {
-  flex: 1;
-  resize: none;
-  padding: 10px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-secondary);
-  color: var(--text-primary);
-  font-family: var(--font);
-  font-size: 0.95rem;
-  line-height: 1.4;
-  outline: none;
-  transition: border-color 0.2s;
-}
-
-#message-input:focus {
-  border-color: var(--accent);
-}
-
-#message-input::placeholder {
-  color: var(--text-secondary);
-}
-
-button {
-  padding: 10px 20px;
-  border: none;
-  border-radius: var(--radius);
-  font-family: var(--font);
-  font-size: 0.95rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.2s, opacity 0.2s;
-  white-space: nowrap;
-}
-
-#send-btn {
-  background: var(--accent);
-  color: #000;
-}
-
-#send-btn:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-#cancel-btn {
-  background: var(--danger);
-  color: #fff;
-}
-
-#cancel-btn:hover {
-  background: var(--danger-hover);
-}
-
-#cancel-btn.hidden {
-  display: none;
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-/* --- Status Bar --- */
-#status-bar {
-  text-align: right;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  min-width: 80px;
-  flex-shrink: 0;
-}
-
-.status-idle { color: var(--text-secondary); }
-.status-loading { color: var(--warning); }
-.status-error { color: var(--danger); }
-.status-success { color: var(--success); }
-
-/* --- Scrollbar personalizada (Webkit) --- */
-#chat-history::-webkit-scrollbar {
-  width: 6px;
-}
-
-#chat-history::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-#chat-history::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 3px;
-}
-
-#chat-history::-webkit-scrollbar-thumb:hover {
-  background: var(--text-secondary);
-}
-</file>
-
-<file path="src/main-cli.ts">
 /**
- * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Sprint 6.5 (Zero Debt).
- *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
- *              - Instancia ConsoleLogger para logging estruturado
- *              - Instancia OllamaProvider com Logger injetado via construtor
- *              - Cria AbortController global para graceful shutdown
- *              - Injeta AbortSignal no OllamaProvider para cancelar fetch em andamento
- *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
- *              - Inicializa NativeHttpServer para servir rota /healthz
- *              - Executa o teste de comunicacao com o motor cognitivo
- *              - Executa o teste do FileSensor (leitura de arquivo local)
- *              - Demonstra o MockVectorStore (Memoria Vetorial - Fase 3)
- *              - Instancia InMemorySessionManager para gestao de sessoes (Fase 5)
- *              - Instancia ConversationManager para orquestracao multi-turno com RAG (Fase 5)
- *              - Simula 2 turnos de conversa para provar a retencao de memoria de sessao
+ * Valida em runtime se um valor desconhecido é um DeepSeekChatResponse válido.
+ * Lança erro descritivo se algum campo obrigatório estiver ausente.
  */
+export function validateDeepSeekResponse(data: unknown): DeepSeekChatResponse {
+  if (data === null || data === undefined || typeof data !== 'object') {
+    throw new Error(`[DeepSeekProvider] Invalid response: expected object`);
+  }
 
-import { randomUUID } from 'node:crypto';
-import { OllamaProvider } from './infra/OllamaProvider.ts';
-import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
-import { ConsoleLogger } from './infra/ConsoleLogger.ts';
-import { ILogger } from './core/ILogger.ts';
-import { CircuitBreaker } from './infra/CircuitBreaker.ts';
-import { NativeHttpServer } from './infra/NativeHttpServer.ts';
-import { IHttpServer } from './core/IHttpServer.ts';
-import { FileSensor } from './infra/FileSensor.ts';
-import { ISensor } from './core/ISensor.ts';
-import { MockVectorStore } from './infra/MockVectorStore.ts';
-import { IVectorStore } from './core/IVectorStore.ts';
-import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
-import { ISessionManager } from './core/ISessionManager.ts';
-import { ConversationManager } from './infra/ConversationManager.ts';
-import { IConversationManager } from './core/IConversationManager.ts';
-import { ToolRegistry } from './infra/ToolRegistry.ts';
-import { IToolRegistry } from './core/IToolRegistry.ts';
-import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
-import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
-import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
+  const record = data as Record<string, unknown>;
 
-let isShuttingDown = false;
-let shutdownInProgress = false;
+  if (!Array.isArray(record.choices) || record.choices.length === 0) {
+    throw new Error(`[DeepSeekProvider] Field "choices" missing, empty, or invalid`);
+  }
 
-function registerShutdownHandlers(
-  logger: ILogger,
-  shutdownController: AbortController,
-  httpServer: IHttpServer
-): void {
-    const shutdown = async (signal: string) => {
-      if (isShuttingDown) {
-        logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
-        process.exit(1);
+  const choice = record.choices[0] as Record<string, unknown>;
+  
+  if (choice.message === null || choice.message === undefined || typeof choice.message !== 'object') {
+    throw new Error(`[DeepSeekProvider] Field "choices[0].message" missing or invalid`);
+  }
+
+  const messageRecord = choice.message as Record<string, unknown>;
+
+  if (typeof messageRecord.role !== 'string' || messageRecord.role !== 'assistant') {
+    throw new Error(`[DeepSeekProvider] Field "choices[0].message.role" missing or invalid`);
+  }
+
+  if (messageRecord.content !== null && typeof messageRecord.content !== 'string') {
+    throw new Error(`[DeepSeekProvider] Field "choices[0].message.content" invalid`);
+  }
+
+  const hasToolCalls = Array.isArray(messageRecord.tool_calls) && messageRecord.tool_calls.length > 0;
+  
+  if (!messageRecord.content && !hasToolCalls) {
+    throw new Error(`[DeepSeekProvider] Field "choices[0].message.content" is empty and no tool_calls provided`);
+  }
+
+  return data as DeepSeekChatResponse;
+}
+
+export class DeepSeekProvider extends IMotorCognitivo {
+  private readonly baseUrl: string;
+  private readonly model: string;
+  private readonly apiKey: string;
+  private readonly logger: ILogger;
+  private readonly maxRetries: number;
+  private readonly delayBase: number;
+  private readonly timeoutMs: number;
+  private readonly circuitBreaker: ICircuitBreaker;
+  private externalSignal: AbortSignal | null = null;
+
+  constructor(config: DeepSeekConfig) {
+    super();
+    this.logger = config.logger;
+    this.apiKey = config.apiKey;
+    
+    if (!this.apiKey) {
+      throw new Error('[DeepSeekProvider] API Key is required.');
+    }
+
+    this.baseUrl = config.baseUrl ?? 'https://api.deepseek.com';
+    this.model = config.model ?? 'deepseek-chat';
+    this.maxRetries = config.maxRetries ?? 3;
+    this.delayBase = config.delayBase ?? 1_000;
+    this.timeoutMs = config.timeoutMs ?? 30_000;
+
+    if (!config.circuitBreaker) {
+      throw new Error(
+        '[DeepSeekProvider] CircuitBreaker is required for DIP compliance. ' +
+        'Provide an instance of ICircuitBreaker in the configuration.'
+      );
+    }
+    this.circuitBreaker = config.circuitBreaker;
+  }
+
+  setAbortSignal(signal: AbortSignal): void {
+    this.externalSignal = signal;
+  }
+
+  private delay(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
       }
 
-      isShuttingDown = true;
-      logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
+      const timer = setTimeout(() => {
+        resolve();
+      }, ms);
 
-      const forceExitTimer = setTimeout(() => {
-        logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
-        process.exit(1);
-      }, 5_000);
-
-      process.removeAllListeners('SIGINT');
-      process.removeAllListeners('SIGTERM');
-
-      // Prevent race condition: ensure abort is called before cleanup
-      if (!shutdownInProgress) {
-        shutdownInProgress = true;
-        shutdownController.abort();
-        clearTimeout(forceExitTimer);
-        logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
-      } else {
-        clearTimeout(forceExitTimer);
-        logger.info('[main] Shutdown already in progress.');
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
       }
+    });
+  }
+
+  private isRetryableError(error: unknown): boolean {
+    if (error instanceof TypeError && error.message.includes('fetch')) {
+      return true;
+    }
+    if (error instanceof Error) {
+      const msg = error.message.toLowerCase();
+      return (
+        msg.includes('econnrefused') ||
+        msg.includes('socket hang up') ||
+        msg.includes('network') ||
+        msg.includes('timeout') ||
+        msg.includes('fetch failed') ||
+        msg.includes('http error 429') || // Rate limit
+        msg.includes('http error 500') ||
+        msg.includes('http error 502') ||
+        msg.includes('http error 503') ||
+        msg.includes('http error 504')
+      );
+    }
+    return false;
+  }
+
+  private formatMessages(mensagens: ChatMessage[]): any[] {
+    return mensagens.map(msg => {
+      const formatted: any = {
+        role: msg.role,
+        content: msg.content,
+      };
+
+      // Se for tool call result
+      if (msg.role === 'tool' && msg.tool_call_id) {
+        formatted.tool_call_id = msg.tool_call_id;
+      }
+
+      // Se assistant chamou tools
+      if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        formatted.tool_calls = msg.tool_calls.map(tc => ({
+          id: tc.id,
+          type: 'function',
+          function: {
+            name: tc.function.name,
+            arguments: JSON.stringify(tc.function.arguments),
+          }
+        }));
+      }
+
+      return formatted;
+    });
+  }
+
+  async gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage> {
+    const url = `${this.baseUrl}/chat/completions`;
+
+    const payload: Record<string, any> = {
+      model: this.model,
+      messages: this.formatMessages(mensagens),
+      stream: false,
     };
 
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-  logger.info('[main] Graceful shutdown handlers registered (SIGINT/SIGTERM).');
-}
-
-async function bootstrap(): Promise<void> {
-  const logger: ILogger = new ConsoleLogger('SOBERANO');
-  const shutdownController = new AbortController();
-  const circuitBreaker = new CircuitBreaker({ logger });
-
-  const httpServer: IHttpServer = new NativeHttpServer({
-    logger,
-    abortSignal: shutdownController.signal,
-  });
-
-  registerShutdownHandlers(logger, shutdownController, httpServer);
-
-  const globalTimeoutSignal = AbortSignal.timeout(120_000);
-  const combinedSignal = AbortSignal.any([shutdownController.signal, globalTimeoutSignal]);
-
-  const provider = new OllamaProvider({ logger, circuitBreaker });
-  provider.setAbortSignal(combinedSignal);
-  const motor: IMotorCognitivo = provider;
-
-  const portArg = process.argv[3];
-  let HTTP_PORT = 3000;
-  if (portArg !== undefined) {
-    HTTP_PORT = parseInt(portArg, 10);
-    if (Number.isNaN(HTTP_PORT)) {
-      logger.error('[main] Invalid port argument "' + portArg + '". Porta invalida. Encerrando.');
-      process.exit(1);
+    if (tools && tools.length > 0) {
+      payload.tools = tools.map(t => ({
+        type: 'function',
+        function: {
+          name: t.function.name,
+          description: t.function.description,
+          parameters: t.function.parameters,
+        }
+      }));
     }
-  }
-  await httpServer.start(HTTP_PORT);
 
-  try {
-    // TESTE 1: MOTOR COGNITIVO
-    logger.info('[main] === TESTE 1: MOTOR COGNITIVO ===');
+    let lastError: Error | null = null;
 
-    const promptTeste = 'Ola, Soberano. Confirme que seus sistemas base estao online.';
-    const mensagens = [{ role: 'user' as const, content: promptTeste }];
-
-    logger.info('[main] Sending messages to cognitive engine...');
-    logger.info('[main] Messages: ' + JSON.stringify(mensagens));
-
-    const respostaMessage = await motor.gerarResposta(mensagens);
-
-    logger.info('[main] === RESPOSTA DO MOTOR COGNITIVO ===');
-    logger.info(respostaMessage.content);
-    logger.info('[main] Test completed successfully.');
-
-    // TESTE DO FILE SENSOR (Fase 2)
-    const filePath = process.argv[2];
-
-    if (filePath) {
-      logger.info('[main] === FILE SENSOR - Demonstracao ===');
-
-      const fileSensor: ISensor<string> = new FileSensor({ logger });
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      const attemptController = new AbortController();
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      let removeExternalListener: (() => void) | null = null;
 
       try {
-        const conteudo = await fileSensor.ler(filePath, combinedSignal);
-        logger.info('[main] Conteudo do arquivo "' + filePath + '":');
-        logger.info(conteudo);
-        logger.info('[main] FileSensor test completed successfully.');
-      } catch (sensorError) {
-        logger.error('[main] FileSensor: Erro ao ler o arquivo "' + filePath + '".');
-        if (sensorError instanceof Error) {
-          logger.error(sensorError.message);
-        } else {
-          logger.error('[main] Unknown error: ' + String(sensorError));
+        this.logger.info(
+          `[DeepSeekProvider] Attempt ${attempt}/${this.maxRetries} - Sending messages to model "${this.model}"` +
+          (tools ? ` with ${tools.length} tool(s) defined` : '')
+        );
+
+        timeoutHandle = setTimeout(() => {
+          attemptController.abort();
+        }, this.timeoutMs);
+
+        if (this.externalSignal) {
+          const onAbort = () => {
+            attemptController.abort();
+          };
+          this.externalSignal.addEventListener('abort', onAbort);
+          removeExternalListener = () => {
+            this.externalSignal!.removeEventListener('abort', onAbort);
+          };
+
+          if (this.externalSignal.aborted) {
+            attemptController.abort();
+          }
+        }
+
+        const executeFetch = async (): Promise<DeepSeekChatResponse> => {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${this.apiKey}`,
+            },
+            body: JSON.stringify(payload),
+            signal: attemptController.signal,
+          });
+
+          if (!response.ok) {
+            const errorBody = await response.text().catch(() => 'No error body available');
+            throw new Error(
+              `[DeepSeekProvider] HTTP error ${response.status} communicating with the cognitive engine.\n` +
+              `  URL: ${url}\n` +
+              `  Model: ${this.model}\n` +
+              `  Details: ${errorBody}`
+            );
+          }
+
+          const rawData: unknown = await response.json();
+          const validated = validateDeepSeekResponse(rawData);
+
+          const contentLength = validated.choices[0]?.message.content?.length ?? 0;
+          this.logger.info(
+            `[DeepSeekProvider] Attempt ${attempt} succeeded. Response received (${contentLength} chars).`
+          );
+
+          return validated;
+        };
+
+        const data: DeepSeekChatResponse = await this.circuitBreaker.execute(executeFetch);
+        const choice = data.choices[0];
+        if (!choice) throw new Error('[DeepSeekProvider] Empty choices array');
+        const msg = choice.message;
+
+        const resposta: ChatMessage = {
+          role: 'assistant',
+          content: msg.content ?? '',
+        };
+
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          resposta.tool_calls = msg.tool_calls.map(tc => {
+            let parsedArgs = {};
+            try {
+              parsedArgs = JSON.parse(tc.function.arguments);
+            } catch (e) {
+              this.logger.warn(`[DeepSeekProvider] Failed to parse tool call arguments: ${tc.function.arguments}`);
+            }
+            return {
+              id: tc.id,
+              function: {
+                name: tc.function.name,
+                arguments: parsedArgs,
+              }
+            };
+          });
+        }
+
+        return resposta;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        // Erros HTTP 4xx (exceto 429) são irrecuperáveis
+        if (error instanceof Error && /HTTP error [4][0-9]{2}/.test(error.message) && !error.message.includes('429')) {
+          this.logger.error(
+            `[DeepSeekProvider] Non-retryable HTTP error in attempt ${attempt}/${this.maxRetries}. ` +
+            `Breaking immediately.\n  Error: ${lastError.message}`
+          );
+          break;
+        }
+
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          this.logger.error(
+            `[DeepSeekProvider] Operation aborted in attempt ${attempt}/${this.maxRetries}. ` +
+            `Breaking immediately.\n  Error: ${lastError.message}`
+          );
+          break;
+        }
+
+        if (this.isRetryableError(error) && attempt < this.maxRetries) {
+          const delayMs = this.delayBase * attempt;
+          this.logger.warn(
+            `[DeepSeekProvider] Attempt ${attempt} failed (connection error). ` +
+            `Retrying in ${delayMs}ms...\n` +
+            `  Error: ${lastError.message}`
+          );
+          if (this.externalSignal?.aborted) {
+            break;
+          }
+          try {
+            await this.delay(delayMs, this.externalSignal ?? undefined);
+          } catch (delayError) {
+            break;
+          }
+          continue;
+        }
+
+        this.logger.error(
+          `[DeepSeekProvider] Unrecoverable error in attempt ${attempt}/${this.maxRetries}. ` +
+          `Breaking.\n  Error: ${lastError.message}`
+        );
+
+        break;
+      } finally {
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
+        }
+        if (removeExternalListener) {
+          removeExternalListener();
         }
       }
-    } else {
-      logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo> [porta]');
     }
 
-    // DEMONSTRACAO DO MOCK VECTOR STORE (Fase 3)
-    logger.info('[main] === MOCK VECTOR STORE - Demonstracao ===');
+    throw lastError ?? new Error('[DeepSeekProvider] Unknown failure after retry');
+  }
 
-    const vectorStore: IVectorStore = new MockVectorStore({ logger });
+  async *gerarRespostaStream(
+    mensagens: ChatMessage[],
+    tools?: IToolDefinition[],
+    signal?: AbortSignal
+  ): AsyncIterable<string> {
+    const url = `${this.baseUrl}/chat/completions`;
 
-    await vectorStore.adicionar('doc-1', [0.1, 0.2, 0.3], { texto: 'Gato felino mamifero', fonte: 'enciclopedia' });
-    await vectorStore.adicionar('doc-2', [0.4, 0.5, 0.6], { texto: 'Cachorro canino mamifero', fonte: 'enciclopedia' });
-    await vectorStore.adicionar('doc-3', [0.7, 0.8, 0.9], { texto: 'Aguia ave rapina', fonte: 'enciclopedia' });
+    const payload: Record<string, any> = {
+      model: this.model,
+      messages: this.formatMessages(mensagens),
+      stream: true,
+    };
 
-    logger.info('[main] 3 vectors added to MockVectorStore.');
-
-    const queryVector = [0.35, 0.45, 0.55];
-    const similar = await vectorStore.buscarSimilares(queryVector, 2);
-
-    logger.info('[main] Top ' + similar.length + ' similar vectors to query [0.35, 0.45, 0.55]:');
-    for (const result of similar) {
-      logger.info('  -> id="' + result.id + '", score=' + result.score.toFixed(4) + ', texto="' + result.metadata.texto + '"');
+    if (tools && tools.length > 0) {
+      payload.tools = tools.map(t => ({
+        type: 'function',
+        function: {
+          name: t.function.name,
+          description: t.function.description,
+          parameters: t.function.parameters,
+        }
+      }));
     }
 
-    logger.info('[main] MockVectorStore demonstration completed successfully.');
+    const controller = new AbortController();
 
-    // TESTE DO CONVERSATION MANAGER (Fase 5)
-    logger.info('[main] === CONVERSATION MANAGER - Demonstracao: Sessoes + RAG (Fase 5) ===');
+    if (signal) {
+      signal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+    if (this.externalSignal) {
+      this.externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
 
-    const sessionManager: ISessionManager = new InMemorySessionManager({
-      logger,
-      maxMessagesPerSession: 20,
+    this.logger.info(
+      `[DeepSeekProvider] Starting stream for model "${this.model}"` +
+      (tools ? ` with ${tools.length} tool(s) defined` : '')
+    );
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
 
-    // --- Tool Registry (Fase 6) ---
-    const toolRegistry: IToolRegistry = new ToolRegistry({ logger });
-    const systemTimeTool = new SystemTimeTool();
-    toolRegistry.registrar(systemTimeTool);
-    logger.info('[main] SystemTimeTool registered in ToolRegistry.');
-
-    const calculatorTool = new CalculatorTool();
-    toolRegistry.registrar(calculatorTool);
-    logger.info('[main] CalculatorTool registered in ToolRegistry.');
-
-    const readFileTool = new ReadFileTool();
-    toolRegistry.registrar(readFileTool);
-    logger.info('[main] ReadFileTool registered in ToolRegistry.');
-
-    const conversationManager: IConversationManager = new ConversationManager({
-      logger,
-      motor,
-      sessionManager,
-      vectorStore,
-      toolRegistry,
-    });
-
-    const sessionId = randomUUID();
-
-    // Turno 1
-    const input1 = 'Ola, quem es tu?';
-    logger.info('[main] CONVERSATION - Turno 1/2: "' + input1 + '"');
-    const resposta1 = await conversationManager.conversar(sessionId, input1);
-    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 1 ===');
-    logger.info(resposta1);
-
-    // Turno 2
-    const input2 = 'Qual foi a minha primeira pergunta?';
-    logger.info('[main] CONVERSATION - Turno 2/2: "' + input2 + '"');
-    const resposta2 = await conversationManager.conversar(sessionId, input2);
-    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 2 ===');
-    logger.info(resposta2);
-
-    // Turno 3 - Força o uso da ferramenta get_system_time
-    const input3 = 'Que horas sao exatamente agora?';
-    logger.info('[main] CONVERSATION - Turno 3/4 (Tool Calling): "' + input3 + '"');
-    const resposta3 = await conversationManager.conversar(sessionId, input3);
-    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 3 (Tool Calling) ===');
-    logger.info(resposta3);
-    logger.info('[main] === Tool Call test completed successfully. ===');
-
-    // Turno 4 - Uso multiplo de ferramentas (calculator + get_system_time)
-    const input4 = 'Soberano, calcule quanto e 1450 dividido por 5 e depois me diga que horas sao';
-    logger.info('[main] CONVERSATION - Turno 4/4 (Multi-tool): "' + input4 + '"');
-    const resposta4 = await conversationManager.conversar(sessionId, input4);
-    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 4 (Multi-tool) ===');
-    logger.info(resposta4);
-    logger.info('[main] === Sprint 6.5 - Zero Debt test completed successfully. ===');
-
-    // Verificacao da memoria de sessao
-    const historicoFinal = await sessionManager.obterHistorico(sessionId);
-    logger.info('[main] === SESSAO "' + sessionId + '" — ' + historicoFinal.length + ' mensagens ===');
-    logger.info('[main] Session history (' + historicoFinal.length + ' messages):');
-    for (const msg of historicoFinal) {
-      const truncatedContent = msg.content.substring(0, 100) + (msg.content.length > 100 ? '...' : '');
-      logger.info('  [' + msg.role + '] ' + truncatedContent);
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => 'No error body available');
+      throw new Error(
+        `[DeepSeekProvider] HTTP error ${response.status} during stream.\n` +
+        `  URL: ${url}\n  Model: ${this.model}\n  Details: ${errorBody}`
+      );
     }
 
-    logger.info('[main] === FASE 6.5 COMPLETA - Todos os testes OK ===');
-  } catch (error) {
-    if (shutdownController.signal.aborted) {
-      logger.info('[main] Operation cancelled due to system shutdown.');
-      return;
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('[DeepSeekProvider] Response body is not readable for streaming');
     }
 
-    logger.error('[main] === ERRO NA COMUNICACAO COM O MOTOR ===');
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
 
-    if (error instanceof Error) {
-      logger.error(error.message);
-    } else {
-      logger.error('[main] Unknown error: ' + String(error));
-    }
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-    logger.error('[main] O sistema nao pode se comunicar com o motor cognitivo.');
-    logger.error('[main] Verifique se o servidor Ollama esta em execucao: ollama serve');
+        buffer += decoder.decode(value, { stream: true });
 
-    process.exit(1);
-  } finally {
-    // Ensure httpServer.stop() is called exactly once to avoid race condition
-    if (!shutdownInProgress) {
-      shutdownInProgress = true;
-      await httpServer.stop().catch((err) => {
-        logger.error('[main] Error stopping HTTP server: ' + err);
-      });
-    }
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? ''; 
 
-    if (isShuttingDown) {
-      logger.info('[main] Resources released. Goodbye, SOBERANO.');
-      process.exit(0);
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === 'data: [DONE]') continue;
+          
+          if (trimmed.startsWith('data: ')) {
+            const dataStr = trimmed.substring(6);
+            try {
+              const chunk = JSON.parse(dataStr);
+              if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content) {
+                yield chunk.choices[0].delta.content;
+              }
+            } catch {
+              // Silently skip malformed JSON chunks
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+      this.logger.info(`[DeepSeekProvider] Stream completed for model "${this.model}"`);
     }
   }
 }
+</file>
 
-bootstrap();
+<file path="tsconfig.test.json">
+{"extends": "./tsconfig.json", "include": ["src/**/*.ts", "src/**/*.test.ts"], "exclude": ["node_modules", "dist"]}
 </file>
 
 <file path="src/core/IEmbeddings.ts">
@@ -1161,31 +832,6 @@ export abstract class IEmbeddings {
    * @throws {Error} Se o serviço de embeddings falhar ou retornar dados inválidos
    */
   abstract gerarVector(text: string): Promise<number[]>;
-}
-</file>
-
-<file path="src/core/IHttpServer.ts">
-/**
- * @file IHttpServer.ts
- * @description Contrato de abstração para servidor HTTP nativo do SOBERANO.
- *              Segue o DIP: módulos de alto nível dependem desta abstração,
- *              não de implementações concretas.
- *
- *              Suporta start/stop para integração com graceful shutdown.
- */
-
-export abstract class IHttpServer {
-  /**
-   * Inicia o servidor HTTP na porta especificada.
-   * @param port - Número da porta para escutar (ex: 3000)
-   */
-  abstract start(port: number): Promise<void>;
-
-  /**
-   * Para o servidor HTTP de forma limpa.
-   * Fecha todas as conexões ativas e libera a porta.
-   */
-  abstract stop(): Promise<void>;
 }
 </file>
 
@@ -2726,6 +2372,967 @@ describe('ToolRegistry', () => {
 });
 </file>
 
+<file path="src/renderer/app.js">
+/**
+ * @file app.js
+ * @description Frontend Vanilla do SOBERANO — "A Casca".
+ *
+ *              Usa a API nativa `fetch` para enviar mensagens e consumir
+ *              Server-Sent Events do backend HTTP (POST /chat).
+ *
+ *              Fluxo:
+ *              1. GET /healthz verifica se o servidor está online.
+ *              2. POST /chat com { message, sessionId } inicia streaming SSE.
+ *              3. Cada evento data: { chunk, done } atualiza o DOM em tempo real.
+ *              4. Ao final (done: true), a message box perde a classe .streaming.
+ */
+
+(function () {
+  'use strict';
+
+  // ─── State ────────────────────────────────────────────────────────────────
+  /** @type {string | null} */
+  let sessionId = localStorage.getItem('soberano_session_id');
+
+  /** @type {boolean} */
+  let isStreaming = false;
+
+  /** @type {AbortController | null} */
+  let currentAbortController = null;
+
+  // ─── DOM References ──────────────────────────────────────────────────────
+  const chatContainer = document.getElementById('chat-container');
+  const messageInput = document.getElementById('message-input');
+  const sendButton = document.getElementById('send-button');
+  const statusDot = document.getElementById('status-dot');
+  const statusText = document.getElementById('status-text');
+  const sessionIdLabel = document.getElementById('session-id-label');
+
+  // ─── Health Check ─────────────────────────────────────────────────────────
+  async function checkHealth() {
+    try {
+      const res = await fetch('/healthz', { method: 'GET' });
+      if (res.ok) {
+        setStatus(true, 'Online');
+        sendButton.disabled = false;
+        return true;
+      }
+    } catch {
+      // ignora
+    }
+    setStatus(false, 'Offline');
+    sendButton.disabled = true;
+    return false;
+  }
+
+  function setStatus(online, text) {
+    statusText.textContent = text;
+    statusDot.classList.toggle('offline', !online);
+    if (online) {
+      sessionIdLabel.textContent = `Sessão: ${sessionId ? sessionId.substring(0, 8) + '...' : 'Nova'}`;
+    }
+  }
+
+  // ─── Session ID ──────────────────────────────────────────────────────────
+  function getOrCreateSessionId() {
+    if (!sessionId) {
+      sessionId = crypto.randomUUID();
+      localStorage.setItem('soberano_session_id', sessionId);
+    }
+    sessionIdLabel.textContent = `Sessão: ${sessionId.substring(0, 8)}...`;
+    return sessionId;
+  }
+
+  // ─── UI Helpers ──────────────────────────────────────────────────────────
+  function addMessage(role, content) {
+    const div = document.createElement('div');
+    div.className = `message ${role}`;
+    div.textContent = content;
+    chatContainer.appendChild(div);
+    scrollToBottom();
+    return div;
+  }
+
+  function addTypingIndicator() {
+    const div = document.createElement('div');
+    div.className = 'typing-indicator';
+    div.innerHTML = '<span></span><span></span><span></span>';
+    chatContainer.appendChild(div);
+    scrollToBottom();
+    return div;
+  }
+
+  function removeTypingIndicator(indicator) {
+    if (indicator && indicator.parentNode) {
+      indicator.parentNode.removeChild(indicator);
+    }
+  }
+
+  function getLastAssistantMessage() {
+    const messages = chatContainer.querySelectorAll('.message.assistant');
+    return messages.length > 0 ? messages[messages.length - 1] : null;
+  }
+
+  function scrollToBottom() {
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+  }
+
+  function setInputEnabled(enabled) {
+    messageInput.disabled = !enabled;
+    sendButton.disabled = !enabled;
+    if (enabled) {
+      messageInput.focus();
+    }
+  }
+
+  // ─── Auto-resize textarea ────────────────────────────────────────────────
+  messageInput.addEventListener('input', function () {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+  });
+
+  // ─── Send message via fetch + SSE ────────────────────────────────────────
+  async function sendMessage(userText) {
+    if (isStreaming || !userText.trim()) return;
+
+    isStreaming = true;
+    setInputEnabled(false);
+
+    // Exibe a mensagem do usuário
+    addMessage('user', userText);
+
+    // Indicador de digitação enquanto aguarda o primeiro chunk
+    const typingIndicator = addTypingIndicator();
+
+    // Cria (ou reusa) o elemento da mensagem do assistente
+    let assistantMessageEl = null;
+    let currentText = '';
+
+    currentAbortController = new AbortController();
+    const sid = getOrCreateSessionId();
+
+    try {
+      const response = await fetch('/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-Id': sid,
+        },
+        body: JSON.stringify({ message: userText }),
+        signal: currentAbortController.signal,
+      });
+
+      if (!response.ok) {
+        const errBody = await response.text();
+        throw new Error(`HTTP ${response.status}: ${errBody}`);
+      }
+
+      // Lê a resposta como texto SSE usando reader
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Processa linhas SSE completas
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Última linha pode estar incompleta
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+
+          const jsonStr = line.slice(6).trim();
+          if (!jsonStr) continue;
+
+          try {
+            const event = JSON.parse(jsonStr);
+
+            // Evento de sessão (primeiro evento)
+            if (event.type === 'session') {
+              sessionId = event.sessionId;
+              localStorage.setItem('soberano_session_id', sessionId);
+              sessionIdLabel.textContent = `Sessão: ${sessionId.substring(0, 8)}...`;
+              continue;
+            }
+
+            // Erro do servidor
+            if (event.error) {
+              removeTypingIndicator(typingIndicator);
+              addMessage('error', `❌ ${event.error}`);
+              continue;
+            }
+
+            // Chunk de texto
+            if (event.chunk !== undefined) {
+              removeTypingIndicator(typingIndicator);
+
+              if (!assistantMessageEl) {
+                // Cria elemento da mensagem do assistente
+                assistantMessageEl = document.createElement('div');
+                assistantMessageEl.className = 'message assistant streaming';
+                assistantMessageEl.textContent = '';
+                chatContainer.appendChild(assistantMessageEl);
+              }
+
+              if (!event.done) {
+                // Adiciona chunk
+                const chunk = event.chunk.replace(/\\n/g, '\n');
+                currentText += chunk;
+                assistantMessageEl.textContent = currentText;
+                scrollToBottom();
+              }
+
+              // Último evento (stream finalizado)
+              if (event.done) {
+                assistantMessageEl.classList.remove('streaming');
+                scrollToBottom();
+              }
+            }
+          } catch (parseErr) {
+            // Ignora JSON malformados no SSE
+            console.warn('[app.js] SSE parse error:', parseErr, jsonStr);
+          }
+        }
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        // Requisição cancelada pelo usuário — ignora silenciosamente
+        return;
+      }
+      removeTypingIndicator(typingIndicator);
+      addMessage('error', `❌ Erro de conexão: ${err.message}`);
+      console.error('[app.js] Fetch error:', err);
+    } finally {
+      isStreaming = false;
+      setInputEnabled(true);
+      currentAbortController = null;
+      messageInput.value = '';
+      messageInput.style.height = 'auto';
+    }
+  }
+
+  // ─── Event Listeners ─────────────────────────────────────────────────────
+  sendButton.addEventListener('click', function () {
+    const text = messageInput.value;
+    if (text.trim()) {
+      sendMessage(text);
+    }
+  });
+
+  messageInput.addEventListener('keydown', function (e) {
+    // Enter envia a mensagem (Shift+Enter = nova linha)
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      const text = this.value;
+      if (text.trim()) {
+        sendMessage(text);
+      }
+    }
+  });
+
+  // ─── Boot ────────────────────────────────────────────────────────────────
+  getOrCreateSessionId();
+  checkHealth();
+  setInterval(checkHealth, 30_000); // Health check a cada 30s
+
+  messageInput.focus();
+
+  console.log('[app.js] SOBERANO frontend initialized.');
+  console.log(`[app.js] Session ID: ${sessionId}`);
+})();
+</file>
+
+<file path="src/renderer/index.html">
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SOBERANO — Assistente de IA</title>
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-tertiary: #334155;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #7dd3fc;
+      --user-msg-bg: #1d4ed8;
+      --assistant-msg-bg: #1e293b;
+      --error: #ef4444;
+      --border: #475569;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    header {
+      background: var(--bg-secondary);
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    header .status {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    header .status .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #22c55e;
+      display: inline-block;
+    }
+
+    header .status .dot.offline {
+      background: var(--error);
+    }
+
+    #chat-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    #chat-container::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    #chat-container::-webkit-scrollbar-track {
+      background: var(--bg-primary);
+    }
+
+    #chat-container::-webkit-scrollbar-thumb {
+      background: var(--bg-tertiary);
+      border-radius: 3px;
+    }
+
+    .message {
+      max-width: 80%;
+      padding: 12px 16px;
+      border-radius: var(--radius);
+      line-height: 1.5;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: var(--user-msg-bg);
+      color: white;
+      border-bottom-right-radius: 2px;
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+      background: var(--assistant-msg-bg);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 2px;
+    }
+
+    .message.assistant.streaming {
+      border-color: var(--accent);
+    }
+
+    .message.error {
+      align-self: flex-start;
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--error);
+      border: 1px solid var(--error);
+    }
+
+    .typing-indicator {
+      align-self: flex-start;
+      display: flex;
+      gap: 4px;
+      padding: 16px;
+      align-items: center;
+    }
+
+    .typing-indicator span {
+      width: 8px;
+      height: 8px;
+      background: var(--text-secondary);
+      border-radius: 50%;
+      animation: typing 1.4s infinite ease-in-out;
+    }
+
+    .typing-indicator span:nth-child(2) {
+      animation-delay: 0.2s;
+    }
+
+    .typing-indicator span:nth-child(3) {
+      animation-delay: 0.4s;
+    }
+
+    @keyframes typing {
+      0%,
+      60%,
+      100% {
+        opacity: 0.3;
+        transform: scale(0.8);
+      }
+      30% {
+        opacity: 1;
+        transform: scale(1.2);
+      }
+    }
+
+    #input-container {
+      background: var(--bg-secondary);
+      padding: 16px 24px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+      flex-shrink: 0;
+    }
+
+    #message-input {
+      flex: 1;
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      font-size: 0.875rem;
+      font-family: inherit;
+      resize: none;
+      min-height: 44px;
+      max-height: 120px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    #message-input:focus {
+      border-color: var(--accent);
+    }
+
+    #message-input::placeholder {
+      color: var(--text-secondary);
+    }
+
+    #send-button {
+      background: var(--accent);
+      color: var(--bg-primary);
+      border: none;
+      border-radius: var(--radius);
+      padding: 12px 24px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+      white-space: nowrap;
+      min-height: 44px;
+    }
+
+    #send-button:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+
+    #send-button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    #session-info {
+      font-size: 0.7rem;
+      color: var(--text-secondary);
+      padding: 4px 24px;
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>⚡ SOBERANO</h1>
+    <span class="status">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">Conectando...</span>
+    </span>
+  </header>
+
+  <div id="chat-container"></div>
+
+  <div id="input-container">
+    <textarea
+      id="message-input"
+      placeholder="Digite sua mensagem para o SOBERANO..."
+      rows="1"
+    ></textarea>
+    <button id="send-button" disabled>Enviar</button>
+  </div>
+
+  <div id="session-info">
+    <span id="session-id-label">Carregando...</span>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
+</file>
+
+<file path="src/main-cli.ts">
+/**
+ * @file main.ts
+ * @description Ponto de entrada do sistema SOBERANO - Sprint 6.5 (Zero Debt).
+ *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
+ *              - Instancia ConsoleLogger para logging estruturado
+ *              - Instancia OllamaProvider com Logger injetado via construtor
+ *              - Cria AbortController global para graceful shutdown
+ *              - Injeta AbortSignal no OllamaProvider para cancelar fetch em andamento
+ *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
+ *              - Inicializa NativeHttpServer para servir rota /healthz
+ *              - Executa o teste de comunicacao com o motor cognitivo
+ *              - Executa o teste do FileSensor (leitura de arquivo local)
+ *              - Demonstra o MockVectorStore (Memoria Vetorial - Fase 3)
+ *              - Instancia InMemorySessionManager para gestao de sessoes (Fase 5)
+ *              - Instancia ConversationManager para orquestracao multi-turno com RAG (Fase 5)
+ *              - Simula 2 turnos de conversa para provar a retencao de memoria de sessao
+ */
+
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { OllamaProvider } from './infra/OllamaProvider.ts';
+import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
+import { ConsoleLogger } from './infra/ConsoleLogger.ts';
+import { ILogger } from './core/ILogger.ts';
+import { CircuitBreaker } from './infra/CircuitBreaker.ts';
+import { NativeHttpServer } from './infra/NativeHttpServer.ts';
+import { IHttpServer } from './core/IHttpServer.ts';
+import { FileSensor } from './infra/FileSensor.ts';
+import { ISensor } from './core/ISensor.ts';
+import { MockVectorStore } from './infra/MockVectorStore.ts';
+import { IVectorStore } from './core/IVectorStore.ts';
+import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
+import { ISessionManager } from './core/ISessionManager.ts';
+import { ConversationManager } from './infra/ConversationManager.ts';
+import { IConversationManager } from './core/IConversationManager.ts';
+import { ToolRegistry } from './infra/ToolRegistry.ts';
+import { IToolRegistry } from './core/IToolRegistry.ts';
+import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
+import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
+import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
+
+let isShuttingDown = false;
+let shutdownInProgress = false;
+
+function registerShutdownHandlers(
+  logger: ILogger,
+  shutdownController: AbortController,
+  httpServer: IHttpServer
+): void {
+    const shutdown = async (signal: string) => {
+      if (isShuttingDown) {
+        logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
+        process.exit(1);
+      }
+
+      isShuttingDown = true;
+      logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
+
+      const forceExitTimer = setTimeout(() => {
+        logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
+        process.exit(1);
+      }, 5_000);
+
+      process.removeAllListeners('SIGINT');
+      process.removeAllListeners('SIGTERM');
+
+      // Prevent race condition: ensure abort is called before cleanup
+      if (!shutdownInProgress) {
+        shutdownInProgress = true;
+        shutdownController.abort();
+        clearTimeout(forceExitTimer);
+        logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
+      } else {
+        clearTimeout(forceExitTimer);
+        logger.info('[main] Shutdown already in progress.');
+      }
+    };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  logger.info('[main] Graceful shutdown handlers registered (SIGINT/SIGTERM).');
+}
+
+async function bootstrap(): Promise<void> {
+  const logger: ILogger = new ConsoleLogger('SOBERANO');
+  const shutdownController = new AbortController();
+  const circuitBreaker = new CircuitBreaker({ logger });
+
+  const globalTimeoutSignal = AbortSignal.timeout(120_000);
+  const combinedSignal = AbortSignal.any([shutdownController.signal, globalTimeoutSignal]);
+
+  const provider = new OllamaProvider({ logger, circuitBreaker });
+  provider.setAbortSignal(combinedSignal);
+  const motor: IMotorCognitivo = provider;
+
+  // --- Session Manager ---
+  const sessionManager: ISessionManager = new InMemorySessionManager({
+    logger,
+    maxMessagesPerSession: 20,
+  });
+
+  // --- Vector Store ---
+  const vectorStore: IVectorStore = new MockVectorStore({ logger });
+
+  // --- Tool Registry ---
+  const toolRegistry: IToolRegistry = new ToolRegistry({ logger });
+  const systemTimeTool = new SystemTimeTool();
+  toolRegistry.registrar(systemTimeTool);
+  logger.info('[main] SystemTimeTool registered in ToolRegistry.');
+
+  const calculatorTool = new CalculatorTool();
+  toolRegistry.registrar(calculatorTool);
+  logger.info('[main] CalculatorTool registered in ToolRegistry.');
+
+  const readFileTool = new ReadFileTool();
+  toolRegistry.registrar(readFileTool);
+  logger.info('[main] ReadFileTool registered in ToolRegistry.');
+
+  // --- Conversation Manager ---
+  const conversationManager: IConversationManager = new ConversationManager({
+    logger,
+    motor,
+    sessionManager,
+    vectorStore,
+    toolRegistry,
+  });
+
+  // --- Resolve rendererDir: dist/renderer = __dirname + '/renderer' ---
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = join(__filename, '..');
+  const rendererDir = join(__dirname, 'renderer');
+
+  // --- HTTP Server ---
+  const httpServer: IHttpServer = new NativeHttpServer({
+    logger,
+    conversationManager,
+    sessionManager,
+    rendererDir,
+    abortSignal: shutdownController.signal,
+  });
+
+  registerShutdownHandlers(logger, shutdownController, httpServer);
+
+  const portArg = process.argv[3];
+  let HTTP_PORT = 3000;
+  if (portArg !== undefined) {
+    HTTP_PORT = parseInt(portArg, 10);
+    if (Number.isNaN(HTTP_PORT)) {
+      logger.error('[main] Invalid port argument "' + portArg + '". Porta invalida. Encerrando.');
+      process.exit(1);
+    }
+  }
+  await httpServer.start(HTTP_PORT);
+
+  try {
+    // TESTE 1: MOTOR COGNITIVO
+    logger.info('[main] === TESTE 1: MOTOR COGNITIVO ===');
+
+    const promptTeste = 'Ola, Soberano. Confirme que seus sistemas base estao online.';
+    const mensagens = [{ role: 'user' as const, content: promptTeste }];
+
+    logger.info('[main] Sending messages to cognitive engine...');
+    logger.info('[main] Messages: ' + JSON.stringify(mensagens));
+
+    const respostaMessage = await motor.gerarResposta(mensagens);
+
+    logger.info('[main] === RESPOSTA DO MOTOR COGNITIVO ===');
+    logger.info(respostaMessage.content);
+    logger.info('[main] Test completed successfully.');
+
+    // TESTE DO FILE SENSOR (Fase 2)
+    const filePath = process.argv[2];
+
+    if (filePath) {
+      logger.info('[main] === FILE SENSOR - Demonstracao ===');
+
+      const fileSensor: ISensor<string> = new FileSensor({ logger });
+
+      try {
+        const conteudo = await fileSensor.ler(filePath, combinedSignal);
+        logger.info('[main] Conteudo do arquivo "' + filePath + '":');
+        logger.info(conteudo);
+        logger.info('[main] FileSensor test completed successfully.');
+      } catch (sensorError) {
+        logger.error('[main] FileSensor: Erro ao ler o arquivo "' + filePath + '".');
+        if (sensorError instanceof Error) {
+          logger.error(sensorError.message);
+        } else {
+          logger.error('[main] Unknown error: ' + String(sensorError));
+        }
+      }
+    } else {
+      logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo> [porta]');
+    }
+
+    // DEMONSTRACAO DO MOCK VECTOR STORE (Fase 3)
+    logger.info('[main] === MOCK VECTOR STORE - Demonstracao ===');
+
+    await vectorStore.adicionar('doc-1', [0.1, 0.2, 0.3], { texto: 'Gato felino mamifero', fonte: 'enciclopedia' });
+    await vectorStore.adicionar('doc-2', [0.4, 0.5, 0.6], { texto: 'Cachorro canino mamifero', fonte: 'enciclopedia' });
+    await vectorStore.adicionar('doc-3', [0.7, 0.8, 0.9], { texto: 'Aguia ave rapina', fonte: 'enciclopedia' });
+
+    logger.info('[main] 3 vectors added to MockVectorStore.');
+
+    const queryVector = [0.35, 0.45, 0.55];
+    const similar = await vectorStore.buscarSimilares(queryVector, 2);
+
+    logger.info('[main] Top ' + similar.length + ' similar vectors to query [0.35, 0.45, 0.55]:');
+    for (const result of similar) {
+      logger.info('  -> id="' + result.id + '", score=' + result.score.toFixed(4) + ', texto="' + result.metadata.texto + '"');
+    }
+
+    logger.info('[main] MockVectorStore demonstration completed successfully.');
+
+    // TESTE DO CONVERSATION MANAGER (Fase 5)
+    logger.info('[main] === CONVERSATION MANAGER - Demonstracao: Sessoes + RAG (Fase 5) ===');
+
+    const sessionId = randomUUID();
+
+    // Turno 1
+    const input1 = 'Ola, quem es tu?';
+    logger.info('[main] CONVERSATION - Turno 1/2: "' + input1 + '"');
+    const resposta1 = await conversationManager.conversar(sessionId, input1);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 1 ===');
+    logger.info(resposta1);
+
+    // Turno 2
+    const input2 = 'Qual foi a minha primeira pergunta?';
+    logger.info('[main] CONVERSATION - Turno 2/2: "' + input2 + '"');
+    const resposta2 = await conversationManager.conversar(sessionId, input2);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 2 ===');
+    logger.info(resposta2);
+
+    // Turno 3 - Força o uso da ferramenta get_system_time
+    const input3 = 'Que horas sao exatamente agora?';
+    logger.info('[main] CONVERSATION - Turno 3/4 (Tool Calling): "' + input3 + '"');
+    const resposta3 = await conversationManager.conversar(sessionId, input3);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 3 (Tool Calling) ===');
+    logger.info(resposta3);
+    logger.info('[main] === Tool Call test completed successfully. ===');
+
+    // Turno 4 - Uso multiplo de ferramentas (calculator + get_system_time)
+    const input4 = 'Soberano, calcule quanto e 1450 dividido por 5 e depois me diga que horas sao';
+    logger.info('[main] CONVERSATION - Turno 4/4 (Multi-tool): "' + input4 + '"');
+    const resposta4 = await conversationManager.conversar(sessionId, input4);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 4 (Multi-tool) ===');
+    logger.info(resposta4);
+    logger.info('[main] === Sprint 6.5 - Zero Debt test completed successfully. ===');
+
+    // Verificacao da memoria de sessao
+    const historicoFinal = await sessionManager.obterHistorico(sessionId);
+    logger.info('[main] === SESSAO "' + sessionId + '" — ' + historicoFinal.length + ' mensagens ===');
+    logger.info('[main] Session history (' + historicoFinal.length + ' messages):');
+    for (const msg of historicoFinal) {
+      const truncatedContent = msg.content.substring(0, 100) + (msg.content.length > 100 ? '...' : '');
+      logger.info('  [' + msg.role + '] ' + truncatedContent);
+    }
+
+    logger.info('[main] === FASE 6.5 COMPLETA - Todos os testes OK ===');
+  } catch (error) {
+    if (shutdownController.signal.aborted) {
+      logger.info('[main] Operation cancelled due to system shutdown.');
+      return;
+    }
+
+    logger.error('[main] === ERRO NA COMUNICACAO COM O MOTOR ===');
+
+    if (error instanceof Error) {
+      logger.error(error.message);
+    } else {
+      logger.error('[main] Unknown error: ' + String(error));
+    }
+
+    logger.error('[main] O sistema nao pode se comunicar com o motor cognitivo.');
+    logger.error('[main] Verifique se o servidor Ollama esta em execucao: ollama serve');
+
+    process.exit(1);
+  } finally {
+    // Ensure httpServer.stop() is called exactly once to avoid race condition
+    if (!shutdownInProgress) {
+      shutdownInProgress = true;
+      await httpServer.stop().catch((err) => {
+        logger.error('[main] Error stopping HTTP server: ' + err);
+      });
+    }
+
+    if (isShuttingDown) {
+      logger.info('[main] Resources released. Goodbye, SOBERANO.');
+      process.exit(0);
+    }
+  }
+}
+
+bootstrap();
+</file>
+
+<file path="src-tauri/src/main.rs">
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+fn main() {
+  tauri::Builder::default()
+    .run(tauri::generate_context!())
+    .expect("error while running tauri application");
+}
+</file>
+
+<file path="src-tauri/.gitignore">
+# Generated by Cargo
+# will have compiled files and executables
+/target/
+</file>
+
+<file path="src-tauri/build.rs">
+fn main() {
+  tauri_build::build()
+}
+</file>
+
+<file path="src-tauri/Cargo.toml">
+[package]
+name = "app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+license = ""
+repository = ""
+default-run = "app"
+edition = "2021"
+rust-version = "1.60"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+tauri-build = { version = "1.5.5", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "1.8.1", features = [] }
+
+[features]
+# this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.
+# If you use cargo directly instead of tauri's cli you can use this feature flag to switch between tauri's `dev` and `build` modes.
+# DO NOT REMOVE!!
+custom-protocol = [ "tauri/custom-protocol" ]
+</file>
+
+<file path="src-tauri/tauri.conf.json">
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run start:server",
+    "devPath": "http://localhost:3000",
+    "distDir": "../src/renderer"
+  },
+  "package": {
+    "productName": "SOBERANO",
+    "version": "0.7.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false
+    },
+    "bundle": {
+      "active": true,
+      "category": "DeveloperTool",
+      "copyright": "",
+      "deb": {
+        "depends": []
+      },
+      "externalBin": [],
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ],
+      "identifier": "com.tauri.dev",
+      "longDescription": "",
+      "macOS": {
+        "entitlements": null,
+        "exceptionDomain": "",
+        "frameworks": [],
+        "providerShortName": null,
+        "signingIdentity": null
+      },
+      "resources": [],
+      "shortDescription": "",
+      "targets": "all",
+      "windows": {
+        "certificateThumbprint": null,
+        "digestAlgorithm": "sha256",
+        "timestampUrl": ""
+      }
+    },
+    "security": {
+      "csp": null
+    },
+    "updater": {
+      "active": false
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "height": 600,
+        "resizable": true,
+        "title": "SOBERANO — Assistente de IA",
+        "width": 800
+      }
+    ]
+  }
+}
+</file>
+
 <file path=".gitignore">
 # Dependências
 node_modules/
@@ -2802,32 +3409,34 @@ export abstract class ICircuitBreaker {
 }
 </file>
 
-<file path="src/core/IConversationManager.ts">
+<file path="src/core/IHttpServer.ts">
 /**
- * @file IConversationManager.ts
- * @description Contrato do Maestro — orquestrador que une a Memória Vetorial (RAG)
- *              e a Memória de Curto Prazo (Sessões) em um único fluxo de conversação
- *              multi-turno. Segue o DIP: módulos de alto nível dependem desta abstração.
+ * @file IHttpServer.ts
+ * @description Contrato de abstração para servidor HTTP nativo do SOBERANO.
+ *              Segue o DIP: módulos de alto nível dependem desta abstração,
+ *              não de implementações concretas.
+ *
+ *              Suporta start/stop para integração com graceful shutdown.
  */
 
-export abstract class IConversationManager {
+export abstract class IHttpServer {
   /**
-   * Processa uma interação completa de conversa:
-   * 1. Guarda o input do usuário no SessionManager (role: user).
-   * 2. Se um VectorStore estiver disponível, busca contextos similares ao input (RAG).
-   * 3. Obtém o histórico completo da sessão.
-   * 4. Constrói uma mensagem system fundindo regras do SOBERANO com documentos recuperados.
-   * 5. Envia o array de mensagens ao motor cognitivo.
-   * 6. Executa o ReAct/Tool Calling Loop se houver tool_calls.
-   * 7. Guarda a resposta (role: assistant) no SessionManager.
-   * 8. Retorna a resposta ao chamador.
-   *
-   * @param sessionId    - Identificador único da sessão de conversa.
-   * @param inputUsuario - Texto de entrada do usuário.
-   * @param signal       - Sinal opcional para abortar a operação (graceful shutdown / cancelamento).
-   * @returns A resposta gerada pelo motor cognitivo (role: assistant).
+   * Retorna a porta real em que o servidor está escutando,
+   * ou null se o servidor não foi iniciado.
    */
-  abstract conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string>;
+  abstract get port(): number | null;
+
+  /**
+   * Inicia o servidor HTTP na porta especificada.
+   * @param port - Número da porta para escutar (ex: 3000)
+   */
+  abstract start(port: number): Promise<void>;
+
+  /**
+   * Para o servidor HTTP de forma limpa.
+   * Fecha todas as conexões ativas e libera a porta.
+   */
+  abstract stop(): Promise<void>;
 }
 </file>
 
@@ -3171,6 +3780,59 @@ export class ToolRegistry extends IToolRegistry {
 - [cite_start]src/main.ts: Orquestração, Wiring manual e ponto de entrada[cite: 162].
 </file>
 
+<file path="src/core/IConversationManager.ts">
+/**
+ * @file IConversationManager.ts
+ * @description Contrato do Maestro — orquestrador que une a Memória Vetorial (RAG)
+ *              e a Memória de Curto Prazo (Sessões) em um único fluxo de conversação
+ *              multi-turno. Segue o DIP: módulos de alto nível dependem desta abstração.
+ *
+ *              A Fase 7 adiciona o método conversarStream() para suporte a SSE
+ *              (Server-Sent Events) via Tauri/WebView.
+ */
+
+export abstract class IConversationManager {
+  /**
+   * Processa uma interação completa de conversa:
+   * 1. Guarda o input do usuário no SessionManager (role: user).
+   * 2. Se um VectorStore estiver disponível, busca contextos similares ao input (RAG).
+   * 3. Obtém o histórico completo da sessão.
+   * 4. Constrói uma mensagem system fundindo regras do SOBERANO com documentos recuperados.
+   * 5. Envia o array de mensagens ao motor cognitivo.
+   * 6. Executa o ReAct/Tool Calling Loop se houver tool_calls.
+   * 7. Guarda a resposta (role: assistant) no SessionManager.
+   * 8. Retorna a resposta ao chamador.
+   *
+   * @param sessionId    - Identificador único da sessão de conversa.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @param signal       - Sinal opcional para abortar a operação (graceful shutdown / cancelamento).
+   * @returns A resposta gerada pelo motor cognitivo (role: assistant).
+   */
+  abstract conversar(sessionId: string, inputUsuario: string, signal?: AbortSignal): Promise<string>;
+
+  /**
+   * Versão streaming de conversar. Processa uma interação e retorna chunks
+   * de texto em tempo real via AsyncIterable, ideal para SSE (Server-Sent Events).
+   *
+   * Diferenças do conversar():
+   * - Usa motor.gerarRespostaStream() em vez de gerarResposta()
+   * - Não executa Tool Calling Loop (incompatível com streaming)
+   * - Cada chunk yieldado é um fragmento da resposta do LLM
+   * - A resposta completa é guardada no SessionManager ao final
+   *
+   * @param sessionId    - Identificador único da sessão de conversa.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @param signal       - Sinal opcional para abortar a operação.
+   * @yields Chunks de texto da resposta em tempo real.
+   */
+  abstract conversarStream(
+    sessionId: string,
+    inputUsuario: string,
+    signal?: AbortSignal
+  ): AsyncIterable<string>;
+}
+</file>
+
 <file path="src/core/ILogger.ts">
 /**
  * @file ILogger.ts
@@ -3290,7 +3952,7 @@ describe('FileSensor', () => {
       const fakeContent = 'conteúdo simulado do arquivo';
       const mockReadFile = async () => fakeContent;
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
       const result = await sensor.ler('/fake/path/file.txt');
 
       assert.strictEqual(result, fakeContent);
@@ -3304,7 +3966,7 @@ describe('FileSensor', () => {
       (enoentError as Error & { code: string }).code = 'ENOENT';
       const mockReadFile = async () => { throw enoentError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/not/found.txt'));
 
@@ -3322,7 +3984,7 @@ describe('FileSensor', () => {
       (eaccesError as Error & { code: string }).code = 'EACCES';
       const mockReadFile = async () => { throw eaccesError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/no/perm.txt'));
 
@@ -3340,7 +4002,7 @@ describe('FileSensor', () => {
       (eisdirError as Error & { code: string }).code = 'EISDIR';
       const mockReadFile = async () => { throw eisdirError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/path/to/dir'));
 
@@ -3358,7 +4020,7 @@ describe('FileSensor', () => {
       (genericError as Error & { code: string }).code = 'EREMOTE';
       const mockReadFile = async () => { throw genericError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/some/file.bin'));
 
@@ -3374,7 +4036,7 @@ describe('FileSensor', () => {
       const logger = new MockLogger();
       const mockReadFile = async () => { throw 'string error'; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/weird.txt'));
 
@@ -3392,7 +4054,7 @@ describe('FileSensor', () => {
       (abortError as Error & { code: string }).code = 'ABORT_ERR';
       const mockReadFile = async (_path: string, _options?: { encoding?: string; signal?: AbortSignal }) => { throw abortError; };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
 
       await assert.rejects(() => sensor.ler('/aborted.txt'));
 
@@ -3412,7 +4074,7 @@ describe('FileSensor', () => {
         return fakeContent;
       };
 
-      const sensor = new FileSensor({ logger, readFile: mockReadFile });
+      const sensor = new FileSensor({ logger, readFile: mockReadFile as any });
       const controller = new AbortController();
       const signal = controller.signal;
 
@@ -3454,103 +4116,6 @@ describe('FileSensor', () => {
     });
   });
 });
-</file>
-
-<file path="src/infra/FileSensor.ts">
-/**
- * @file FileSensor.ts
- * @description Implementação concreta de ISensor<string> para leitura de arquivos
- *              locais utilizando o módulo nativo node:fs/promises.
- *
- *              Segue o DIP: a classe depende da abstração ILogger para logging,
- *              e implementa a abstração ISensor<string>.
- *
- *              A função readFile é injetável via Options Object para permitir
- *              mocking nos testes sem depender de arquivos reais em disco.
- */
-
-import { readFile as fsReadFile } from 'node:fs/promises';
-import { ISensor } from '../core/ISensor.ts';
-import { ILogger } from '../core/ILogger.ts';
-
-export interface FileSensorOptions {
-  /** Instância de ILogger para logging estruturado */
-  logger: ILogger;
-  /**
-   * Função de leitura de arquivos injetável.
-   * Padrão: readFile nativo de node:fs/promises.
-   * Útil para testes com mock.
-   * A assinatura reflete as sobrecargas reais do Node.js:
-   * - Sem encoding → Buffer
-   * - Com encoding → string
-   */
-  readFile?: {
-    (path: string): Promise<Buffer>;
-    (path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
-    (path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
-  };
-}
-
-export class FileSensor extends ISensor<string> {
-  private readonly logger: ILogger;
-  private readonly readFile: {
-    (path: string): Promise<Buffer>;
-    (path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
-    (path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
-  };
-
-  /**
-   * @param options - Objeto de configuração seguindo o padrão Options Object.
-   */
-  constructor(options: FileSensorOptions) {
-    super();
-    this.logger = options.logger;
-    this.readFile = options.readFile ?? fsReadFile;
-  }
-
-  /**
-   * Lê o conteúdo de um arquivo local como string UTF-8.
-   *
-   * @param target - Caminho absoluto ou relativo do arquivo a ser lido
-   * @param signal - Opcional. AbortSignal para cancelamento da leitura em andamento
-   * @returns Conteúdo do arquivo em formato string
-   * @throws {Error} Se o arquivo não existir, não puder ser lido, ou outro erro de I/O
-   */
-  async ler(target: string, signal?: AbortSignal): Promise<string> {
-    this.logger.debug(`[FileSensor] Attempting to read file: "${target}"`);
-
-    try {
-      const content = await this.readFile(target, { encoding: 'utf-8', signal });
-      this.logger.debug(`[FileSensor] Successfully read file: "${target}" (${content.length} bytes)`);
-      return content;
-    } catch (error) {
-      if (error instanceof Error) {
-        const err = error as Error & { code?: string };
-
-        switch (err.code) {
-          case 'ENOENT':
-            this.logger.error(`[FileSensor] File not found: "${target}"`);
-            break;
-          case 'EACCES':
-            this.logger.error(`[FileSensor] Permission denied when reading file: "${target}"`);
-            break;
-          case 'EISDIR':
-            this.logger.error(`[FileSensor] Path is a directory, not a file: "${target}"`);
-            break;
-          case 'ABORT_ERR':
-            this.logger.warn(`[FileSensor] Read operation aborted for file: "${target}"`);
-            break;
-          default:
-            this.logger.error(`[FileSensor] Error reading file "${target}": ${err.message}`);
-        }
-      } else {
-        this.logger.error(`[FileSensor] Unknown error reading file "${target}": ${String(error)}`);
-      }
-
-      throw error;
-    }
-  }
-}
 </file>
 
 <file path="src/infra/NativeHttpServer.test.ts">
@@ -3604,14 +4169,14 @@ describe('NativeHttpServer', () => {
   describe('Contrato (interface)', () => {
     it('deve ser instanciável com logger e sem abortSignal', () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       assert.ok(server instanceof NativeHttpServer);
     });
 
     it('deve ser instanciável com abortSignal', () => {
       const logger = new MockLogger();
       const controller = new AbortController();
-      const server = new NativeHttpServer({ logger, abortSignal: controller.signal });
+      const server = new NativeHttpServer({ logger, abortSignal: controller.signal } as any);
       assert.ok(server instanceof NativeHttpServer);
     });
   });
@@ -3619,7 +4184,7 @@ describe('NativeHttpServer', () => {
   describe('Ciclo de vida (start/stop)', () => {
     it('deve iniciar e parar o servidor na porta especificada', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       servers.push(server);
 
       await server.start(0); // porta 0 = SO atribui porta aleatória
@@ -3631,7 +4196,7 @@ describe('NativeHttpServer', () => {
 
     it('deve chamar stop sem erro mesmo se nunca foi iniciado', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
 
       // stop() sem start() não deve lançar
       await server.stop();
@@ -3640,7 +4205,7 @@ describe('NativeHttpServer', () => {
 
     it('deve ser idempotente: múltiplas chamadas a stop() resolvem imediatamente', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       servers.push(server);
 
       await server.start(0);
@@ -3678,7 +4243,7 @@ describe('NativeHttpServer', () => {
     it('deve parar o servidor quando o AbortSignal é disparado', async () => {
       const logger = new MockLogger();
       const controller = new AbortController();
-      const server = new NativeHttpServer({ logger, abortSignal: controller.signal });
+      const server = new NativeHttpServer({ logger, abortSignal: controller.signal } as any);
       servers.push(server);
 
       await server.start(0);
@@ -3703,7 +4268,7 @@ describe('NativeHttpServer', () => {
   describe('Requisições HTTP reais', () => {
     it('GET /healthz deve retornar status 200, Content-Type JSON e corpo exato', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       servers.push(server);
 
       await server.start(0);
@@ -3724,7 +4289,7 @@ describe('NativeHttpServer', () => {
 
     it('rota inexistente deve retornar status 404 e corpo "Not Found"', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       servers.push(server);
 
       await server.start(0);
@@ -3746,171 +4311,97 @@ describe('NativeHttpServer', () => {
 });
 </file>
 
-<file path="src/infra/NativeHttpServer.ts">
+<file path="src/infra/FileSensor.ts">
 /**
- * @file NativeHttpServer.ts
- * @description Implementação concreta do servidor HTTP utilizando exclusivamente
- *              o módulo nativo node:http. Zero dependências externas.
+ * @file FileSensor.ts
+ * @description Implementação concreta de ISensor<string> para leitura de arquivos
+ *              locais utilizando o módulo nativo node:fs/promises.
  *
- *              - start(port): cria server, registra rota health-check, escuta na porta
- *              - stop(): encerra o servidor de forma limpa (close + removeAllListeners)
- *              - Responde a GET /healthz com JSON { status: "ok" } e status 200
- *              - Responde a qualquer outra rota com 404
- *              - Integra-se ao AbortSignal global para graceful shutdown
+ *              Segue o DIP: a classe depende da abstração ILogger para logging,
+ *              e implementa a abstração ISensor<string>.
+ *
+ *              A função readFile é injetável via Options Object para permitir
+ *              mocking nos testes sem depender de arquivos reais em disco.
  */
 
-import { createServer, Server } from 'node:http';
-import { IHttpServer } from '../core/IHttpServer.ts';
+import { readFile as fsReadFile } from 'node:fs/promises';
+import { ISensor } from '../core/ISensor.ts';
 import { ILogger } from '../core/ILogger.ts';
 
-export interface NativeHttpServerOptions {
+export interface FileSensorOptions {
+  /** Instância de ILogger para logging estruturado */
   logger: ILogger;
   /**
-   * Sinal de aborto global. Quando disparado, o servidor executa stop()
-   * automaticamente. Use o shutdownController.signal do bootstrap.
+   * Função de leitura de arquivos injetável.
+   * Padrão: readFile nativo de node:fs/promises.
+   * Útil para testes com mock.
+   * A assinatura reflete as sobrecargas reais do Node.js:
+   * - Sem encoding → Buffer
+   * - Com encoding → string
    */
-  abortSignal?: AbortSignal;
+  readFile?: {
+    (path: string): Promise<Buffer>;
+    (path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
+    (path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
+  };
 }
 
-export class NativeHttpServer extends IHttpServer {
-  private server: Server | null = null;
+export class FileSensor extends ISensor<string> {
   private readonly logger: ILogger;
-  private readonly abortSignal?: AbortSignal;
-  private abortListener: (() => void) | null = null;
-  private actualPort: number | null = null;
-  /** Flag de idempotência para stop(). Evita múltiplas chamadas simultâneas a close(). */
-  private stopping: boolean = false;
-  /** Flag que indica se a Promise de start() já foi resolvida.
-   *  Quando false, erros do server rejeitam a Promise.
-   *  Quando true, erros são apenas logados (runtime errors). */
-  private startResolved: boolean = false;
+  private readonly readFile: FileSensorOptions['readFile'];
 
-  constructor(options: NativeHttpServerOptions) {
+  /**
+   * @param options - Objeto de configuração seguindo o padrão Options Object.
+   */
+  constructor(options: FileSensorOptions) {
     super();
     this.logger = options.logger;
-    this.abortSignal = options.abortSignal;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.readFile = options.readFile ?? (fsReadFile as any);
   }
 
   /**
-   * Retorna a porta real em que o servidor está escutando,
-   * ou null se o servidor não foi iniciado.
+   * Lê o conteúdo de um arquivo local como string UTF-8.
+   *
+   * @param target - Caminho absoluto ou relativo do arquivo a ser lido
+   * @param signal - Opcional. AbortSignal para cancelamento da leitura em andamento
+   * @returns Conteúdo do arquivo em formato string
+   * @throws {Error} Se o arquivo não existir, não puder ser lido, ou outro erro de I/O
    */
-  get port(): number | null {
-    return this.actualPort;
-  }
+  async ler(target: string, signal?: AbortSignal): Promise<string> {
+    this.logger.debug(`[FileSensor] Attempting to read file: "${target}"`);
 
-  async start(port: number): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      this.startResolved = false;
+    try {
+      const content = await this.readFile!(target, { encoding: 'utf-8', signal });
+      this.logger.debug(`[FileSensor] Successfully read file: "${target}" (${content.length} bytes)`);
+      return content;
+    } catch (error) {
+      if (error instanceof Error) {
+        const err = error as Error & { code?: string };
 
-      this.server = createServer((req, res) => {
-        // Rota de health-check
-        if (req.url === '/healthz' && req.method === 'GET') {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ status: 'ok', service: 'SOBERANO' }));
-          return;
+        switch (err.code) {
+          case 'ENOENT':
+            this.logger.error(`[FileSensor] File not found: "${target}"`);
+            break;
+          case 'EACCES':
+            this.logger.error(`[FileSensor] Permission denied when reading file: "${target}"`);
+            break;
+          case 'EISDIR':
+            this.logger.error(`[FileSensor] Path is a directory, not a file: "${target}"`);
+            break;
+          case 'ABORT_ERR':
+            this.logger.warn(`[FileSensor] Read operation aborted for file: "${target}"`);
+            break;
+          default:
+            this.logger.error(`[FileSensor] Error reading file "${target}": ${err.message}`);
         }
-
-        // Qualquer outra rota → 404
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Not Found');
-      });
-
-      // --- Integração com AbortSignal (graceful shutdown automático) ---
-      if (this.abortSignal && !this.abortSignal.aborted) {
-        this.abortListener = () => {
-          this.logger.info('[NativeHttpServer] AbortSignal received. Stopping server...');
-          this.stop().catch((err) => {
-            this.logger.error(`[NativeHttpServer] Error during abort-driven stop: ${err}`);
-          });
-        };
-        this.abortSignal.addEventListener('abort', this.abortListener);
+      } else {
+        this.logger.error(`[FileSensor] Unknown error reading file "${target}": ${String(error)}`);
       }
 
-      // Listener de erro do server.
-      // Se a Promise ainda não foi resolvida, rejeita (erro de start).
-      // Se já foi resolvida, apenas loga (erro de runtime).
-      this.server.on('error', (err: unknown) => {
-        if (!this.startResolved) {
-          reject(err);
-        } else {
-          this.logger.error(`[NativeHttpServer] Runtime error: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      });
-
-      this.server.listen(port, () => {
-        const addr = this.server!.address();
-        this.actualPort = typeof addr === 'object' && addr ? (addr as { port: number }).port : port;
-        this.logger.info(`[NativeHttpServer] HTTP server listening on port ${this.actualPort}`);
-        this.startResolved = true;
-        resolve();
-      });
-    });
-  }
-
-  async stop(): Promise<void> {
-    // Idempotente: se já está parando ou servidor é null, resolve imediatamente
-    if (this.stopping || !this.server) {
-      return;
+      throw error;
     }
-
-    this.stopping = true;
-
-    // Remove o listener de abort para não causar loop
-    if (this.abortSignal && this.abortListener) {
-      this.abortSignal.removeEventListener('abort', this.abortListener);
-      this.abortListener = null;
-    }
-
-    return new Promise<void>((resolve, reject) => {
-      this.server!.close((err) => {
-        if (err) {
-          // Se o servidor já não estava ouvindo (ENOTCONN), trata como sucesso
-          if ((err as Error & { code?: string }).code === 'ENOTCONN') {
-            this.logger.info('[NativeHttpServer] Server was already not listening.');
-            this.server = null;
-            this.actualPort = null;
-            this.stopping = false;
-            resolve();
-            return;
-          }
-
-          this.logger.error(`[NativeHttpServer] Error closing server: ${err.message}`);
-          this.stopping = false;
-          reject(err);
-          return;
-        }
-        this.logger.info('[NativeHttpServer] Server closed successfully.');
-        this.server = null;
-        this.actualPort = null;
-        this.stopping = false;
-        resolve();
-      });
-    });
   }
-}
-</file>
-
-<file path="tsconfig.json">
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "outDir": "dist/",
-    "rootDir": "src/",
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "declaration": true,
-    "sourceMap": true,
-    "allowImportingTsExtensions": true,
-    "rewriteRelativeImportExtensions": true
-  },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
 }
 </file>
 
@@ -4031,6 +4522,406 @@ export class InMemorySessionManager extends ISessionManager {
         `[InMemorySessionManager] Session "${sessionId}" not found for clearing (no-op).`
       );
     }
+  }
+}
+</file>
+
+<file path="src/infra/NativeHttpServer.ts">
+/**
+ * @file NativeHttpServer.ts
+ * @description Implementação concreta do servidor HTTP utilizando exclusivamente
+ *              o módulo nativo node:http. Zero dependências externas.
+ *
+ *              A Fase 7 (Tauri) adiciona:
+ *              - POST /chat: recebe JSON { message, sessionId } e responde em SSE
+ *              - Servir arquivos estáticos do frontend renderer (src/renderer/)
+ *              - GET /chat-history?sessionId=... : retorna histórico da sessão
+ *
+ *              Rotas:
+ *              - GET /healthz              → { status: "ok" }
+ *              - POST /chat                → SSE com chunks do LLM
+ *              - GET /chat-history         → { messages: [...] }
+ *              - GET /                     → index.html (frontend)
+ *              - GET /* (arquivo estático) → serve do src/renderer/
+ */
+
+import { createServer, Server, IncomingMessage, ServerResponse } from 'node:http';
+import { readFile, stat } from 'node:fs/promises';
+import { join, extname } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { IHttpServer } from '../core/IHttpServer.ts';
+import { ILogger } from '../core/ILogger.ts';
+import { IConversationManager } from '../core/IConversationManager.ts';
+import { ISessionManager } from '../core/ISessionManager.ts';
+
+export interface NativeHttpServerOptions {
+  logger: ILogger;
+  conversationManager: IConversationManager;
+  sessionManager: ISessionManager;
+  /** Caminho absoluto para a pasta do frontend renderer (src/renderer/) */
+  rendererDir: string;
+  /**
+   * Sinal de aborto global. Quando disparado, o servidor executa stop()
+   * automaticamente. Use o shutdownController.signal do bootstrap.
+   */
+  abortSignal?: AbortSignal;
+}
+
+/** Mapa de extensões para Content-Type */
+const MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js':   'application/javascript; charset=utf-8',
+  '.css':  'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.svg':  'image/svg+xml',
+  '.ico':  'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2':'font/woff2',
+};
+
+export class NativeHttpServer extends IHttpServer {
+  private server: Server | null = null;
+  private readonly logger: ILogger;
+  private readonly conversationManager: IConversationManager;
+  private readonly sessionManager: ISessionManager;
+  private readonly rendererDir: string;
+  private readonly abortSignal?: AbortSignal;
+  private abortListener: (() => void) | null = null;
+  private actualPort: number | null = null;
+  /** Flag de idempotência para stop(). Evita múltiplas chamadas simultâneas a close(). */
+  private stopping: boolean = false;
+  /** Flag que indica se a Promise de start() já foi resolvida. */
+  private startResolved: boolean = false;
+
+  constructor(options: NativeHttpServerOptions) {
+    super();
+    this.logger = options.logger;
+    this.conversationManager = options.conversationManager;
+    this.sessionManager = options.sessionManager;
+    this.rendererDir = options.rendererDir;
+    this.abortSignal = options.abortSignal;
+  }
+
+  /**
+   * Retorna a porta real em que o servidor está escutando,
+   * ou null se o servidor não foi iniciado.
+   */
+  get port(): number | null {
+    return this.actualPort;
+  }
+
+  async start(port: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.startResolved = false;
+
+      this.server = createServer((req, res) => {
+        this.handleRequest(req, res).catch((err) => {
+          this.logger.error(`[NativeHttpServer] Unhandled error: ${err}`);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Internal Server Error');
+          }
+        });
+      });
+
+      // --- Integração com AbortSignal (graceful shutdown automático) ---
+      if (this.abortSignal && !this.abortSignal.aborted) {
+        this.abortListener = () => {
+          this.logger.info('[NativeHttpServer] AbortSignal received. Stopping server...');
+          this.stop().catch((err) => {
+            this.logger.error(`[NativeHttpServer] Error during abort-driven stop: ${err}`);
+          });
+        };
+        this.abortSignal.addEventListener('abort', this.abortListener);
+      }
+
+      // Listener de erro do server
+      this.server.on('error', (err: unknown) => {
+        if (!this.startResolved) {
+          reject(err);
+        } else {
+          this.logger.error(`[NativeHttpServer] Runtime error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      });
+
+      this.server.listen(port, () => {
+        const addr = this.server!.address();
+        this.actualPort = typeof addr === 'object' && addr ? (addr as { port: number }).port : port;
+        this.logger.info(`[NativeHttpServer] HTTP server listening on port ${this.actualPort}`);
+        this.startResolved = true;
+        resolve();
+      });
+    });
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopping || !this.server) {
+      return;
+    }
+
+    this.stopping = true;
+
+    if (this.abortSignal && this.abortListener) {
+      this.abortSignal.removeEventListener('abort', this.abortListener);
+      this.abortListener = null;
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      this.server!.close((err) => {
+        if (err) {
+          if ((err as Error & { code?: string }).code === 'ENOTCONN') {
+            this.logger.info('[NativeHttpServer] Server was already not listening.');
+            this.server = null;
+            this.actualPort = null;
+            this.stopping = false;
+            resolve();
+            return;
+          }
+          this.logger.error(`[NativeHttpServer] Error closing server: ${err.message}`);
+          this.stopping = false;
+          reject(err);
+          return;
+        }
+        this.logger.info('[NativeHttpServer] Server closed successfully.');
+        this.server = null;
+        this.actualPort = null;
+        this.stopping = false;
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * Define os headers CORS para permitir requisições de origens externas
+   * (ex: Tauri WebView que acessa de tauri://localhost).
+   */
+  private setCorsHeaders(res: ServerResponse): void {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id');
+    res.setHeader('Access-Control-Max-Age', '86400');
+  }
+
+  /**
+   * Roteador principal de requisições HTTP.
+   * Decide qual handler chamar com base no método e path.
+   */
+  private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const { method, url } = req;
+    const pathname = url ? new URL(url, `http://${req.headers.host || 'localhost'}`).pathname : '/';
+
+    // Aplica CORS em todas as respostas
+    this.setCorsHeaders(res);
+
+    // Preflight OPTIONS — responde imediatamente
+    if (method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    try {
+      // Rota: GET /healthz
+      if (pathname === '/healthz' && method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', service: 'SOBERANO' }));
+        return;
+      }
+
+      // Rota: POST /chat (SSE)
+      if (pathname === '/chat' && method === 'POST') {
+        await this.handleChatSSE(req, res);
+        return;
+      }
+
+      // Rota: GET /chat-history?sessionId=xxx
+      if (pathname === '/chat-history' && method === 'GET') {
+        await this.handleChatHistory(req, res);
+        return;
+      }
+
+      // Rota: GET / (servir arquivos estáticos do renderer)
+      if (method === 'GET') {
+        await this.serveStatic(pathname, res);
+        return;
+      }
+
+      // Qualquer outra rota → 404
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not Found');
+    } catch (err) {
+      this.logger.error(`[NativeHttpServer] Error handling ${method} ${pathname}: ${err}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Internal Server Error');
+      }
+    }
+  }
+
+  /**
+   * Handles POST /chat com Server-Sent Events.
+   *
+   * Request body: JSON { message: string }
+   *
+   * Response:
+   *   Content-Type: text/event-stream
+   *   data: {"chunk": "...", "done": false}
+   *   data: {"chunk": "", "done": true}
+   *
+   * Se o header X-Session-Id for fornecido, reusa a sessão;
+   * caso contrário, cria uma nova.
+   */
+  private async handleChatSSE(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Lê o body
+    const body = await this.readBody(req);
+
+    let parsed: { message?: string };
+    try {
+      parsed = JSON.parse(body) as { message?: string };
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      return;
+    }
+
+    const userMessage = parsed.message;
+    if (!userMessage || typeof userMessage !== 'string' || userMessage.trim().length === 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Campo "message" é obrigatório e não pode ser vazio' }));
+      return;
+    }
+
+    // Obtém ou cria sessionId
+    const sessionId = this.getOrCreateSession(req);
+
+    // Configura headers SSE
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Session-Id': sessionId,
+    });
+
+    // Envia o sessionId como primeiro evento (cliente pode armazenar)
+    res.write(`data: ${JSON.stringify({ type: 'session', sessionId })}\n\n`);
+
+    // Consome o stream e envia chunks como eventos SSE
+    const signal = AbortSignal.timeout(120_000); // Timeout de 2 minutos
+
+    try {
+      for await (const chunk of this.conversationManager.conversarStream(sessionId, userMessage.trim(), signal)) {
+        // Escapa \n para não quebrar o formato SSE
+        const escapedChunk = chunk.replace(/\n/g, '\\n');
+        res.write(`data: ${JSON.stringify({ chunk: escapedChunk, done: false })}\n\n`);
+      }
+
+      // Sinaliza fim do stream
+      res.write(`data: ${JSON.stringify({ chunk: '', done: true })}\n\n`);
+      res.end();
+      this.logger.info(`[NativeHttpServer] SSE stream completed for session "${sessionId}".`);
+    } catch (err) {
+      if (signal.aborted) {
+        this.logger.info(`[NativeHttpServer] SSE stream timed out for session "${sessionId}".`);
+        res.write(`data: ${JSON.stringify({ error: 'Timeout', done: true })}\n\n`);
+      } else {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        this.logger.error(`[NativeHttpServer] SSE stream error for session "${sessionId}": ${errorMsg}`);
+        res.write(`data: ${JSON.stringify({ error: errorMsg, done: true })}\n\n`);
+      }
+      res.end();
+    }
+  }
+
+  /**
+   * Handles GET /chat-history?sessionId=xxx
+   * Retorna o histórico de mensagens da sessão.
+   */
+  private async handleChatHistory(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
+    const sessionId = url.searchParams.get('sessionId');
+
+    if (!sessionId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Parâmetro "sessionId" é obrigatório' }));
+      return;
+    }
+
+    try {
+      const messages = await this.sessionManager.obterHistorico(sessionId);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ sessionId, messages }));
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      this.logger.error(`[NativeHttpServer] Error fetching history for session "${sessionId}": ${errorMsg}`);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Erro ao buscar histórico' }));
+    }
+  }
+
+  /**
+   * Serve arquivos estáticos da pasta renderer.
+   * Se o path for '/', serve index.html.
+   */
+  private async serveStatic(pathname: string, res: ServerResponse): Promise<void> {
+    // Se rendererDir não foi configurado, retorna 404
+    if (!this.rendererDir) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not Found');
+      return;
+    }
+
+    // Normaliza o path: '/' → '/index.html'
+    const normalizedPath = pathname === '/' ? '/index.html' : pathname;
+    const filePath = join(this.rendererDir, normalizedPath);
+
+    try {
+      // Verifica se o arquivo existe e é um arquivo regular
+      const stats = await stat(filePath);
+      if (!stats.isFile()) {
+        throw new Error('Not a file');
+      }
+
+      const ext = extname(filePath);
+      const contentType = MIME_TYPES[ext] ?? 'application/octet-stream';
+
+      const content = await readFile(filePath);
+      res.writeHead(200, {
+        'Content-Type': contentType,
+        'Content-Length': content.length,
+      });
+      res.end(content);
+    } catch {
+      // Arquivo não encontrado → 404
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not Found');
+    }
+  }
+
+  /**
+   * Lê o corpo completo de uma requisição HTTP.
+   */
+  private readBody(req: IncomingMessage): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      req.on('error', (err) => reject(err));
+    });
+  }
+
+  /**
+   * Obtém o sessionId do header X-Session-Id, ou cria um novo.
+   */
+  private getOrCreateSession(req: IncomingMessage): string {
+    const existingSessionId = req.headers['x-session-id'];
+    if (existingSessionId && typeof existingSessionId === 'string' && existingSessionId.length > 0) {
+      return existingSessionId;
+    }
+    return randomUUID();
   }
 }
 </file>
@@ -4410,6 +5301,30 @@ describe('validateOllamaResponse (função pura) - /api/chat', () => {
     });
   });
 });
+</file>
+
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "outDir": "dist/",
+    "rootDir": "src/",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "sourceMap": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+}
 </file>
 
 <file path="src/core/IMotorCognitivo.ts">
@@ -4973,7 +5888,7 @@ describe('OllamaProvider', () => {
         JSON.stringify({ message: { content: '' }, done: true }),
       ].join('\n');
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         const stream = new ReadableStream({
           start(controller) {
             controller.enqueue(new TextEncoder().encode(ndjsonResponse));
@@ -5000,7 +5915,7 @@ describe('OllamaProvider', () => {
     it('deve lançar erro HTTP quando resposta não for ok no stream', async () => {
       const mockLogger = new MockLogger();
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         return new Response('Not Found', { status: 404 });
       });
 
@@ -5029,7 +5944,7 @@ describe('OllamaProvider', () => {
       const ac = new AbortController();
       ac.abort();
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         throw new Error('fetch should not be called with pre-aborted signal');
       });
 
@@ -5053,7 +5968,7 @@ describe('OllamaProvider', () => {
       let capturedUrl: string | undefined;
       let capturedOptions: RequestInit | undefined;
 
-      fetchMock = mock.method(globalThis, 'fetch', (url: RequestInfo | URL, options?: RequestInit) => {
+      fetchMock = mock.method(globalThis, 'fetch', async (url: RequestInfo | URL, options?: RequestInit) => {
         capturedUrl = typeof url === 'string' ? url : url.toString();
         capturedOptions = options;
 
@@ -5108,7 +6023,7 @@ describe('OllamaProvider', () => {
     it('deve lançar erro HTTP quando resposta não for ok', async () => {
       const mockLogger = new MockLogger();
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         return new Response(JSON.stringify({ error: 'Model not found' }), {
           status: 404,
           headers: { 'Content-Type': 'application/json' },
@@ -5132,7 +6047,7 @@ describe('OllamaProvider', () => {
       const mockLogger = new MockLogger();
 
       // Fetch que sempre falha com TypeError (erro de conexão)
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         throw new TypeError('fetch failed: connection refused');
       });
 
@@ -5174,7 +6089,7 @@ describe('OllamaProvider', () => {
 
       let callCount = 0;
 
-      fetchMock = mock.method(globalThis, 'fetch', () => {
+      fetchMock = mock.method(globalThis, 'fetch', async () => {
         callCount++;
         return new Response('Bad Request', { status: 400 });
       });
@@ -5369,9 +6284,11 @@ export class ConversationManager extends IConversationManager {
 
     // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
     let systemContent =
-      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
-      `Responda em Português do Brasil de forma clara e objetiva. ` +
-      `Mantenha o contexto da conversa ao responder.`;
+      `Você é o ${this.systemName}, um assistente virtual de inteligência artificial de alta performance e robustez. ` +
+      `Seu objetivo é ajudar o usuário com respostas precisas, claras e úteis em Português do Brasil. ` +
+      `Mantenha um tom profissional, porém amigável. ` +
+      `IMPORTANTE: Não invente ferramentas que não foram fornecidas. Se não puder realizar uma tarefa, explique o porquê educadamente. ` +
+      `Mantenha o contexto da conversa e responda apenas ao que foi solicitado.`;
 
     if (documentosRecuperados.length > 0) {
       const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
@@ -5422,6 +6339,160 @@ export class ConversationManager extends IConversationManager {
     );
 
     return respostaFinal;
+  }
+
+  /**
+   * Versão streaming de conversar. Processa uma interação e retorna chunks
+   * de texto em tempo real via AsyncIterable, ideal para SSE (Server-Sent Events).
+   *
+   * Fluxo:
+   * 1. Guarda inputUsuario no SessionManager (role: user).
+   * 2. Se IVectorStore existir, gera embedding heurístico e busca contextos similares.
+   * 3. Obtém o histórico atualizado do SessionManager.
+   * 4. Constrói mensagem system fundindo regras do SOBERANO com documentos recuperados.
+   * 5. Chama motor.gerarRespostaStream() e faz yield de cada chunk.
+   * 6. Guarda a resposta completa (role: assistant) no SessionManager ao final.
+   *
+   * NOTA: Tool Calling Loop NÃO é executado em modo streaming, pois o ReAct
+   * requer múltiplos round-trips (LLM → tool → LLM) que são incompatíveis
+   * com um fluxo contínuo de SSE. Tools ainda são expostas via toolDefinitions
+   * no payload, mas tool_calls na resposta não são processados.
+   *
+   * @param sessionId    - Identificador único da sessão.
+   * @param inputUsuario - Texto de entrada do usuário.
+   * @param signal       - Sinal opcional para abortar a operação.
+   * @yields Chunks de texto da resposta em tempo real.
+   */
+  async *conversarStream(
+    sessionId: string,
+    inputUsuario: string,
+    signal?: AbortSignal
+  ): AsyncIterable<string> {
+    this.logger.info(
+      `[ConversationManager] Streaming turn for session "${sessionId}". Input: "${inputUsuario}"`
+    );
+
+    // --- Guard: valida entrada vazia ---
+    if (inputUsuario.length === 0) {
+      const fallbackMsg = '[SOBERANO] Nenhuma mensagem foi fornecida. Por favor, digite algo para conversarmos.';
+      yield fallbackMsg;
+      return;
+    }
+
+    // --- Passo 1: Guarda o input do usuário na sessão ---
+    const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);
+    this.logger.debug('[ConversationManager] User message saved to session.');
+
+    // --- Passo 2: RAG — busca contextos similares no VectorStore (se disponível) ---
+    let documentosRecuperados: string[] = [];
+    if (this.vectorStore) {
+      try {
+        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
+        this.logger.debug(
+          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
+        );
+
+        const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
+
+        if (resultados.length > 0) {
+          documentosRecuperados = resultados.map((r) => {
+            const metadata = r.metadata as Record<string, unknown>;
+            return String(metadata.texto ?? metadata.content ?? JSON.stringify(metadata));
+          });
+          this.logger.info(
+            `[ConversationManager] RAG: ${resultados.length} relevant documents retrieved.`
+          );
+        } else {
+          this.logger.debug('[ConversationManager] RAG: No similar documents found.');
+        }
+      } catch (ragError) {
+        this.logger.error(
+          `[ConversationManager] RAG query failed (infrastructure failure): ${ragError}`
+        );
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No VectorStore configured. RAG disabled.');
+    }
+
+    // --- Passo 3: Obtém o histórico completo da sessão ---
+    const historico = await this.sessionManager.obterHistorico(sessionId);
+    this.logger.debug(
+      `[ConversationManager] Session history retrieved: ${historico.length} messages.`
+    );
+
+    // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
+    let systemContent =
+      `Você é o ${this.systemName}, um assistente virtual de inteligência artificial de alta performance e robustez. ` +
+      `Seu objetivo é ajudar o usuário com respostas precisas, claras e úteis em Português do Brasil. ` +
+      `Mantenha um tom profissional, porém amigável. ` +
+      `Mantenha o contexto da conversa e responda apenas ao que foi solicitado.`;
+
+    if (documentosRecuperados.length > 0) {
+      const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
+      systemContent +=
+        `\n\nDocumentos de contexto recuperados:\n${contextoRAG}\n\n` +
+        `Utilize as informações dos documentos acima para enriquecer sua resposta, ` +
+        `mas não invente informações que não estejam presentes.`;
+    }
+
+    const systemMessage: ChatMessage = { role: 'system', content: systemContent };
+
+    // Remove quaisquer mensagens system antigas do histórico para evitar conflito de instruções
+    const historicoFiltrado = historico.filter(m => m.role !== 'system');
+
+    // --- Passo 5: Obtém definições das ferramentas se ToolRegistry estiver disponível ---
+    let toolDefinitions: IToolDefinition[] | undefined = undefined;
+    if (this.toolRegistry) {
+      const ferramentas = this.toolRegistry.obterTodas();
+      if (ferramentas.length > 0) {
+        toolDefinitions = ferramentas.map((f) => f.getDefinition());
+        this.logger.info(
+          `[ConversationManager] Exposing ${toolDefinitions.length} tool(s) to cognitive engine: ` +
+          ferramentas.map((f) => `"${f.name}"`).join(', ')
+        );
+      } else {
+        this.logger.debug('[ConversationManager] ToolRegistry has no tools registered.');
+      }
+    } else {
+      this.logger.debug('[ConversationManager] No ToolRegistry configured. Tool Calling disabled.');
+    }
+
+    // Monta array inicial de mensagens para enviar ao motor
+    const mensagensParaMotor: ChatMessage[] = [systemMessage, ...historicoFiltrado];
+
+    this.logger.info(
+      `[ConversationManager] Streaming ${mensagensParaMotor.length} messages to cognitive engine ` +
+      `(${documentosRecuperados.length > 0 ? 'with RAG context' : 'without RAG'})` +
+      (toolDefinitions ? ` with ${toolDefinitions.length} tool(s).` : '.')
+    );
+
+    // --- Passo 6: Chama o motor em modo streaming e faz yield de cada chunk ---
+    // Propaga o AbortSignal externo para o motor cognitivo
+    if (signal) {
+      this.motor.setAbortSignal(signal);
+    }
+
+    const respostaCompleta: string[] = [];
+
+    for await (const chunk of this.motor.gerarRespostaStream(
+      mensagensParaMotor,
+      toolDefinitions,
+      signal
+    )) {
+      respostaCompleta.push(chunk);
+      yield chunk;
+    }
+
+    // --- Passo 7: Guarda a resposta completa no SessionManager ---
+    const respostaFinal = respostaCompleta.join('');
+    const mensagemAssistant: ChatMessage = { role: 'assistant', content: respostaFinal };
+    await this.sessionManager.adicionarMensagem(sessionId, mensagemAssistant);
+
+    this.logger.info(
+      `[ConversationManager] Stream complete for session "${sessionId}". ` +
+      `Response length: ${respostaFinal.length} chars.`
+    );
   }
 
   /**
@@ -6068,7 +7139,7 @@ export class OllamaProvider extends IMotorCognitivo {
 
   /**
    * Envia mensagens ao motor cognitivo e retorna um fluxo de chunks de texto
-   * (streaming), útil para enviar tokens progressivamente via IPC no Electron.
+   * (streaming), útil para consumo progressivo dos tokens gerados.
    *
    * @param mensagens - Array de mensagens no formato ChatMessage[].
    * @param tools - Array opcional de definições de ferramentas (tool calling).
@@ -6177,13 +7248,14 @@ export class OllamaProvider extends IMotorCognitivo {
 {
   "name": "soberano",
   "version": "0.7.0",
-  "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez - Fase 7: Electron Desktop",
+  "description": "SOBERANO - Microsserviço Local de IA Generativa (Tauri + Node.js HTTP/SSE)",
   "type": "module",
-  "main": "dist/main/main.js",
   "scripts": {
-    "start": "node --experimental-transform-types src/main-cli.ts",
-    "build": "tsc && cp -r src/renderer dist/ && cp -r src/preload dist/",
-    "start:desktop": "npm run build && electron dist/main/main.js",
+    "start:server": "node --experimental-transform-types src/main.ts",
+    "start:server:dev": "node --watch --experimental-transform-types src/main.ts",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:init": "tauri init",
     "test": "node --experimental-transform-types --test src/infra/*.test.ts src/infra/tools/*.test.ts",
     "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
     "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
@@ -6195,12 +7267,12 @@ export class OllamaProvider extends IMotorCognitivo {
     "soberano",
     "llm",
     "ollama",
-    "electron",
-    "desktop"
+    "tauri"
   ],
   "license": "MIT",
   "devDependencies": {
-    "electron": "^42.1.0",
+    "@tauri-apps/cli": "^1.6.0",
+    "@types/node": "^20.14.0",
     "tsx": "^4.22.0",
     "typescript": "^6.0.3"
   }
@@ -6209,136 +7281,12 @@ export class OllamaProvider extends IMotorCognitivo {
 
 <file path="src/env.d.ts">
 /**
-* @file env.d.ts
- * @description Declarações de tipos mínimas para APIs nativas do Node.js e Electron.
- *              Necessário porque não podemos instalar @types/node nem @types/electron
- *              (zero dependências externas). Apenas o essencial para eliminar erros
- *              de TypeScript no VS Code.
- *
- *              Versão: 0.7.0 — Adicionados tipos Electron para IPC e Main Process.
+ * @file env.d.ts
+ * @description Declarações de tipos mínimas suplementares para o SOBERANO.
+ *              Apenas o que o @types/node não cobre.
  */
 
-// Buffer global (necessário para node:fs/promises overloads)
-declare class Buffer {
-  length: number;
-  static from(data: string, encoding?: string): Buffer;
-  toString(encoding?: string): string;
-}
-
-// TextDecoder (necessário para streaming de respostas do Ollama)
-declare class TextDecoder {
-  constructor(label?: string);
-  decode(input?: BufferSource, options?: { stream: boolean }): string;
-}
-
-// Process global
-declare var process: {
-  argv: string[];
-  exit(code?: number): never;
-  on(event: string, listener: (...args: unknown[]) => void): void;
-  removeAllListeners(event?: string): void;
-};
-
-// AbortController e AbortSignal (API nativa global)
-declare class AbortController {
-  readonly signal: AbortSignal;
-  abort(): void;
-}
-
-declare class AbortSignal {
-  readonly aborted: boolean;
-  addEventListener(type: 'abort', listener: () => void): void;
-  removeEventListener(type: 'abort', listener: () => void): void;
-  static timeout(ms: number): AbortSignal;
-  static any(signals: AbortSignal[]): AbortSignal;
-}
-
-// queueMicrotask
-declare function queueMicrotask(callback: () => void): void;
-
-// setTimeout e clearTimeout
-declare function setTimeout(
-  callback: (...args: unknown[]) => void,
-  ms?: number,
-  ...args: unknown[]
-): ReturnType<typeof setTimeout>;
-declare function clearTimeout(timeoutId: ReturnType<typeof setTimeout> | undefined): void;
-
-// === ELECTRON TYPES (mínimos para IPC Bridge) ===
-
-declare module 'electron' {
-  export interface BrowserWindowConstructorOptions {
-    width?: number;
-    height?: number;
-    title?: string;
-    webPreferences?: {
-      preload?: string;
-      contextIsolation?: boolean;
-      nodeIntegration?: boolean;
-    };
-  }
-
-  export class BrowserWindow {
-    constructor(options?: BrowserWindowConstructorOptions);
-    loadFile(path: string): void;
-    webContents: WebContents;
-    on(event: string, listener: (...args: unknown[]) => void): void;
-    close(): void;
-  }
-
-  export interface WebContents {
-    send(channel: string, ...args: unknown[]): void;
-  }
-
-  export interface IpcMain {
-    handle(channel: string, listener: (event: IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>): void;
-    on(channel: string, listener: (event: IpcMainEvent, ...args: unknown[]) => void): void;
-  }
-
-  export interface IpcMainInvokeEvent {
-    sender: WebContents;
-  }
-
-  export interface IpcMainEvent {
-    sender: WebContents;
-  }
-
-  export interface IpcRenderer {
-    invoke(channel: string, ...args: unknown[]): Promise<unknown>;
-    on(channel: string, listener: (event: unknown, ...args: unknown[]) => void): this;
-    removeAllListeners(channel?: string): void;
-    removeListener(channel: string, listener: (...args: unknown[]) => void): this;
-    send(channel: string, ...args: unknown[]): void;
-  }
-
-  export interface ContextBridge {
-    exposeInMainWorld(apiKey: string, api: Record<string, unknown>): void;
-  }
-
-  export interface App {
-    on(event: string, listener: (...args: unknown[]) => void): this;
-    quit(): void;
-    whenReady(): Promise<void>;
-    getPath(name: string): string;
-  }
-
-  export const app: App;
-  export const BrowserWindow: typeof BrowserWindow;
-  export const ipcMain: IpcMain;
-  export const ipcRenderer: IpcRenderer;
-  export const contextBridge: ContextBridge;
-
-  // Forma de exportar todos os símbolos
-  export default {
-    app,
-    BrowserWindow,
-    ipcMain,
-    ipcRenderer,
-    contextBridge,
-  };
-}
-
-// node:test
+// node:test (ainda não coberto pelo @types/node oficial)
 declare module 'node:test' {
   interface TestContext {
     diagnostic(message: string): void;
@@ -6369,89 +7317,12 @@ declare module 'node:test' {
   export function beforeEach(fn: () => void | Promise<void>): void;
   export function afterEach(fn: () => void | Promise<void>): void;
 }
-
-// node:http
-declare module 'node:http' {
-  interface IncomingMessage {
-    url?: string | undefined;
-    method?: string | undefined;
-    on(event: string, listener: (...args: unknown[]) => void): this;
-  }
-  interface ServerResponse {
-    writeHead(statusCode: number, headers?: Record<string, string>): void;
-    end(data?: string): void;
-  }
-  type RequestListener = (req: IncomingMessage, res: ServerResponse) => void;
-  interface Server {
-    listen(port: number, callback?: () => void): void;
-    close(callback?: (err?: Error) => void): void;
-    on(event: string, listener: (...args: unknown[]) => void): this;
-    address(): { port: number; family?: string; address?: string } | string | null;
-  }
-  export function createServer(requestListener: RequestListener): Server;
-}
-
-// node:fs/promises
-declare module 'node:fs/promises' {
-  export function readFile(path: string): Promise<Buffer>;
-  export function readFile(path: string, options: { encoding: string; signal?: AbortSignal }): Promise<string>;
-  export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
-}
-
-// node:fs
-declare module 'node:fs' {
-  export function mkdtempSync(prefix: string): string;
-  export function writeFileSync(path: string, data: string, encoding?: string): void;
-  export function mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined;
-  export function rmdirSync(path: string, options?: { recursive?: boolean }): void;
-  export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
-  export function existsSync(path: string): boolean;
-}
-
-// node:os
-declare module 'node:os' {
-  export function tmpdir(): string;
-}
-
-// node:path
-declare module 'node:path' {
-  export function join(...paths: string[]): string;
-  export function resolve(...paths: string[]): string;
-  export function relative(from: string, to: string): string;
-}
-
-// node:crypto
-declare module 'node:crypto' {
-  export function randomUUID(): string;
-}
-
-// node:assert
-declare module 'node:assert' {
-  interface Assert {
-    ok(value: unknown, message?: string): void;
-    strictEqual<T>(actual: T, expected: T, message?: string): void;
-    deepStrictEqual<T>(actual: T, expected: T, message?: string): void;
-    throws(
-      block: () => unknown,
-      error?: RegExp | Function | Object | Error,
-      message?: string
-    ): void;
-    rejects(
-      block: (() => Promise<unknown>) | Promise<unknown>,
-      error?: RegExp | Function | Object | Error,
-      message?: string
-    ): Promise<void>;
-    fail(message?: string): never;
-  }
-  const assert: Assert;
-  export default assert;
-}
 </file>
 
 <file path="README.md">
-# SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
+# SOBERANO — Microsserviço Local de IA Generativa (Tauri + Node.js HTTP/SSE)
 
-**Versão:** 0.7.0 — Sprint 7.0 (Interface Desktop — Electron IPC Bridge)
+**Versão:** 0.7.0
 
 ## Stack
 
@@ -6459,72 +7330,117 @@ declare module 'node:assert' {
 |-----------|-----------|
 | Linguagem | TypeScript (Node.js nativo) |
 | Testes | `node:test`, `node:assert` |
-| Dependências | **Zero** — PROIBIDO bibliotecas externas |
-| HTTP | `fetch` global nativo |
+| Dependências | **Mínimas** — `@tauri-apps/cli`, `@types/node`, `typescript`, `tsx` |
+| HTTP | `node:http` servidor + `fetch` global nativo |
+| Streaming | SSE (Server-Sent Events) via `node:http` |
+| Shell Desktop | Tauri (aponta para `dist/renderer/`) |
 
-> **Nota sobre `src/env.d.ts`:** Para manter o compromisso de dependência externa zero, este projeto não utiliza `@types/node`. Em vez disso, o arquivo `src/env.d.ts` declara manualmente apenas os tipos necessários das APIs nativas (HTTP, filesystem, AbortSignal, etc.). Isso elimina a necessidade de instalar um pacote de tipos externo, mantendo o projeto autocontido e leve. Sempre que um novo módulo nativo for utilizado, seus tipos devem ser adicionados a este arquivo.
+> **Nota sobre tipos:** Diferentemente da Fase 6, agora utilizamos `@types/node` para tipagem completa dos módulos nativos Node.js. O arquivo `src/env.d.ts` foi simplificado, mantendo apenas declarações específicas do projeto.
 
-## Arquitetura (DIP + SOLID)
+## Arquitetura (DIP + SOLID + Microsserviço Local)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Tauri Shell                              │
+│  (WebView - aponta para dist/renderer/)                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              Frontend Vanilla (A Casca)                  │   │
+│  │  - index.html, app.js, style                            │   │
+│  │  - fetch() para POST /chat                              │   │
+│  │  - getReader() para SSE streaming                       │   │
+│  │  - Atualização do DOM em tempo real                     │   │
+│  └──────────────┬──────────────────────────────────────────┘   │
+└─────────────────┼───────────────────────────────────────────────┘
+                  │ HTTP (localhost:3000)
+                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              SOBERANO HTTP Server (Node.js nativo)              │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  src/main.ts  (Bootstrap / Wiring)                       │  │
+│  │  - AbortController global (graceful shutdown)            │  │
+│  │  - Injeção de dependências (Options Object)              │  │
+│  │  - Registro de ferramentas (ToolRegistry)                │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/NativeHttpServer.ts   (IHttpServer)           │  │
+│  │  - GET  /healthz   → health check                       │  │
+│  │  - GET  /chat-history?sessionId → histórico JSON         │  │
+│  │  - POST /chat      → SSE streaming (conversarStream)    │  │
+│  │  - Servir / (src/renderer/) → arquivos estáticos        │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/ConversationManager.ts  (IConversationManager)│  │
+│  │  - conversarStream(sessionId, input, signal) → SSE      │  │
+│  │  - ReAct Tool Loop (até 3 iterações)                    │  │
+│  │  - RAG com MockVectorStore                              │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/OllamaProvider.ts  (IMotorCognitivo)          │  │
+│  │  - fetch para http://localhost:11434/api/chat            │  │
+│  │  - Retry com backoff + Circuit Breaker                   │  │
+│  │  - Tool Calling (Fase 6)                                │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ```
 src/
-├── core/                    # Contratos e lógica de negócio pura ("A Alma")
-│   ├── ILogger.ts                     # Abstração de logging + LogLevel enum
-│   ├── IMotorCognitivo.ts             # Abstração do motor cognitivo (LLM) + ChatMessage + IToolDefinition
-│   ├── ICircuitBreaker.ts             # Abstração do Circuit Breaker
-│   ├── IHttpServer.ts                 # Abstração do servidor HTTP
-│   ├── ISensor.ts                     # Abstração genérica de sensor (T)
-│   ├── IEmbeddings.ts                 # Contrato para geração de embeddings vetoriais
-│   ├── IVectorStore.ts                # Contrato para armazenamento e busca vetorial
-│   ├── ISessionManager.ts             # Contrato para gestão de sessões de conversa
-│   ├── IConversationManager.ts        # Contrato do Maestro (orquestração multi-turno)
-│   └── ITool.ts                        # Contrato genérico de ferramenta (Tool Calling)
-├── infra/                   # Implementações técnicas ("Os Músculos")
-│   ├── ConsoleLogger.ts                # Logger concreto (stdout)
+├── core/                            # Contratos e lógica de negócio pura ("A Alma")
+│   ├── ILogger.ts                                 # Abstração de logging + LogLevel enum
+│   ├── IMotorCognitivo.ts                          # Abstração do motor cognitivo (LLM)
+│   ├── ICircuitBreaker.ts                          # Abstração do Circuit Breaker
+│   ├── IHttpServer.ts                              # Abstração do servidor HTTP
+│   ├── ISensor.ts                                  # Abstração genérica de sensor (T)
+│   ├── IEmbeddings.ts                              # Contrato para geração de embeddings vetoriais
+│   ├── IVectorStore.ts                             # Contrato para armazenamento e busca vetorial
+│   ├── ISessionManager.ts                          # Contrato para gestão de sessões de conversa
+│   ├── IConversationManager.ts                     # Contrato do Maestro (orquestração multi-turno)
+│   └── ITool.ts                                    # Contrato genérico de ferramenta (Tool Calling)
+├── infra/                            # Implementações técnicas ("Os Músculos")
+│   ├── ConsoleLogger.ts                            # Logger concreto (stdout)
 │   ├── ConsoleLogger.test.ts
-│   ├── OllamaProvider.ts               # Provider Ollama via fetch nativo (endpoint /api/chat)
+│   ├── OllamaProvider.ts                           # Provider Ollama via fetch nativo
 │   ├── OllamaProvider.test.ts
-│   ├── validateOllamaResponse.test.ts  # Testes de validação de schema da API
-│   ├── CircuitBreaker.ts               # Circuit Breaker (3 estados)
+│   ├── validateOllamaResponse.test.ts             # Testes de validação de schema da API
+│   ├── CircuitBreaker.ts                           # Circuit Breaker (3 estados)
 │   ├── CircuitBreaker.test.ts
-│   ├── FileSensor.ts                   # Sensor de arquivo (ISensor<string>)
+│   ├── FileSensor.ts                               # Sensor de arquivo (ISensor<string>)
 │   ├── FileSensor.test.ts
-│   ├── NativeHttpServer.ts             # Servidor HTTP nativo (IHttpServer)
+│   ├── NativeHttpServer.ts                         # Servidor HTTP nativo (IHttpServer) c/ SSE
 │   ├── NativeHttpServer.test.ts
-│   ├── MockVectorStore.ts              # Vector Store mock
-│   ├── InMemorySessionManager.ts       # Gestão de sessões em memória
+│   ├── MockVectorStore.ts                          # Vector Store mock
+│   ├── InMemorySessionManager.ts                   # Gestão de sessões em memória
 │   ├── InMemorySessionManager.test.ts
-│   ├── ConversationManager.ts          # Maestro: orquestra sessão + RAG + motor
+│   ├── ConversationManager.ts                      # Maestro: orquestra sessão + RAG + motor
 │   ├── ConversationManager.test.ts
-│   ├── ToolRegistry.ts                 # Registro de ferramentas
+│   ├── ToolRegistry.ts                             # Registro de ferramentas
 │   ├── ToolRegistry.test.ts
-│   └── tools/                          # Arsenal de ferramentas do agente
+│   └── tools/                                      # Arsenal de ferramentas do agente
 │       ├── SystemTimeTool.ts
 │       ├── SystemTimeTool.test.ts
 │       ├── CalculatorTool.ts
 │       ├── CalculatorTool.test.ts
 │       ├── ReadFileTool.ts
 │       └── ReadFileTool.test.ts
-├── main/                    # Processo principal do Electron (Fase 7)
-│   └── main.ts                         # BrowserWindow + IPC handlers + wiring
-├── preload/                 # Context Bridge seguro (Fase 7)
-│   └── preload.ts                      # window.soberanoAPI (enviarMensagem, onStream, onStreamEnd, cancelar)
-├── renderer/                # UI Desktop (Fase 7)
-│   ├── index.html                      # Chat UI (histórico, input, botões)
-│   ├── style.css                       # Tema escuro minimalista
-│   └── app.js                          # Lógica do renderer (zero dependências)
-├── env.d.ts                 # Tipos manuais para APIs nativas do Node + Electron
-├── main-cli.ts              # Ponto de entrada CLI (MVP original, renomeado)
-└── main.ts                  # Orquestração, wiring manual, ponto de entrada (CLI)
+├── renderer/                         # Frontend Vanilla ("A Casca" — servido como estático)
+│   ├── index.html                    # Interface do chat (dark mode, responsivo)
+│   └── app.js                        # Consumidor SSE via fetch/getReader
+├── env.d.ts                          # Tipos manuais para APIs nativas do Node
+├── main.ts                           # Bootstrap: wiring + servidor HTTP (ponto de entrada)
+└── main-cli.ts                       # Ponto de entrada CLI (MVP original, legado)
 ```
 
 ### Princípios
 
 - **Abstração Primeiro:** Interfaces/classes abstratas em `src/core` antes de qualquer implementação
 - **Inversão de Dependência:** Módulos de alto nível (`main.ts`) dependem de abstrações, não de implementações
-- **Injeção via Construtor/Options Object:** Dependências são injetadas no construtor (não Service Locator)
-- **Options Object:** Classes com múltiplas configurações usam objeto de configuração tipado
+- **Injeção via Options Object:** Dependências são injetadas via objeto de configuração tipado (nunca parâmetros posicionais)
 - **Desacoplamento:** Detalhes técnicos nunca vazam para `src/core`
+- **Streaming Nativo:** SSE (Server-Sent Events) via `node:http` — sem bibliotecas de terceiros
+- **Microsserviço Local:** Backend Node.js puro na porta 3000; Tauri é apenas o shell desktop
 
 ## Funcionalidades Implementadas
 
@@ -6543,15 +7459,20 @@ src/
 | Sensor de arquivo (FileSensor) com `node:fs/promises` | ✅ Estabilizada |
 | Contrato genérico ISensor\<T\> (preparação para novos sensores) | ✅ |
 | Servidor HTTP nativo (IHttpServer) com rota /healthz | ✅ |
+| **POST /chat com SSE streaming** — `conversarStream` transmite chunks em tempo real | ✅ **Nova na Fase 7** |
+| GET /chat-history — retorna histórico JSON de uma sessão | ✅ **Nova na Fase 7** |
+| **Frontend Vanilla (renderer/)** — fetch + getReader para SSE | ✅ **Nova na Fase 7** |
+| Servir arquivos estáticos (src/renderer/) via NativeHttpServer | ✅ **Nova na Fase 7** |
+| **Electron removido** — substituído por Tauri como shell desktop | ✅ **Nova na Fase 7** |
 | Contrato IEmbeddings para geração de vetores | ✅ |
 | Contrato IVectorStore para armazenamento e busca vetorial | ✅ |
 | MockVectorStore — implementação em memória com similaridade cosseno | ✅ |
 | Contrato ISessionManager — gestão de sessões de conversa | ✅ |
 | InMemorySessionManager — implementação em memória com limite de mensagens | ✅ |
 | Contrato IConversationManager — Maestro de orquestração multi-turno | ✅ |
+| **conversarStream()** — streaming de chunks via AsyncIterable | ✅ **Nova na Fase 7** |
 | ConversationManager — pipeline: salva -> RAG -> funde contexto -> envia -> salva resposta | ✅ |
 | Embedding Heurístico — vetor de 10 dimensões sem dependência externa | ✅ |
-| Demonstração integrada no main.ts (2 turnos de conversa com sessão) | ✅ |
 | Interface IToolDefinition para definição de ferramentas no request /api/chat | ✅ |
 | Contrato ITool — interface genérica para ferramentas executáveis (getDefinition, execute) | ✅ |
 | OllamaProvider envia tools[] no payload de /api/chat quando fornecido | ✅ |
@@ -6562,7 +7483,6 @@ src/
 | SystemTimeTool — ferramenta concreta que retorna data/hora ISO 8601 | ✅ |
 | CalculatorTool — ferramenta de cálculo matemático (soma, subtração, multiplicação, divisão) | ✅ |
 | ReadFileTool — ferramenta de leitura de arquivos locais (fail-safe) | ✅ |
-| Demonstração multi-ferramenta no main.ts (calculator + get_system_time) | ✅ |
 | ReAct/Tool Calling Loop no ConversationManager (até 3 iterações, segurança anti-loop) | ✅ |
 | Detecção e execução de tool_calls com guarda de contexto no SessionManager | ✅ |
 | Tratamento de erros: ferramenta não encontrada, falha de execução, sem registry | ✅ |
@@ -6582,22 +7502,39 @@ src/
 
 ### Pré-requisitos
 
-- Node.js >= 18 (fetch nativo)
+- Node.js >= 20 (fetch nativo, `node:test`)
 - Servidor Ollama em execução (`ollama serve`)
-- Modelo Ollama disponível (padrão: `qwen2.5-coder:3b`)
+- Modelo Ollama disponível (padrão: `llama3.2:1b`)
+- **Tauri CLI** (opcional, para build desktop)
 
 ### Scripts do `package.json`
 
 | Comando | Descrição |
 |---------|-----------|
-| `npm start` | Inicia o sistema (CLI MVP) — executa `src/main.ts` |
-| `npm start:desktop` | Abre o Electron Desktop — executa Electron a partir de `src/main/main.ts` |
+| `npm run start:server` | Inicia o servidor HTTP SOBERANO na porta 3000 |
+| `npm run start:server:dev` | Inicia com `--watch` para recarregar automático em desenvolvimento |
+| `npm run tauri:dev` | Inicia o Tauri em modo dev (abre janela desktop apontando para `http://localhost:3000`) |
+| `npm run tauri:build` | Compila o binário desktop Tauri |
+| `npm run tauri:init` | Inicializa a configuração do Tauri no projeto |
 | `npm test` | Roda **todos** os testes unitários (`src/infra/*.test.ts` e `src/infra/tools/*.test.ts`) |
 | `npm run test:ollama` | Testes do OllamaProvider isoladamente |
 | `npm run test:circuit` | Testes do CircuitBreaker isoladamente |
 | `npm run test:file` | Testes do FileSensor isoladamente |
 | `npm run test:http` | Testes do NativeHttpServer isoladamente |
 | `npm run typecheck` | TypeScript type-check sem executar (`tsc --noEmit`) |
+
+### Fluxo de Desenvolvimento
+
+```bash
+# Terminal 1: Iniciar servidor backend
+npm run start:server
+
+# Terminal 2: Iniciar Tauri (opcional — ou acessar http://localhost:3000 no navegador)
+npm run tauri:dev
+
+# Testes
+npm test
+```
 
 ## Roadmap
 
@@ -6611,427 +7548,171 @@ src/
 | **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
 | **6.4** | Red Team Fixes (bugs críticos no loop ReAct) + Electron Prep (streaming, cancelamento) | ✅ **Concluída** |
 | **6.5** | Blindagem Final — Degradação Graciosa RAG, Defensive Copy SessionManager, Shutdown Determinístico, Fallback ReAct Edge Case | ✅ **Concluída** |
-| **7** | Electron UI (n8n-style via IPC nativo) | ✅ **Concluída** |
-
-## Contratos do Core
-
-### `ILogger`
-
-```typescript
-enum LogLevel { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3 }
-
-abstract class ILogger {
-  abstract info(message: string): void;
-  abstract warn(message: string): void;
-  abstract error(message: string): void;
-  abstract debug(message: string): void;
-}
-```
-
-### `IMotorCognitivo`
-
-```typescript
-interface IToolDefinition {
-  type: 'function';
-  function: {
-    name: string;
-    description: string;
-    parameters: Record<string, any>;
-  };
-}
-
-interface ChatMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
-  tool_calls?: Array<{
-    id: string;
-    function: { name: string; arguments: Record<string, any> };
-  }>;
-  tool_call_id?: string;
-}
-
-abstract class IMotorCognitivo {
-  abstract setAbortSignal(signal: AbortSignal): void;
-  abstract gerarResposta(mensagens: ChatMessage[], tools?: IToolDefinition[]): Promise<ChatMessage>;
-  abstract gerarRespostaStream(
-    mensagens: ChatMessage[],
-    tools?: IToolDefinition[],
-    signal?: AbortSignal
-  ): AsyncIterable<string>;
-}
-```
-
-### `ICircuitBreaker`
-
-```typescript
-enum CircuitState { CLOSED, OPEN, HALF_OPEN }
-
-abstract class ICircuitBreaker {
-  abstract readonly state: CircuitState;
-  abstract execute<T>(fn: () => Promise<T>): Promise<T>;
-  abstract recordFailure(): void;
-  abstract reset(): void;
-}
-```
-
-### `ISensor<T>`
-
-```typescript
-abstract class ISensor<T> {
-  abstract ler(target: string, signal?: AbortSignal): Promise<T>;
-}
-```
-
-### `IToolRegistry`
-
-```typescript
-abstract class IToolRegistry {
-  abstract registrar(tool: ITool): void;
-  abstract obter(nome: string): ITool | undefined;
-  abstract obterTodas(): ITool[];
-}
-```
-
-### `ITool`
-
-```typescript
-abstract class ITool {
-  abstract readonly name: string;
-  abstract readonly description: string;
-  abstract readonly parametersSchema: Record<string, any>;
-  abstract execute(args: Record<string, any>): Promise<any>;
-  abstract getDefinition(): IToolDefinition;
-}
-```
-
-### `IEmbeddings`
-
-```typescript
-abstract class IEmbeddings {
-  abstract gerarVector(text: string): Promise<number[]>;
-}
-```
-
-### `IVectorStore<M>`
-
-```typescript
-abstract class IVectorStore<M = any> {
-  abstract adicionar(id: string, vector: number[], metadata: M): Promise<void>;
-  abstract buscarSimilares(vector: number[], limit: number): Promise<
-    { id: string; metadata: M; score: number }[]
-  >;
-}
-```
-
-### `ISessionManager`
-
-```typescript
-abstract class ISessionManager {
-  abstract adicionarMensagem(sessionId: string, message: ChatMessage): Promise<void>;
-  abstract obterHistorico(sessionId: string): Promise<ChatMessage[]>;
-  abstract limparSessao(sessionId: string): Promise<void>;
-}
-```
-
-### `IConversationManager`
-
-```typescript
-abstract class IConversationManager {
-  abstract conversar(sessionId: string, input: string, signal?: AbortSignal): Promise<string>;
-}
-```
-
-## Convenções
-
-- **Código e logs internos:** Inglês
-- **Mensagens para o usuário:** PT-BR
-- **Testes:** `node:test` nativo com `mock.method()` para isolamento
-- **Commits:** Descritivos em inglês, seguindo conventional commits
+| **7** | **Pivot: Microsserviço Local (HTTP/SSE + Tauri)** <br><br> • Electron removido (incompatível com Ubuntu 22.04 — SIGSEGV Chromium)<br> • Backend Node.js como servidor HTTP puro na porta 3000<br> • Rota POST /chat com SSE streaming (conversarStream)<br> • Frontend Vanilla (renderer/) — fetch + getReader para SSE<br> • Tauri como shell desktop (aponta para dist/renderer/)<br> • Graceful shutdown com AbortController global<br> • `@tauri-apps/cli` + `@types/node` | ✅ **Concluída** |
 </file>
 
 <file path="src/main.ts">
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Sprint 6.5 (Zero Debt).
- *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
- *              - Instancia ConsoleLogger para logging estruturado
- *              - Instancia OllamaProvider com Logger injetado via construtor
- *              - Cria AbortController global para graceful shutdown
- *              - Injeta AbortSignal no OllamaProvider para cancelar fetch em andamento
- *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
- *              - Inicializa NativeHttpServer para servir rota /healthz
- *              - Executa o teste de comunicacao com o motor cognitivo
- *              - Executa o teste do FileSensor (leitura de arquivo local)
- *              - Demonstra o MockVectorStore (Memoria Vetorial - Fase 3)
- *              - Instancia InMemorySessionManager para gestao de sessoes (Fase 5)
- *              - Instancia ConversationManager para orquestracao multi-turno com RAG (Fase 5)
- *              - Simula 2 turnos de conversa para provar a retencao de memoria de sessao
+ * @description Ponto de entrada do SOBERANO — Servidor HTTP puro (Node.js nativo).
+ *
+ *              A Fase 7 substitui o Electron pelo Tauri como shell desktop.
+ *              O backend Node.js funciona como microsserviço local na porta 3000,
+ *              servindo:
+ *              - API REST em /chat (SSE) e /chat-history
+ *              - Frontend estático (vanilla HTML/JS) em src/renderer/
+ *
+ *              Graceful Shutdown: SIGINT/SIGTERM disparam abortSignal global,
+ *              que é propagado para o servidor HTTP e operações em andamento.
+ *
+ *              Dependências: exclusivamente módulos nativos Node.js.
+ *              Nenhuma dependência externa (zero npm além de typescript e tauri-cli).
  */
 
-import { randomUUID } from 'node:crypto';
-import { OllamaProvider } from './infra/OllamaProvider.ts';
-import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { ConsoleLogger } from './infra/ConsoleLogger.ts';
-import { ILogger } from './core/ILogger.ts';
 import { CircuitBreaker } from './infra/CircuitBreaker.ts';
-import { NativeHttpServer } from './infra/NativeHttpServer.ts';
-import { IHttpServer } from './core/IHttpServer.ts';
-import { FileSensor } from './infra/FileSensor.ts';
-import { ISensor } from './core/ISensor.ts';
-import { MockVectorStore } from './infra/MockVectorStore.ts';
-import { IVectorStore } from './core/IVectorStore.ts';
-import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
-import { ISessionManager } from './core/ISessionManager.ts';
-import { ConversationManager } from './infra/ConversationManager.ts';
-import { IConversationManager } from './core/IConversationManager.ts';
 import { ToolRegistry } from './infra/ToolRegistry.ts';
-import { IToolRegistry } from './core/IToolRegistry.ts';
-import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
 import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
+import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
 import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
+import { FileSensor } from './infra/FileSensor.ts';
+import { NativeHttpServer } from './infra/NativeHttpServer.ts';
+import type { NativeHttpServerOptions } from './infra/NativeHttpServer.ts';
+import { OllamaProvider } from './infra/OllamaProvider.ts';
+import { DeepSeekProvider } from './infra/DeepSeekProvider.ts';
+import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
+import { ConversationManager } from './infra/ConversationManager.ts';
+import { MockVectorStore } from './infra/MockVectorStore.ts';
+import { ILogger } from './core/ILogger.ts';
+import { ITool } from './core/ITool.ts';
 
-let isShuttingDown = false;
-let shutdownInProgress = false;
+// ─── Caminho absoluto da pasta src (ESM-compatível) ─────────────────────────
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PROJECT_ROOT = dirname(__dirname); // sobe de src/ para raiz
 
-function registerShutdownHandlers(
-  logger: ILogger,
-  shutdownController: AbortController,
-  httpServer: IHttpServer
-): void {
-    const shutdown = async (signal: string) => {
-      if (isShuttingDown) {
-        logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
-        process.exit(1);
-      }
+// ─── AbortController global para graceful shutdown ─────────────────────────
+const shutdownController = new AbortController();
 
-      isShuttingDown = true;
-      logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
+function setupProcessHandlers(logger: ILogger): void {
+  const handleSignal = (signal: string) => {
+    logger.info(`[main] ${signal} received. Initiating graceful shutdown...`);
+    if (!shutdownController.signal.aborted) {
+      shutdownController.abort();
+    }
+  };
 
-      const forceExitTimer = setTimeout(() => {
-        logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
-        process.exit(1);
-      }, 5_000);
+  process.on('SIGINT', () => handleSignal('SIGINT'));
+  process.on('SIGTERM', () => handleSignal('SIGTERM'));
 
-      process.removeAllListeners('SIGINT');
-      process.removeAllListeners('SIGTERM');
-
-      // Prevent race condition: ensure abort is called before cleanup
-      if (!shutdownInProgress) {
-        shutdownInProgress = true;
-        shutdownController.abort();
-        clearTimeout(forceExitTimer);
-        logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
-      } else {
-        clearTimeout(forceExitTimer);
-        logger.info('[main] Shutdown already in progress.');
-      }
-    };
-
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-  logger.info('[main] Graceful shutdown handlers registered (SIGINT/SIGTERM).');
-}
-
-async function bootstrap(): Promise<void> {
-  const logger: ILogger = new ConsoleLogger('SOBERANO');
-  const shutdownController = new AbortController();
-  const circuitBreaker = new CircuitBreaker({ logger });
-
-  const httpServer: IHttpServer = new NativeHttpServer({
-    logger,
-    abortSignal: shutdownController.signal,
+  // Previne crash em unhandled rejections — loga e continua
+  process.on('unhandledRejection', (reason: unknown) => {
+    logger.error(`[main] Unhandled Rejection: ${reason instanceof Error ? reason.message : String(reason)}`);
   });
 
-  registerShutdownHandlers(logger, shutdownController, httpServer);
-
-  const globalTimeoutSignal = AbortSignal.timeout(120_000);
-  const combinedSignal = AbortSignal.any([shutdownController.signal, globalTimeoutSignal]);
-
-  const provider = new OllamaProvider({ logger, circuitBreaker });
-  provider.setAbortSignal(combinedSignal);
-  const motor: IMotorCognitivo = provider;
-
-  const portArg = process.argv[3];
-  let HTTP_PORT = 3000;
-  if (portArg !== undefined) {
-    HTTP_PORT = parseInt(portArg, 10);
-    if (Number.isNaN(HTTP_PORT)) {
-      logger.error('[main] Invalid port argument "' + portArg + '". Porta invalida. Encerrando.');
-      process.exit(1);
-    }
-  }
-  await httpServer.start(HTTP_PORT);
-
-  try {
-    // TESTE 1: MOTOR COGNITIVO
-    logger.info('[main] === TESTE 1: MOTOR COGNITIVO ===');
-
-    const promptTeste = 'Ola, Soberano. Confirme que seus sistemas base estao online.';
-    const mensagens = [{ role: 'user' as const, content: promptTeste }];
-
-    logger.info('[main] Sending messages to cognitive engine...');
-    logger.info('[main] Messages: ' + JSON.stringify(mensagens));
-
-    const respostaMessage = await motor.gerarResposta(mensagens);
-
-    logger.info('[main] === RESPOSTA DO MOTOR COGNITIVO ===');
-    logger.info(respostaMessage.content);
-    logger.info('[main] Test completed successfully.');
-
-    // TESTE DO FILE SENSOR (Fase 2)
-    const filePath = process.argv[2];
-
-    if (filePath) {
-      logger.info('[main] === FILE SENSOR - Demonstracao ===');
-
-      const fileSensor: ISensor<string> = new FileSensor({ logger });
-
-      try {
-        const conteudo = await fileSensor.ler(filePath, combinedSignal);
-        logger.info('[main] Conteudo do arquivo "' + filePath + '":');
-        logger.info(conteudo);
-        logger.info('[main] FileSensor test completed successfully.');
-      } catch (sensorError) {
-        logger.error('[main] FileSensor: Erro ao ler o arquivo "' + filePath + '".');
-        if (sensorError instanceof Error) {
-          logger.error(sensorError.message);
-        } else {
-          logger.error('[main] Unknown error: ' + String(sensorError));
-        }
-      }
-    } else {
-      logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo> [porta]');
-    }
-
-    // DEMONSTRACAO DO MOCK VECTOR STORE (Fase 3)
-    logger.info('[main] === MOCK VECTOR STORE - Demonstracao ===');
-
-    const vectorStore: IVectorStore = new MockVectorStore({ logger });
-
-    await vectorStore.adicionar('doc-1', [0.1, 0.2, 0.3], { texto: 'Gato felino mamifero', fonte: 'enciclopedia' });
-    await vectorStore.adicionar('doc-2', [0.4, 0.5, 0.6], { texto: 'Cachorro canino mamifero', fonte: 'enciclopedia' });
-    await vectorStore.adicionar('doc-3', [0.7, 0.8, 0.9], { texto: 'Aguia ave rapina', fonte: 'enciclopedia' });
-
-    logger.info('[main] 3 vectors added to MockVectorStore.');
-
-    const queryVector = [0.35, 0.45, 0.55];
-    const similar = await vectorStore.buscarSimilares(queryVector, 2);
-
-    logger.info('[main] Top ' + similar.length + ' similar vectors to query [0.35, 0.45, 0.55]:');
-    for (const result of similar) {
-      logger.info('  -> id="' + result.id + '", score=' + result.score.toFixed(4) + ', texto="' + result.metadata.texto + '"');
-    }
-
-    logger.info('[main] MockVectorStore demonstration completed successfully.');
-
-    // TESTE DO CONVERSATION MANAGER (Fase 5)
-    logger.info('[main] === CONVERSATION MANAGER - Demonstracao: Sessoes + RAG (Fase 5) ===');
-
-    const sessionManager: ISessionManager = new InMemorySessionManager({
-      logger,
-      maxMessagesPerSession: 20,
-    });
-
-    // --- Tool Registry (Fase 6) ---
-    const toolRegistry: IToolRegistry = new ToolRegistry({ logger });
-    const systemTimeTool = new SystemTimeTool();
-    toolRegistry.registrar(systemTimeTool);
-    logger.info('[main] SystemTimeTool registered in ToolRegistry.');
-
-    const calculatorTool = new CalculatorTool();
-    toolRegistry.registrar(calculatorTool);
-    logger.info('[main] CalculatorTool registered in ToolRegistry.');
-
-    const readFileTool = new ReadFileTool();
-    toolRegistry.registrar(readFileTool);
-    logger.info('[main] ReadFileTool registered in ToolRegistry.');
-
-    const conversationManager: IConversationManager = new ConversationManager({
-      logger,
-      motor,
-      sessionManager,
-      vectorStore,
-      toolRegistry,
-    });
-
-    const sessionId = randomUUID();
-
-    // Turno 1
-    const input1 = 'Ola, quem es tu?';
-    logger.info('[main] CONVERSATION - Turno 1/2: "' + input1 + '"');
-    const resposta1 = await conversationManager.conversar(sessionId, input1);
-    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 1 ===');
-    logger.info(resposta1);
-
-    // Turno 2
-    const input2 = 'Qual foi a minha primeira pergunta?';
-    logger.info('[main] CONVERSATION - Turno 2/2: "' + input2 + '"');
-    const resposta2 = await conversationManager.conversar(sessionId, input2);
-    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 2 ===');
-    logger.info(resposta2);
-
-    // Turno 3 - Força o uso da ferramenta get_system_time
-    const input3 = 'Que horas sao exatamente agora?';
-    logger.info('[main] CONVERSATION - Turno 3/4 (Tool Calling): "' + input3 + '"');
-    const resposta3 = await conversationManager.conversar(sessionId, input3);
-    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 3 (Tool Calling) ===');
-    logger.info(resposta3);
-    logger.info('[main] === Tool Call test completed successfully. ===');
-
-    // Turno 4 - Uso multiplo de ferramentas (calculator + get_system_time)
-    const input4 = 'Soberano, calcule quanto e 1450 dividido por 5 e depois me diga que horas sao';
-    logger.info('[main] CONVERSATION - Turno 4/4 (Multi-tool): "' + input4 + '"');
-    const resposta4 = await conversationManager.conversar(sessionId, input4);
-    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 4 (Multi-tool) ===');
-    logger.info(resposta4);
-    logger.info('[main] === Sprint 6.5 - Zero Debt test completed successfully. ===');
-
-    // Verificacao da memoria de sessao
-    const historicoFinal = await sessionManager.obterHistorico(sessionId);
-    logger.info('[main] === SESSAO "' + sessionId + '" — ' + historicoFinal.length + ' mensagens ===');
-    logger.info('[main] Session history (' + historicoFinal.length + ' messages):');
-    for (const msg of historicoFinal) {
-      const truncatedContent = msg.content.substring(0, 100) + (msg.content.length > 100 ? '...' : '');
-      logger.info('  [' + msg.role + '] ' + truncatedContent);
-    }
-
-    logger.info('[main] === FASE 6.5 COMPLETA - Todos os testes OK ===');
-  } catch (error) {
-    if (shutdownController.signal.aborted) {
-      logger.info('[main] Operation cancelled due to system shutdown.');
-      return;
-    }
-
-    logger.error('[main] === ERRO NA COMUNICACAO COM O MOTOR ===');
-
-    if (error instanceof Error) {
-      logger.error(error.message);
-    } else {
-      logger.error('[main] Unknown error: ' + String(error));
-    }
-
-    logger.error('[main] O sistema nao pode se comunicar com o motor cognitivo.');
-    logger.error('[main] Verifique se o servidor Ollama esta em execucao: ollama serve');
-
-    process.exit(1);
-  } finally {
-    // Ensure httpServer.stop() is called exactly once to avoid race condition
-    if (!shutdownInProgress) {
-      shutdownInProgress = true;
-      await httpServer.stop().catch((err) => {
-        logger.error('[main] Error stopping HTTP server: ' + err);
-      });
-    }
-
-    if (isShuttingDown) {
-      logger.info('[main] Resources released. Goodbye, SOBERANO.');
-      process.exit(0);
-    }
-  }
+  process.on('uncaughtException', (err: Error) => {
+    logger.error(`[main] Uncaught Exception: ${err.message}`);
+    logger.error(err.stack ?? '');
+    process.exit(1); // Estado inconsistente — encerra
+  });
 }
 
-bootstrap();
+// ─── Bootstrap ──────────────────────────────────────────────────────────────
+async function main(): Promise<void> {
+  const logger = new ConsoleLogger();
+
+  logger.info('=== SOBERANO v0.7.0 — Container Tauri (HTTP/SSE) ===');
+
+  setupProcessHandlers(logger);
+
+  // ─── 1. Infraestrutura ─────────────────────────────────────────────────
+  const toolRegistry = new ToolRegistry({ logger });
+  const tools: ITool[] = [new CalculatorTool(), new SystemTimeTool(), new ReadFileTool()];
+  for (const tool of tools) {
+    toolRegistry.registrar(tool);
+  }
+  logger.info(`[main] ${tools.length} tool(s) registered.`);
+
+  const sensor = new FileSensor({ logger });
+
+  const circuitBreaker = new CircuitBreaker({ logger });
+
+  let provider;
+  const providerName = (process as any).env?.PROVIDER || 'ollama';
+  const requestedModel = (process as any).env?.MODEL;
+  
+  if (providerName === 'deepseek') {
+    const apiKey = (process as any).env?.DEEPSEEK_API_KEY;
+    if (!apiKey) {
+      logger.error('[main] DEEPSEEK_API_KEY environment variable is required when using DeepSeek provider.');
+      process.exit(1);
+    }
+    const model = requestedModel || 'deepseek-chat'; // ou 'deepseek-flash', 'deepseek-pro' dependendo do nome exato da API
+    provider = new DeepSeekProvider({ logger, apiKey, model, circuitBreaker });
+    logger.info(`[main] Cognitive Engine configured to use DeepSeek API (Model: ${model}).`);
+  } else {
+    const model = requestedModel || 'qwen2.5-coder:7b';
+    provider = new OllamaProvider({ logger, model, baseUrl: 'http://localhost:11434', circuitBreaker });
+    logger.info(`[main] Cognitive Engine configured to use Ollama local provider (Model: ${model}).`);
+  }
+
+  const sessionManager = new InMemorySessionManager({ logger });
+
+  const vectorStore = new MockVectorStore({ logger });
+
+  const conversationManager = new ConversationManager({
+    logger,
+    motor: provider,
+    sessionManager,
+    toolRegistry,
+    vectorStore,
+  });
+
+  // ─── 2. Servidor HTTP ──────────────────────────────────────────────────
+  const port = parseInt((process as any).env?.PORT ?? '3000', 10);
+  const rendererDir = join(PROJECT_ROOT, 'src', 'renderer');
+
+  const serverOptions: NativeHttpServerOptions = {
+    logger,
+    conversationManager,
+    sessionManager,
+    rendererDir,
+    abortSignal: shutdownController.signal,
+  };
+
+  const httpServer = new NativeHttpServer(serverOptions);
+
+  try {
+    await httpServer.start(port);
+    logger.info(`[main] SOBERANO HTTP server running on http://localhost:${httpServer.port}`);
+    logger.info(`[main] Frontend disponível em http://localhost:${httpServer.port}`);
+    logger.info('[main] Pressione Ctrl+C para encerrar.');
+  } catch (err) {
+    logger.error(`[main] Failed to start HTTP server: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  // ─── 3. Graceful Shutdown ──────────────────────────────────────────────
+  shutdownController.signal.addEventListener('abort', async () => {
+    logger.info('[main] Shutting down SOBERANO...');
+    try {
+      await httpServer.stop();
+      logger.info('[main] HTTP server stopped.');
+    } catch (err) {
+      logger.error(`[main] Error stopping HTTP server: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    logger.info('[main] SOBERANO encerrado. Até logo!');
+    process.exit(0);
+  });
+}
+
+// ─── Start ──────────────────────────────────────────────────────────────────
+main().catch((err: unknown) => {
+  console.error('[main] Fatal error during bootstrap:', err);
+  process.exit(1);
+});
 </file>
 
 </files>

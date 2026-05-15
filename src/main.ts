@@ -27,6 +27,7 @@ import { FileSensor } from './infra/FileSensor.ts';
 import { NativeHttpServer } from './infra/NativeHttpServer.ts';
 import type { NativeHttpServerOptions } from './infra/NativeHttpServer.ts';
 import { OllamaProvider } from './infra/OllamaProvider.ts';
+import { DeepSeekProvider } from './infra/DeepSeekProvider.ts';
 import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
 import { ConversationManager } from './infra/ConversationManager.ts';
 import { MockVectorStore } from './infra/MockVectorStore.ts';
@@ -84,7 +85,24 @@ async function main(): Promise<void> {
 
   const circuitBreaker = new CircuitBreaker({ logger });
 
-  const provider = new OllamaProvider({ logger, model: 'qwen2.5-coder:3b', baseUrl: 'http://localhost:11434', circuitBreaker });
+  let provider;
+  const providerName = (process as any).env?.PROVIDER || 'ollama';
+  const requestedModel = (process as any).env?.MODEL;
+  
+  if (providerName === 'deepseek') {
+    const apiKey = (process as any).env?.DEEPSEEK_API_KEY;
+    if (!apiKey) {
+      logger.error('[main] DEEPSEEK_API_KEY environment variable is required when using DeepSeek provider.');
+      process.exit(1);
+    }
+    const model = requestedModel || 'deepseek-chat'; // ou 'deepseek-flash', 'deepseek-pro' dependendo do nome exato da API
+    provider = new DeepSeekProvider({ logger, apiKey, model, circuitBreaker });
+    logger.info(`[main] Cognitive Engine configured to use DeepSeek API (Model: ${model}).`);
+  } else {
+    const model = requestedModel || 'qwen2.5-coder:7b';
+    provider = new OllamaProvider({ logger, model, baseUrl: 'http://localhost:11434', circuitBreaker });
+    logger.info(`[main] Cognitive Engine configured to use Ollama local provider (Model: ${model}).`);
+  }
 
   const sessionManager = new InMemorySessionManager({ logger });
 

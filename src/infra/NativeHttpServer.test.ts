@@ -48,14 +48,14 @@ describe('NativeHttpServer', () => {
   describe('Contrato (interface)', () => {
     it('deve ser instanciável com logger e sem abortSignal', () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       assert.ok(server instanceof NativeHttpServer);
     });
 
     it('deve ser instanciável com abortSignal', () => {
       const logger = new MockLogger();
       const controller = new AbortController();
-      const server = new NativeHttpServer({ logger, abortSignal: controller.signal });
+      const server = new NativeHttpServer({ logger, abortSignal: controller.signal } as any);
       assert.ok(server instanceof NativeHttpServer);
     });
   });
@@ -63,7 +63,7 @@ describe('NativeHttpServer', () => {
   describe('Ciclo de vida (start/stop)', () => {
     it('deve iniciar e parar o servidor na porta especificada', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       servers.push(server);
 
       await server.start(0); // porta 0 = SO atribui porta aleatória
@@ -75,7 +75,7 @@ describe('NativeHttpServer', () => {
 
     it('deve chamar stop sem erro mesmo se nunca foi iniciado', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
 
       // stop() sem start() não deve lançar
       await server.stop();
@@ -84,7 +84,7 @@ describe('NativeHttpServer', () => {
 
     it('deve ser idempotente: múltiplas chamadas a stop() resolvem imediatamente', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       servers.push(server);
 
       await server.start(0);
@@ -122,7 +122,7 @@ describe('NativeHttpServer', () => {
     it('deve parar o servidor quando o AbortSignal é disparado', async () => {
       const logger = new MockLogger();
       const controller = new AbortController();
-      const server = new NativeHttpServer({ logger, abortSignal: controller.signal });
+      const server = new NativeHttpServer({ logger, abortSignal: controller.signal } as any);
       servers.push(server);
 
       await server.start(0);
@@ -147,7 +147,7 @@ describe('NativeHttpServer', () => {
   describe('Requisições HTTP reais', () => {
     it('GET /healthz deve retornar status 200, Content-Type JSON e corpo exato', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       servers.push(server);
 
       await server.start(0);
@@ -168,7 +168,7 @@ describe('NativeHttpServer', () => {
 
     it('rota inexistente deve retornar status 404 e corpo "Not Found"', async () => {
       const logger = new MockLogger();
-      const server = new NativeHttpServer({ logger });
+      const server = new NativeHttpServer({ logger } as any);
       servers.push(server);
 
       await server.start(0);
