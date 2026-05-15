@@ -217,15 +217,17 @@ describe('CircuitBreaker', () => {
     });
   });
 
-  describe('recordFailure e reset', () => {
-    it('recordFailure deve incrementar contagem e abrir ao atingir threshold', () => {
+  describe('execute e reset - contagem de falhas e recuperação', () => {
+    it('execute com falha deve incrementar contagem e abrir ao atingir threshold', async () => {
       const logger = new MockLogger();
       const cb = new CircuitBreaker({ logger, failureThreshold: 2, openTimeoutMs: 30_000 });
 
-      cb.recordFailure();
+      const failingFn = () => Promise.reject(new Error('Falha simulada'));
+
+      await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.CLOSED);
 
-      cb.recordFailure();
+      await assert.rejects(() => cb.execute(failingFn));
       assert.strictEqual(cb.state, CircuitState.OPEN);
     });
 

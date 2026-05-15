@@ -1,5 +1,5 @@
 /**
- * @file env.d.ts
+* @file env.d.ts
  * @description Declarações de tipos mínimas para APIs nativas do Node.js.
  *              Necessário porque não podemos instalar @types/node (zero dependências externas).
  *              Apenas o essencial para eliminar erros de TypeScript no VS Code.
@@ -10,6 +10,12 @@ declare class Buffer {
   length: number;
   static from(data: string, encoding?: string): Buffer;
   toString(encoding?: string): string;
+}
+
+// TextDecoder (necessário para streaming de respostas do Ollama)
+declare class TextDecoder {
+  constructor(label?: string);
+  decode(input?: BufferSource, options?: { stream: boolean }): string;
 }
 
 // Process global
@@ -125,6 +131,11 @@ declare module 'node:path' {
   export function join(...paths: string[]): string;
   export function resolve(...paths: string[]): string;
   export function relative(from: string, to: string): string;
+}
+
+// node:crypto
+declare module 'node:crypto' {
+  export function randomUUID(): string;
 }
 
 // node:assert

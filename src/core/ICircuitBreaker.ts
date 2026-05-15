@@ -29,9 +29,12 @@ export abstract class ICircuitBreaker {
    */
   abstract execute<T>(fn: () => Promise<T>): Promise<T>;
 
-  /** Registra uma falha manualmente (para uso externo) */
-  abstract recordFailure(): void;
-
   /** Reseta o circuit breaker para o estado CLOSED */
   abstract reset(): void;
+
+  /**
+   * Registra uma falha manualmente. Protegido para uso interno do execute().
+   * Não deve ser chamado externamente.
+   */
+  protected abstract recordFailure(): void;
 }

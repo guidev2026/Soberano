@@ -120,6 +120,17 @@ export class ConversationManager extends IConversationManager {
       `[ConversationManager] Processing turn for session "${sessionId}". Input: "${inputUsuario}"`
     );
 
+    // --- Guard: valida entrada vazia ---
+    if (inputUsuario.length === 0) {
+      const fallbackMsg = '[SOBERANO] Nenhuma mensagem foi fornecida. Por favor, digite algo para conversarmos.';
+      const mensagemFallback: ChatMessage = { role: 'assistant', content: fallbackMsg };
+      await this.sessionManager.adicionarMensagem(sessionId, mensagemFallback);
+      this.logger.warn(
+        `[ConversationManager] Empty input received for session "${sessionId}". Returned fallback.`
+      );
+      return fallbackMsg;
+    }
+
     // --- Passo 1: Guarda o input do usuário na sessão ---
     const mensagemUsuario: ChatMessage = { role: 'user', content: inputUsuario };
     await this.sessionManager.adicionarMensagem(sessionId, mensagemUsuario);

@@ -46,7 +46,8 @@ export class InMemorySessionManager extends ISessionManager {
    * @param mensagem  - Mensagem no formato ChatMessage a ser adicionada.
    */
   async adicionarMensagem(sessionId: string, mensagem: ChatMessage): Promise<void> {
-    const historico = this.sessions.get(sessionId) ?? [];
+    // Cópia defensiva: evita que mutações externas corrompam o estado interno
+    const historico = [...(this.sessions.get(sessionId) ?? [])];
 
     // Se atingiu o limite, remove a mensagem não-system mais antiga
     if (historico.length >= this.maxMessagesPerSession) {
@@ -68,7 +69,8 @@ export class InMemorySessionManager extends ISessionManager {
     }
 
     historico.push(mensagem);
-    this.sessions.set(sessionId, historico);
+    // Armazena uma cópia defensiva para isolar o estado interno
+    this.sessions.set(sessionId, [...historico]);
 
     this.logger.debug(
       `[InMemorySessionManager] Mensagem adicionada à sessão "${sessionId}". ` +

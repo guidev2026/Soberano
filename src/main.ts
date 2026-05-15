@@ -1,6 +1,6 @@
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Sprint 6.3 (Expansao do Arsenal).
+ * @description Ponto de entrada do sistema SOBERANO - Sprint 6.5 (Zero Debt).
  *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
@@ -16,6 +16,7 @@
  *              - Simula 2 turnos de conversa para provar a retencao de memoria de sessao
  */
 
+import { randomUUID } from 'node:crypto';
 import { OllamaProvider } from './infra/OllamaProvider.ts';
 import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
 import { ConsoleLogger } from './infra/ConsoleLogger.ts';
@@ -38,6 +39,7 @@ import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
 import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
 
 let isShuttingDown = false;
+let shutdownInProgress = false;
 
 function registerShutdownHandlers(
   logger: ILogger,
@@ -61,10 +63,16 @@ function registerShutdownHandlers(
       process.removeAllListeners('SIGINT');
       process.removeAllListeners('SIGTERM');
 
-      shutdownController.abort();
-
-      clearTimeout(forceExitTimer);
-      logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
+      // Prevent race condition: ensure abort is called before cleanup
+      if (!shutdownInProgress) {
+        shutdownInProgress = true;
+        shutdownController.abort();
+        clearTimeout(forceExitTimer);
+        logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
+      } else {
+        clearTimeout(forceExitTimer);
+        logger.info('[main] Shutdown already in progress.');
+      }
     };
 
   process.on('SIGINT', () => shutdown('SIGINT'));
@@ -195,7 +203,7 @@ async function bootstrap(): Promise<void> {
       toolRegistry,
     });
 
-    const sessionId = 'demo-sprint-5.3';
+    const sessionId = randomUUID();
 
     // Turno 1
     const input1 = 'Ola, quem es tu?';
@@ -225,7 +233,7 @@ async function bootstrap(): Promise<void> {
     const resposta4 = await conversationManager.conversar(sessionId, input4);
     logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 4 (Multi-tool) ===');
     logger.info(resposta4);
-    logger.info('[main] === Sprint 6.3 - Expansao do Arsenal test completed successfully. ===');
+    logger.info('[main] === Sprint 6.5 - Zero Debt test completed successfully. ===');
 
     // Verificacao da memoria de sessao
     const historicoFinal = await sessionManager.obterHistorico(sessionId);
@@ -236,7 +244,7 @@ async function bootstrap(): Promise<void> {
       logger.info('  [' + msg.role + '] ' + truncatedContent);
     }
 
-    logger.info('[main] === FASE 5 COMPLETA - Todos os testes OK ===');
+    logger.info('[main] === FASE 6.5 COMPLETA - Todos os testes OK ===');
   } catch (error) {
     if (shutdownController.signal.aborted) {
       logger.info('[main] Operation cancelled due to system shutdown.');
@@ -256,9 +264,13 @@ async function bootstrap(): Promise<void> {
 
     process.exit(1);
   } finally {
-    await httpServer.stop().catch((err) => {
-      logger.error('[main] Error stopping HTTP server: ' + err);
-    });
+    // Ensure httpServer.stop() is called exactly once to avoid race condition
+    if (!shutdownInProgress) {
+      shutdownInProgress = true;
+      await httpServer.stop().catch((err) => {
+        logger.error('[main] Error stopping HTTP server: ' + err);
+      });
+    }
 
     if (isShuttingDown) {
       logger.info('[main] Resources released. Goodbye, SOBERANO.');

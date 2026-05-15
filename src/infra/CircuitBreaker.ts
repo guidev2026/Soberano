@@ -84,7 +84,7 @@ export class CircuitBreaker extends ICircuitBreaker {
     }
   }
 
-  recordFailure(): void {
+  protected recordFailure(): void {
     this.failureCount++;
     this.lastFailureTime = Date.now();
 

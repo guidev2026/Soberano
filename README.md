@@ -110,7 +110,8 @@ src/
 | Suporte a cancelamento via AbortSignal no conversar() | ✅ |
 | Contrato gerarRespostaStream() no IMotorCognitivo para suporte a streaming | ✅ |
 | Implementação base de gerarRespostaStream no OllamaProvider | ✅ |
-| ConversationManager.test.ts — 8 testes unitários cobrindo ReAct Loop (tool calls, fallback, cancelamento) | ✅ |
+| ConversationManager.test.ts — 10 testes unitários cobrindo ReAct Loop (tool calls, fallback, cancelamento, maxToolIterations) | ✅ |
+| MockVectorStore.test.ts — 9 testes unitários de cosineSimilarity (vetores idênticos, ortogonais, nulos, opostos, dimensões, limit, vazio, duplicatas) | ✅ |
 
 ## Como Executar
 

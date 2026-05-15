@@ -32,16 +32,17 @@ export class ToolRegistry extends IToolRegistry {
 
   /**
    * Registra uma ferramenta no registry.
-   * Se uma ferramenta com o mesmo nome já existir, emite um aviso e sobrescreve.
+   * Lança erro se uma ferramenta com o mesmo nome já existir (colisão).
    *
    * @param tool - Instância concreta de ITool a ser registrada.
+   * @throws {Error} Se já existir uma ferramenta registrada com o mesmo nome.
    */
   registrar(tool: ITool): void {
     const nome = tool.name;
 
     if (this.tools.has(nome)) {
-      this.logger.warn(
-        `[ToolRegistry] Tool "${nome}" is already registered. Overwriting previous registration.`
+      throw new Error(
+        `[ToolRegistry] Tool "${nome}" is already registered. Cannot register duplicate.`
       );
     }
 

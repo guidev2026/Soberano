@@ -64,6 +64,91 @@ describe('OllamaProvider', () => {
     fetchMock?.mock.restore();
   });
 
+  describe('gerarRespostaStream', () => {
+    it('deve produzir chunks de texto a partir de um stream NDJSON', async () => {
+      const mockLogger = new MockLogger();
+
+      // Simula resposta NDJSON do Ollama (cada linha é um JSON com { message: { content: "..." } })
+      const ndjsonResponse = [
+        JSON.stringify({ message: { content: 'Olá' } }),
+        JSON.stringify({ message: { content: ', ' } }),
+        JSON.stringify({ message: { content: 'mundo!' } }),
+        JSON.stringify({ message: { content: '' }, done: true }),
+      ].join('\n');
+
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(ndjsonResponse));
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'application/x-ndjson' },
+        });
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
+
+      const chunks: string[] = [];
+      for await (const chunk of provider.gerarRespostaStream([{ role: 'user', content: 'teste' }])) {
+        chunks.push(chunk);
+      }
+
+      assert.deepStrictEqual(chunks, ['Olá', ', ', 'mundo!']);
+    });
+
+    it('deve lançar erro HTTP quando resposta não for ok no stream', async () => {
+      const mockLogger = new MockLogger();
+
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        return new Response('Not Found', { status: 404 });
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
+
+      await assert.rejects(
+        async () => {
+          for await (const _ of provider.gerarRespostaStream([{ role: 'user', content: 'teste' }])) {
+            // should not yield
+          }
+        },
+        (err: unknown) => {
+          if (err instanceof Error) {
+            assert.ok(err.message.includes('HTTP error 404'));
+          }
+          return true;
+        }
+      );
+    });
+
+    it('deve rejeitar imediatamente com AbortError se sinal já estiver abortado', async () => {
+      const mockLogger = new MockLogger();
+
+      // Um sinal já abortado deve fazer o fetch falhar imediatamente
+      const ac = new AbortController();
+      ac.abort();
+
+      fetchMock = mock.method(globalThis, 'fetch', () => {
+        throw new Error('fetch should not be called with pre-aborted signal');
+      });
+
+      const mockCB = new MockCircuitBreaker();
+      const provider = new OllamaProvider({ logger: mockLogger, circuitBreaker: mockCB });
+
+      await assert.rejects(
+        async () => {
+          for await (const _ of provider.gerarRespostaStream([{ role: 'user', content: 'teste' }], undefined, ac.signal)) {
+            // should not yield
+          }
+        }
+      );
+    });
+  });
+
   describe('Chamada fetch - gerarResposta', () => {
     it('deve chamar fetch com a URL e payload corretos (endpoint /api/chat)', async () => {
       const mockLogger = new MockLogger();
