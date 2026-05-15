@@ -105,6 +105,28 @@ declare module 'node:fs/promises' {
   export function readFile(path: string, options?: { encoding?: string; signal?: AbortSignal }): Promise<string | Buffer>;
 }
 
+// node:fs
+declare module 'node:fs' {
+  export function mkdtempSync(prefix: string): string;
+  export function writeFileSync(path: string, data: string, encoding?: string): void;
+  export function mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined;
+  export function rmdirSync(path: string, options?: { recursive?: boolean }): void;
+  export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
+  export function existsSync(path: string): boolean;
+}
+
+// node:os
+declare module 'node:os' {
+  export function tmpdir(): string;
+}
+
+// node:path
+declare module 'node:path' {
+  export function join(...paths: string[]): string;
+  export function resolve(...paths: string[]): string;
+  export function relative(from: string, to: string): string;
+}
+
 // node:assert
 declare module 'node:assert' {
   interface Assert {

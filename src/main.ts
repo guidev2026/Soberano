@@ -1,6 +1,6 @@
 /**
  * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Fase 5 (Gerenciamento de Contexto).
+ * @description Ponto de entrada do sistema SOBERANO - Sprint 6.3 (Expansao do Arsenal).
  *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
  *              - Instancia ConsoleLogger para logging estruturado
  *              - Instancia OllamaProvider com Logger injetado via construtor
@@ -34,6 +34,8 @@ import { IConversationManager } from './core/IConversationManager.ts';
 import { ToolRegistry } from './infra/ToolRegistry.ts';
 import { IToolRegistry } from './core/IToolRegistry.ts';
 import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
+import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
+import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
 
 let isShuttingDown = false;
 
@@ -185,6 +187,14 @@ async function bootstrap(): Promise<void> {
     toolRegistry.registrar(systemTimeTool);
     logger.info('[main] SystemTimeTool registered in ToolRegistry.');
 
+    const calculatorTool = new CalculatorTool();
+    toolRegistry.registrar(calculatorTool);
+    logger.info('[main] CalculatorTool registered in ToolRegistry.');
+
+    const readFileTool = new ReadFileTool();
+    toolRegistry.registrar(readFileTool);
+    logger.info('[main] ReadFileTool registered in ToolRegistry.');
+
     const conversationManager: IConversationManager = new ConversationManager({
       logger,
       motor,
@@ -211,11 +221,19 @@ async function bootstrap(): Promise<void> {
 
     // Turno 3 - Força o uso da ferramenta get_system_time
     const input3 = 'Que horas sao exatamente agora?';
-    logger.info('[main] CONVERSATION - Turno 3/3 (Tool Calling): "' + input3 + '"');
+    logger.info('[main] CONVERSATION - Turno 3/4 (Tool Calling): "' + input3 + '"');
     const resposta3 = await conversationManager.conversar(sessionId, input3);
     logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 3 (Tool Calling) ===');
     logger.info(resposta3);
     logger.info('[main] === Tool Call test completed successfully. ===');
+
+    // Turno 4 - Uso multiplo de ferramentas (calculator + get_system_time)
+    const input4 = 'Soberano, calcule quanto e 1450 dividido por 5 e depois me diga que horas sao';
+    logger.info('[main] CONVERSATION - Turno 4/4 (Multi-tool): "' + input4 + '"');
+    const resposta4 = await conversationManager.conversar(sessionId, input4);
+    logger.info('[main] === CONVERSATION MANAGER - Resposta Turno 4 (Multi-tool) ===');
+    logger.info(resposta4);
+    logger.info('[main] === Sprint 6.3 - Expansao do Arsenal test completed successfully. ===');
 
     // Verificacao da memoria de sessao
     const historicoFinal = await sessionManager.obterHistorico(sessionId);

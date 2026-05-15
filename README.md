@@ -1,6 +1,6 @@
 # SOBERANO — Sistema de Orquestração com Engenharia de Software de Alta Robustez
 
-**Versão:** 0.6.0 — Fase 6 (Sistema de Agentes e Ferramentas)
+**Versão:** 0.6.3 — Sprint 6.3 (Expansão do Arsenal)
 
 ## Stack
 
@@ -44,7 +44,14 @@ src/
 │   ├── InMemorySessionManager.ts   # Gestão de sessões em memória (ISessionManager)
 │   ├── InMemorySessionManager.test.ts
 │   ├── ConversationManager.ts      # Maestro: orquestra sessão + RAG + motor cognitivo
-│   └── ConversationManager.test.ts
+│   ├── ConversationManager.test.ts
+│   └── tools/                      # Arsenal de ferramentas do agente
+│       ├── SystemTimeTool.ts       # Retorna data/hora atual do sistema
+│       ├── SystemTimeTool.test.ts
+│       ├── CalculatorTool.ts       # Operações matemáticas básicas
+│       ├── CalculatorTool.test.ts
+│       ├── ReadFileTool.ts         # Leitura de arquivos locais
+│       └── ReadFileTool.test.ts
 ├── env.d.ts           # Tipos manuais para APIs nativas do Node
 └── main.ts            # Orquestração, wiring manual, ponto de entrada
 ```
@@ -91,6 +98,9 @@ src/
 | Contrato IToolRegistry — registro e consulta de ferramentas | ✅ |
 | ToolRegistry — implementação concreta com Map<string, ITool> | ✅ |
 | SystemTimeTool — ferramenta concreta que retorna data/hora ISO 8601 | ✅ |
+| CalculatorTool — ferramenta de cálculo matemático (soma, subtração, multiplicação, divisão) | ✅ |
+| ReadFileTool — ferramenta de leitura de arquivos locais (fail-safe) | ✅ |
+| Demonstração multi-ferramenta no main.ts (calculator + get_system_time) | ✅ |
 | ReAct/Tool Calling Loop no ConversationManager (até 3 iterações, segurança anti-loop) | ✅ |
 | Detecção e execução de tool_calls com guarda de contexto no SessionManager | ✅ |
 | Tratamento de erros: ferramenta não encontrada, falha de execução, sem registry | ✅ |

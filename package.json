@@ -1,11 +1,11 @@
 {
   "name": "soberano",
-  "version": "0.3.0",
+  "version": "0.6.3",
   "description": "SOBERANO - Sistema de Orquestração com Engenharia de Software de Alta Robustez",
   "type": "module",
   "scripts": {
     "start": "node --experimental-transform-types src/main.ts",
-    "test": "node --experimental-transform-types --test src/infra/*.test.ts",
+    "test": "node --experimental-transform-types --test src/infra/*.test.ts src/infra/tools/*.test.ts",
     "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
     "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
     "test:file": "node --experimental-transform-types src/infra/FileSensor.test.ts",
