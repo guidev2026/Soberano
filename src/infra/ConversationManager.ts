@@ -177,9 +177,11 @@ export class ConversationManager extends IConversationManager {
 
     // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
     let systemContent =
-      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
-      `Responda em Português do Brasil de forma clara e objetiva. ` +
-      `Mantenha o contexto da conversa ao responder.`;
+      `Você é o ${this.systemName}, um assistente virtual de inteligência artificial de alta performance e robustez. ` +
+      `Seu objetivo é ajudar o usuário com respostas precisas, claras e úteis em Português do Brasil. ` +
+      `Mantenha um tom profissional, porém amigável. ` +
+      `IMPORTANTE: Não invente ferramentas que não foram fornecidas. Se não puder realizar uma tarefa, explique o porquê educadamente. ` +
+      `Mantenha o contexto da conversa e responda apenas ao que foi solicitado.`;
 
     if (documentosRecuperados.length > 0) {
       const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');
@@ -314,9 +316,10 @@ export class ConversationManager extends IConversationManager {
 
     // --- Passo 4: Constrói a mensagem system (Context Fusion) ---
     let systemContent =
-      `Você é o ${this.systemName}, um assistente de IA de alta robustez. ` +
-      `Responda em Português do Brasil de forma clara e objetiva. ` +
-      `Mantenha o contexto da conversa ao responder.`;
+      `Você é o ${this.systemName}, um assistente virtual de inteligência artificial de alta performance e robustez. ` +
+      `Seu objetivo é ajudar o usuário com respostas precisas, claras e úteis em Português do Brasil. ` +
+      `Mantenha um tom profissional, porém amigável. ` +
+      `Mantenha o contexto da conversa e responda apenas ao que foi solicitado.`;
 
     if (documentosRecuperados.length > 0) {
       const contextoRAG = documentosRecuperados.map((doc, idx) => `[${idx + 1}] ${doc}`).join('\n');

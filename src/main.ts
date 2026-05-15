@@ -84,7 +84,7 @@ async function main(): Promise<void> {
 
   const circuitBreaker = new CircuitBreaker({ logger });
 
-  const provider = new OllamaProvider({ logger, model: 'llama3.2:1b', baseUrl: 'http://localhost:11434', circuitBreaker });
+  const provider = new OllamaProvider({ logger, model: 'qwen2.5-coder:3b', baseUrl: 'http://localhost:11434', circuitBreaker });
 
   const sessionManager = new InMemorySessionManager({ logger });
 
@@ -100,7 +100,7 @@ async function main(): Promise<void> {
 
   // ─── 2. Servidor HTTP ──────────────────────────────────────────────────
   const port = parseInt((process as any).env?.PORT ?? '3000', 10);
-  const rendererDir = join(PROJECT_ROOT, 'renderer');
+  const rendererDir = join(PROJECT_ROOT, 'src', 'renderer');
 
   const serverOptions: NativeHttpServerOptions = {
     logger,
