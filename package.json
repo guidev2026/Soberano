@@ -1,7 +1,7 @@
 {
   "name": "soberano",
-  "version": "0.8.0",
-  "description": "SOBERANO - Microsserviço Local de IA Generativa (Tauri + Node.js HTTP/SSE)",
+  "version": "0.9.1",
+  "description": "SOBERANO — Microsserviço Local de IA Generativa (Tauri + Node.js HTTP/SSE)",
   "type": "module",
   "scripts": {
     "start:server": "node --experimental-transform-types src/main.ts",
@@ -9,7 +9,7 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:init": "tauri init",
-    "test": "node --experimental-transform-types --test src/infra/*.test.ts src/infra/tools/*.test.ts",
+    "test": "node --experimental-transform-types --test src/infra/*.test.ts src/infra/tools/*.test.ts src/core/*.test.ts",
     "test:ollama": "node --experimental-transform-types src/infra/OllamaProvider.test.ts",
     "test:circuit": "node --experimental-transform-types src/infra/CircuitBreaker.test.ts",
     "test:file": "node --experimental-transform-types src/infra/FileSensor.test.ts",

@@ -1,6 +1,6 @@
 # SOBERANO — Microsserviço Local de IA Generativa (Tauri + Node.js HTTP/SSE)
 
-**Versão:** 0.9.0
+**Versão:** 0.9.1
 
 ## Stack
 
@@ -12,6 +12,8 @@
 | HTTP | `node:http` servidor + `fetch` global nativo |
 | Streaming | SSE (Server-Sent Events) via `node:http` |
 | Shell Desktop | Tauri (aponta para `dist/renderer/`) |
+| Banco de Dados | `node:sqlite` (SQLite nativo — zero dependências NPM) |
+| Embeddings | Ollama API (`nomic-embed-text`) via `fetch` nativo |
 
 > **Nota sobre tipos:** Diferentemente da Fase 6, agora utilizamos `@types/node` para tipagem completa dos módulos nativos Node.js. O arquivo `src/env.d.ts` foi simplificado, mantendo apenas declarações específicas do projeto.
 
@@ -38,6 +40,7 @@
 │  │  - AbortController global (graceful shutdown)            │  │
 │  │  - Injeção de dependências (Options Object)              │  │
 │  │  - Registro de ferramentas (ToolRegistry)                │  │
+│  │  - Fechamento seguro de conexões DB no shutdown          │  │
 │  └──────────┬───────────────────────────────────────────────┘  │
 │             │                                                  │
 │  ┌──────────▼───────────────────────────────────────────────┐  │
@@ -49,17 +52,49 @@
 │  └──────────┬───────────────────────────────────────────────┘  │
 │             │                                                  │
 │  ┌──────────▼───────────────────────────────────────────────┐  │
-│  │  src/infra/ConversationManager.ts  (IConversationManager)│  │
+│  │  src/infra/ConversationManager.ts (IConversationManager) │  │
 │  │  - conversarStream(sessionId, input, signal) → SSE      │  │
 │  │  - ReAct Tool Loop (até 3 iterações)                    │  │
-│  │  - RAG com MockVectorStore                              │  │
+│  │  - RAG com SqliteVectorStore + OllamaEmbeddingProvider  │  │
 │  └──────────┬───────────────────────────────────────────────┘  │
 │             │                                                  │
 │  ┌──────────▼───────────────────────────────────────────────┐  │
-│  │  src/infra/OllamaProvider.ts  (IMotorCognitivo)          │  │
-│  │  - fetch para http://localhost:11434/api/chat            │  │
-│  │  - Retry com backoff + Circuit Breaker                   │  │
-│  │  - Tool Calling (Fase 6)                                │  │
+│  │  Providers Cognitivos (IMotorCognitivo)                   │  │
+│  │                                                           │  │
+│  │  ┌─────────────────────────────────────────────────────┐  │  │
+│  │  │  OllamaProvider (padrão)                            │  │  │
+│  │  │  - fetch para http://localhost:11434/api/chat       │  │  │
+│  │  │  - Modelo: qwen2.5-coder:7b                        │  │  │
+│  │  │  - Retry + Circuit Breaker + Tool Calling           │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  │  ┌─────────────────────────────────────────────────────┐  │  │
+│  │  │  DeepSeekProvider (alternativo)                     │  │  │
+│  │  │  - API nativa via fetch com fallback para Ollama    │  │  │
+│  │  │  - Variável de ambiente PROVIDER=deepseek           │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/SqliteSessionManager.ts (ISessionManager)     │  │
+│  │  - Persistência Local-First com node:sqlite              │  │
+│  │  - Pruning ativo no INSERT (remove mensagens antigas)    │  │
+│  │  - Limite de contexto configurável (padrão 50 msgs)      │  │
+│  │  - Fechamento seguro de conexão no shutdown              │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/SqliteVectorStore.ts (IVectorStore)           │  │
+│  │  - Banco vetorial real com node:sqlite                   │  │
+│  │  - Similaridade Cosseno em JS nativo                     │  │
+│  │  - Suporte a metadados (source, timestamp)               │  │
+│  │  - Ingestão e busca com limite K configurável            │  │
+│  └──────────┬───────────────────────────────────────────────┘  │
+│             │                                                  │
+│  ┌──────────▼───────────────────────────────────────────────┐  │
+│  │  src/infra/OllamaEmbeddingProvider.ts (IEmbeddingProvider)│  │
+│  │  - Geração de embeddings via Ollama API                  │  │
+│  │  - Circuit Breaker integrado                             │  │
+│  │  - Modelo: nomic-embed-text                              │  │
 │  └──────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -73,17 +108,23 @@ src/
 │   ├── IHttpServer.ts                              # Abstração do servidor HTTP
 │   ├── ISensor.ts                                  # Abstração genérica de sensor (T)
 │   ├── IEmbeddings.ts                              # Contrato para geração de embeddings vetoriais
+│   ├── IEmbeddingProvider.ts                       # Contrato para provedor de embeddings
 │   ├── IVectorStore.ts                             # Contrato para armazenamento e busca vetorial
 │   ├── ISessionManager.ts                          # Contrato para gestão de sessões de conversa
 │   ├── IConversationManager.ts                     # Contrato do Maestro (orquestração multi-turno)
 │   ├── ITool.ts                                    # Contrato genérico de ferramenta (Tool Calling)
+│   ├── IToolRegistry.ts                            # Contrato do registro de ferramentas
 │   ├── ContextManager.ts                           # Gerenciador de contexto/memória (histórico limitado)
-│   └── SoberanoAgent.ts                            # Agente orquestrador (motor + memória)
+│   ├── ContextManager.test.ts
+│   ├── SoberanoAgent.ts                            # Agente orquestrador (motor + memória)
+│   └── SoberanoAgent.test.ts
 ├── infra/                            # Implementações técnicas ("Os Músculos")
 │   ├── ConsoleLogger.ts                            # Logger concreto (stdout)
 │   ├── ConsoleLogger.test.ts
 │   ├── OllamaProvider.ts                           # Provider Ollama via fetch nativo
 │   ├── OllamaProvider.test.ts
+│   ├── DeepSeekProvider.ts                         # Provider DeepSeek via API nativa
+│   ├── DeepSeekProvider.test.ts
 │   ├── validateOllamaResponse.test.ts             # Testes de validação de schema da API
 │   ├── CircuitBreaker.ts                           # Circuit Breaker (3 estados)
 │   ├── CircuitBreaker.test.ts
@@ -91,8 +132,12 @@ src/
 │   ├── FileSensor.test.ts
 │   ├── NativeHttpServer.ts                         # Servidor HTTP nativo (IHttpServer) c/ SSE
 │   ├── NativeHttpServer.test.ts
-│   ├── MockVectorStore.ts                          # Vector Store mock
-│   ├── InMemorySessionManager.ts                   # Gestão de sessões em memória
+│   ├── SqliteSessionManager.ts                     # Persistência SQLite nativa (ISessionManager)
+│   ├── SqliteSessionManager.test.ts
+│   ├── SqliteVectorStore.ts                        # Banco vetorial real com SQLite
+│   ├── MockVectorStore.ts                          # Vector Store mock (legado)
+│   ├── OllamaEmbeddingProvider.ts                  # Embeddings via Ollama API
+│   ├── InMemorySessionManager.ts                   # Gestão de sessões em memória (legado)
 │   ├── InMemorySessionManager.test.ts
 │   ├── ConversationManager.ts                      # Maestro: orquestra sessão + RAG + motor
 │   ├── ConversationManager.test.ts
@@ -108,6 +153,8 @@ src/
 ├── renderer/                         # Frontend Vanilla ("A Casca" — servido como estático)
 │   ├── index.html                    # Interface do chat (dark mode, responsivo)
 │   └── app.js                        # Consumidor SSE via fetch/getReader
+├── scripts/
+│   └── ingest.ts                     # Script de ingestão de documentos para RAG
 ├── env.d.ts                          # Tipos manuais para APIs nativas do Node
 ├── main.ts                           # Bootstrap: wiring + servidor HTTP (ponto de entrada)
 ├── main-cli.ts                       # Ponto de entrada CLI (MVP original, legado)
@@ -122,6 +169,8 @@ src/
 - **Desacoplamento:** Detalhes técnicos nunca vazam para `src/core`
 - **Streaming Nativo:** SSE (Server-Sent Events) via `node:http` — sem bibliotecas de terceiros
 - **Microsserviço Local:** Backend Node.js puro na porta 3000; Tauri é apenas o shell desktop
+- **Local-First:** Persistência com `node:sqlite` — zero dependências NPM para banco de dados
+- **RAG Real:** Embeddings via Ollama + busca por similaridade cosseno em JS nativo
 
 ## Funcionalidades Implementadas
 
@@ -168,60 +217,17 @@ src/
 | **Persistência Local-First com `node:sqlite` (Zero Dependências NPM)** | ✅ **Nova na Fase 9** |
 | **RAG Real com Ollama Embedding Provider (`nomic-embed-text`)** | ✅ **Nova na Fase 9** |
 | **Banco Vetorial Nativo via JS e SQLite (`SqliteVectorStore`)** | ✅ **Nova na Fase 9** |
+| **DeepSeek Provider — provider alternativo via API nativa com fallback** | ✅ |
+| **Circuit Breaker integrado ao OllamaEmbeddingProvider** | ✅ |
+| **Fechamento seguro de conexões DB (sessionManager + vectorStore) no shutdown** | ✅ |
+| **Pruning ativo no SqliteSessionManager (remove mensagens antigas no INSERT)** | ✅ |
+| **Script de ingestão de documentos para RAG (src/scripts/ingest.ts)** | ✅ **Nova na Fase 9** |
+| **SqliteVectorStore com suporte a metadados (source, timestamp) e busca por similaridade** | ✅ **Nova na Fase 9** |
 
 ## Como Executar
 
 ### Pré-requisitos
 
-- Node.js >= 20 (fetch nativo, `node:test`)
+- Node.js >= 22.12 (suporte a `node:sqlite` nativo)
 - Servidor Ollama em execução (`ollama serve`)
-- Modelo Ollama disponível (padrão: `llama3.2:1b`)
-- **Tauri CLI** (opcional, para build desktop)
-
-### Scripts do `package.json`
-
-| Comando | Descrição |
-|---------|-----------|
-| `npm run start:server` | Inicia o servidor HTTP SOBERANO na porta 3000 |
-| `npm run start:server:dev` | Inicia com `--watch` para recarregar automático em desenvolvimento |
-| `npm run tauri:dev` | Inicia o Tauri em modo dev (abre janela desktop apontando para `http://localhost:3000`) |
-| `npm run tauri:build` | Compila o binário desktop Tauri |
-| `npm run tauri:init` | Inicializa a configuração do Tauri no projeto |
-| `npm test` | Roda **todos** os testes unitários (`src/infra/*.test.ts`, `src/infra/tools/*.test.ts`, `src/core/*.test.ts`) |
-| `npm run test:ollama` | Testes do OllamaProvider isoladamente |
-| `npm run test:circuit` | Testes do CircuitBreaker isoladamente |
-| `npm run test:file` | Testes do FileSensor isoladamente |
-| `npm run test:http` | Testes do NativeHttpServer isoladamente |
-| `npm run typecheck` | TypeScript type-check sem executar (`tsc --noEmit`) |
-
-### Fluxo de Desenvolvimento
-
-```bash
-# Terminal 1: Iniciar servidor backend
-npm run start:server
-
-# Terminal 2: Iniciar Tauri (opcional — ou acessar http://localhost:3000 no navegador)
-npm run tauri:dev
-
-# Terminal 3: CLI interativa (Fase 8)
-npx tsx src/cli.ts
-
-# Testes
-npm test
-```
-
-## Roadmap
-
-| Fase | Descrição | Status |
-|------|-----------|--------|
-| **1** | CLI MVP — comunicação básica com Ollama + Circuit Breaker | ✅ **Concluída** |
-| **2** | Sensores — FileSensor (leitura de arquivos locais) | ✅ **Concluída** |
-| **3** | Memória — Embeddings + Vector Store (RAG Tradicional) | ✅ **Concluída** |
-| **4** | Qualidade de Teste e Determinismo — timeouts mínimos, mock.fn, assertions de retry | ✅ **Concluída** |
-| **5** | Gerenciamento de contexto e sessões multi-turno | ✅ **Concluída** |
-| **6** | Sistema de agentes e ferramentas (tool use) | ✅ **Concluída** |
-| **6.4** | Red Team Fixes (bugs críticos no loop ReAct) + Electron Prep (streaming, cancelamento) | ✅ **Concluída** |
-| **6.5** | Blindagem Final — Degradação Graciosa RAG, Defensive Copy SessionManager, Shutdown Determinístico, Fallback ReAct Edge Case | ✅ **Concluída** |
-| **7** | **Pivot: Microsserviço Local (HTTP/SSE + Tauri)** <br><br> • Electron removido (incompatível com Ubuntu 22.04 — SIGSEGV Chromium)<br> • Backend Node.js como servidor HTTP puro na porta 3000<br> • Rota POST /chat com SSE streaming (conversarStream)<br> • Frontend Vanilla (renderer/) — fetch + getReader para SSE<br> • Tauri como shell desktop (aponta para dist/renderer/)<br> • Graceful shutdown com AbortController global<br> • `@tauri-apps/cli` + `@types/node` | ✅ **Concluída** |
-| **8** | **Núcleo de Interação — Gerenciador de Contexto + Agente + CLI** <br><br> • ContextManager — histórico com limite configurável de mensagens<br> • SoberanoAgent — agente que integra IMotorCognitivo + ContextManager via DI<br> • CLI interativa (node:readline/promises) com comandos /sair, /limpar, /ajuda<br> • 22 testes unitários (15 ContextManager + 7 SoberanoAgent) | ✅ **Concluída** |
-| **9** | **Motor de Persistência e RAG Local (Zero Deps)** <br><br> • Banco relacional `node:sqlite` para persistência das sessões (Local-First).<br> • Gerador de Embeddings apontando via Fetch para a API do Ollama (`nomic-embed-text`).<br> • Banco Vetorial com SQLite executando matemática de similaridade nativa em memória JS.<br> • Script dedicado de ingestão de documentos para RAG de forma isolada. | ✅ **Concluída** |
+- Modelo Ollama disponível (padrão: `qwen2.5-c
