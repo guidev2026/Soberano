@@ -8,6 +8,10 @@
  *              - API REST em /chat (SSE) e /chat-history
  *              - Frontend estático (vanilla HTML/JS) em src/renderer/
  *
+ *              Bootstrap unificado: as dependências são construídas via
+ *              buildDependencies() em src/bootstrap.ts, eliminando duplicação
+ *              de wiring com main-cli.ts (princípio DRY).
+ *
  *              Graceful Shutdown: SIGINT/SIGTERM disparam abortSignal global,
  *              que é propagado para o servidor HTTP e operações em andamento.
  *
@@ -15,113 +19,22 @@
  *              Nenhuma dependência externa (zero npm além de typescript e tauri-cli).
  */
 
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-import { ConsoleLogger } from './infra/ConsoleLogger.ts';
-import { CircuitBreaker } from './infra/CircuitBreaker.ts';
-import { ToolRegistry } from './infra/ToolRegistry.ts';
-import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
-import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
-import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
-import { FileSensor } from './infra/FileSensor.ts';
+import { join } from 'node:path';
+import { buildDependencies, resolveProjectRoot, resolveRendererDir } from './bootstrap.ts';
 import { NativeHttpServer } from './infra/NativeHttpServer.ts';
 import type { NativeHttpServerOptions } from './infra/NativeHttpServer.ts';
-import { OllamaProvider } from './infra/OllamaProvider.ts';
-import { DeepSeekProvider } from './infra/DeepSeekProvider.ts';
-import { SqliteSessionManager } from './infra/SqliteSessionManager.ts';
-import { ConversationManager } from './infra/ConversationManager.ts';
-import { SqliteVectorStore } from './infra/SqliteVectorStore.ts';
-import { OllamaEmbeddingProvider } from './infra/OllamaEmbeddingProvider.ts';
-import { ILogger } from './core/ILogger.ts';
-import { ITool } from './core/ITool.ts';
-
-// ─── Caminho absoluto da pasta src (ESM-compatível) ─────────────────────────
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const PROJECT_ROOT = dirname(__dirname); // sobe de src/ para raiz
-
-// ─── AbortController global para graceful shutdown ─────────────────────────
-const shutdownController = new AbortController();
-
-function setupProcessHandlers(logger: ILogger): void {
-  const handleSignal = (signal: string) => {
-    logger.info(`[main] ${signal} received. Initiating graceful shutdown...`);
-    if (!shutdownController.signal.aborted) {
-      shutdownController.abort();
-    }
-  };
-
-  process.on('SIGINT', () => handleSignal('SIGINT'));
-  process.on('SIGTERM', () => handleSignal('SIGTERM'));
-
-  // Previne crash em unhandled rejections — loga e continua
-  process.on('unhandledRejection', (reason: unknown) => {
-    logger.error(`[main] Unhandled Rejection: ${reason instanceof Error ? reason.message : String(reason)}`);
-  });
-
-  process.on('uncaughtException', (err: Error) => {
-    logger.error(`[main] Uncaught Exception: ${err.message}`);
-    logger.error(err.stack ?? '');
-    process.exit(1); // Estado inconsistente — encerra
-  });
-}
 
 // ─── Bootstrap ──────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
-  const logger = new ConsoleLogger();
+  const { logger, shutdownController, sessionManager, conversationManager } =
+    await buildDependencies({ loggerTag: 'SOBERANO' });
 
   logger.info('=== SOBERANO v0.7.0 — Container Tauri (HTTP/SSE) ===');
 
-  setupProcessHandlers(logger);
-
-  // ─── 1. Infraestrutura ─────────────────────────────────────────────────
-  const toolRegistry = new ToolRegistry({ logger });
-  const tools: ITool[] = [new CalculatorTool(), new SystemTimeTool(), new ReadFileTool()];
-  for (const tool of tools) {
-    toolRegistry.registrar(tool);
-  }
-  logger.info(`[main] ${tools.length} tool(s) registered.`);
-
-  const sensor = new FileSensor({ logger });
-
-  const circuitBreaker = new CircuitBreaker({ logger });
-
-  let provider;
-  const providerName = (process as any).env?.PROVIDER || 'ollama';
-  const requestedModel = (process as any).env?.MODEL;
-  
-  if (providerName === 'deepseek') {
-    const apiKey = (process as any).env?.DEEPSEEK_API_KEY;
-    if (!apiKey) {
-      logger.error('[main] DEEPSEEK_API_KEY environment variable is required when using DeepSeek provider.');
-      process.exit(1);
-    }
-    const model = requestedModel || 'deepseek-chat'; // ou 'deepseek-flash', 'deepseek-pro' dependendo do nome exato da API
-    provider = new DeepSeekProvider({ logger, apiKey, model, circuitBreaker });
-    logger.info(`[main] Cognitive Engine configured to use DeepSeek API (Model: ${model}).`);
-  } else {
-    const model = requestedModel || 'qwen2.5-coder:7b';
-    provider = new OllamaProvider({ logger, model, baseUrl: 'http://localhost:11434', circuitBreaker });
-    logger.info(`[main] Cognitive Engine configured to use Ollama local provider (Model: ${model}).`);
-  }
-
-  const sessionManager = new SqliteSessionManager({ logger, dbPath: 'nexus_core.db' });
-
-  const vectorStore = new SqliteVectorStore({ logger, dbPath: 'nexus_knowledge.db' });
-  const embeddingProvider = new OllamaEmbeddingProvider({ logger, model: 'nomic-embed-text' });
-
-  const conversationManager = new ConversationManager({
-    logger,
-    motor: provider,
-    sessionManager,
-    toolRegistry,
-    vectorStore,
-    embeddingProvider,
-  });
-
-  // ─── 2. Servidor HTTP ──────────────────────────────────────────────────
+  // ─── 1. Servidor HTTP ──────────────────────────────────────────────────
   const port = parseInt((process as any).env?.PORT ?? '3000', 10);
-  const rendererDir = join(PROJECT_ROOT, 'src', 'renderer');
+  const projectRoot = resolveProjectRoot();
+  const rendererDir = join(projectRoot, 'src', 'renderer');
 
   const serverOptions: NativeHttpServerOptions = {
     logger,
@@ -143,7 +56,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // ─── 3. Graceful Shutdown ──────────────────────────────────────────────
+  // ─── 2. Graceful Shutdown ──────────────────────────────────────────────
   shutdownController.signal.addEventListener('abort', async () => {
     logger.info('[main] Shutting down SOBERANO...');
     try {
@@ -152,6 +65,8 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.error(`[main] Error stopping HTTP server: ${err instanceof Error ? err.message : String(err)}`);
     }
+
+    // Conexões com banco são fechadas pelo bootstrap.ts via shutdownController.signal
     logger.info('[main] SOBERANO encerrado. Até logo!');
     process.exit(0);
   });

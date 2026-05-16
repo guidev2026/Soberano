@@ -3,6 +3,11 @@
  * @description Implementação do motor de persistência nativo utilizando `node:sqlite`.
  *              Garante a persistência local (Single-Tenant) do histórico sem
  *              dependências externas de pacotes NPM.
+ * 
+ *              Gerencia limite de contexto (pruning):
+ *              - No INSERT: apaga mensagens não-system antigas do banco (pruning ativo).
+ *              - No SELECT: retorna no máximo `maxMessagesPerSession` mensagens,
+ *                sempre preservando a(s) mensagem(ns) `system` original(is).
  */
 
 import { DatabaseSync } from 'node:sqlite';
@@ -15,18 +20,30 @@ export interface SqliteSessionManagerOptions {
   logger: ILogger;
   /** Caminho do arquivo de banco de dados SQLite. Padrão: 'nexus_core.db' */
   dbPath?: string;
+  /**
+   * Número máximo de mensagens retornadas no histórico por sessão.
+   * A(s) mensagem(ns) `system` são SEMPRE preservadas.
+   * Mensagens não-system mais antigas são descartadas (pruning ativo no INSERT).
+   * Padrão: 50.
+   */
+  maxMessagesPerSession?: number;
 }
 
 export class SqliteSessionManager extends ISessionManager {
   private readonly db: DatabaseSync;
   private readonly logger: ILogger;
+  private readonly maxMessagesPerSession: number;
 
   constructor(options: SqliteSessionManagerOptions) {
     super();
     this.logger = options.logger;
+    this.maxMessagesPerSession = options.maxMessagesPerSession ?? 50;
     const dbPath = options.dbPath ?? 'nexus_core.db';
 
     this.logger.info(`[SqliteSessionManager] Inicializando banco de dados em: ${dbPath}`);
+    this.logger.debug(
+      `[SqliteSessionManager] maxMessagesPerSession configurado para: ${this.maxMessagesPerSession}`
+    );
     this.db = new DatabaseSync(dbPath);
     this.initDatabase();
   }
@@ -44,26 +61,26 @@ export class SqliteSessionManager extends ISessionManager {
         created_at INTEGER NOT NULL
       );
     `);
-    
+
     // Índice para otimizar busca por session_id
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
     `);
-    
+
     this.logger.debug('[SqliteSessionManager] Banco de dados preparado (Tabela: messages).');
   }
 
   async adicionarMensagem(sessionId: string, mensagem: ChatMessage): Promise<void> {
-    const stmt = this.db.prepare(`
+    // 1. Insere a nova mensagem
+    const insertStmt = this.db.prepare(`
       INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
 
-    // Serializar o array de tool_calls para JSON se estiver presente
     const toolCallsJson = mensagem.tool_calls ? JSON.stringify(mensagem.tool_calls) : null;
     const toolCallId = mensagem.tool_call_id ?? null;
 
-    stmt.run(
+    insertStmt.run(
       sessionId,
       mensagem.role,
       mensagem.content,
@@ -75,6 +92,36 @@ export class SqliteSessionManager extends ISessionManager {
     this.logger.debug(
       `[SqliteSessionManager] Mensagem adicionada à sessão "${sessionId}" (role: ${mensagem.role}).`
     );
+
+    // 2. Pruning ativo: remove mensagens não-system mais antigas que excedam o limite
+    // Subquery dupla necessária porque SQLite não aceita LIMIT dentro de IN subquery diretamente
+    const pruneStmt = this.db.prepare(`
+      DELETE FROM messages
+      WHERE id IN (
+        SELECT id FROM (
+          SELECT id FROM messages
+          WHERE session_id = ? AND role != 'system'
+          ORDER BY id ASC
+          LIMIT MAX(0, (
+            (SELECT COUNT(*) FROM messages WHERE session_id = ? AND role != 'system') -
+            MAX(0, ? - (SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'system'))
+          ))
+        )
+      )
+    `);
+
+    const result = pruneStmt.run(
+      sessionId,
+      sessionId,
+      this.maxMessagesPerSession,
+      sessionId
+    ) as { changes: number };
+
+    if (result.changes > 0) {
+      this.logger.debug(
+        `[SqliteSessionManager] Pruning: ${result.changes} mensagem(ns) antiga(s) removida(s) da sessão "${sessionId}".`
+      );
+    }
   }
 
   async obterHistorico(sessionId: string): Promise<ReadonlyArray<ChatMessage>> {
@@ -92,7 +139,17 @@ export class SqliteSessionManager extends ISessionManager {
       tool_calls: string | null;
     }>;
 
-    const historico = rows.map(row => {
+    // Separa mensagens system das demais
+    const systemMessages = rows.filter(r => r.role === 'system');
+    const nonSystemMessages = rows.filter(r => r.role !== 'system');
+
+    // Aplica o limite de contexto: mantém as N mais recentes mensagens não-system
+    const maxNonSystem = Math.max(0, this.maxMessagesPerSession - systemMessages.length);
+    const trimmedNonSystem = nonSystemMessages.slice(-maxNonSystem);
+
+    const combinedMessages = [...systemMessages, ...trimmedNonSystem];
+
+    const historico = combinedMessages.map(row => {
       const msg: ChatMessage = {
         role: row.role as ChatMessage['role'],
         content: row.content,
@@ -118,9 +175,9 @@ export class SqliteSessionManager extends ISessionManager {
 
   async limparSessao(sessionId: string): Promise<void> {
     const stmt = this.db.prepare(`DELETE FROM messages WHERE session_id = ?`);
-    const result = stmt.run(sessionId) as any;
+    const result = stmt.run(sessionId) as { changes: number };
 
-    if (result && result.changes && result.changes > 0) {
+    if (result.changes > 0) {
       this.logger.debug(
         `[SqliteSessionManager] Sessão "${sessionId}" limpa. ${result.changes} mensagens removidas.`
       );

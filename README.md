@@ -107,8 +107,7 @@ src/
 │   ├── ICircuitBreaker.ts                          # Abstração do Circuit Breaker
 │   ├── IHttpServer.ts                              # Abstração do servidor HTTP
 │   ├── ISensor.ts                                  # Abstração genérica de sensor (T)
-│   ├── IEmbeddings.ts                              # Contrato para geração de embeddings vetoriais
-│   ├── IEmbeddingProvider.ts                       # Contrato para provedor de embeddings
+│   ├── IEmbeddingProvider.ts                       # Contrato único para geração de embeddings vetoriais
 │   ├── IVectorStore.ts                             # Contrato para armazenamento e busca vetorial
 │   ├── ISessionManager.ts                          # Contrato para gestão de sessões de conversa
 │   ├── IConversationManager.ts                     # Contrato do Maestro (orquestração multi-turno)
@@ -156,8 +155,9 @@ src/
 ├── scripts/
 │   └── ingest.ts                     # Script de ingestão de documentos para RAG
 ├── env.d.ts                          # Tipos manuais para APIs nativas do Node
-├── main.ts                           # Bootstrap: wiring + servidor HTTP (ponto de entrada)
-├── main-cli.ts                       # Ponto de entrada CLI (MVP original, legado)
+├── bootstrap.ts                      # Fábrica central de dependências (DRY — usado por main.ts e main-cli.ts)
+├── main.ts                           # Bootstrap unificado + servidor HTTP (ponto de entrada principal)
+├── main-cli.ts                       # Bootstrap unificado + interface CLI de terminal (legado)
 └── cli.ts                            # CLI interativa com loop readline (Fase 8)
 ```
 
@@ -223,6 +223,11 @@ src/
 | **Pruning ativo no SqliteSessionManager (remove mensagens antigas no INSERT)** | ✅ |
 | **Script de ingestão de documentos para RAG (src/scripts/ingest.ts)** | ✅ **Nova na Fase 9** |
 | **SqliteVectorStore com suporte a metadados (source, timestamp) e busca por similaridade** | ✅ **Nova na Fase 9** |
+| **Unificação de contratos — IEmbeddings.ts removido, apenas IEmbeddingProvider.ts** | ✅ **Nova na Fase 9** |
+| **Circuit Breaker injetado no OllamaEmbeddingProvider** | ✅ **Nova na Fase 9** |
+| **Graceful Shutdown com fechamento seguro de SqliteSessionManager + SqliteVectorStore** | ✅ **Nova na Fase 9** |
+| **Bootstrap unificado (bootstrap.ts) — fábrica central de dependências DRY** | ✅ **Nova na Fase 9** |
+| **main.ts e main-cli.ts consomem bootstrap.ts (elimina duplicação de wiring)** | ✅ **Nova na Fase 9** |
 
 ## Como Executar
 

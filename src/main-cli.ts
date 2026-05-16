@@ -1,142 +1,47 @@
 /**
- * @file main.ts
- * @description Ponto de entrada do sistema SOBERANO - Sprint 6.5 (Zero Debt).
- *              Realiza o wiring manual (Injecao de Dependencia) seguindo o DIP:
- *              - Instancia ConsoleLogger para logging estruturado
- *              - Instancia OllamaProvider com Logger injetado via construtor
- *              - Cria AbortController global para graceful shutdown
- *              - Injeta AbortSignal no OllamaProvider para cancelar fetch em andamento
- *              - Trata sinais do sistema (SIGINT/SIGTERM) para encerramento limpo
- *              - Inicializa NativeHttpServer para servir rota /healthz
- *              - Executa o teste de comunicacao com o motor cognitivo
- *              - Executa o teste do FileSensor (leitura de arquivo local)
- *              - Demonstra o MockVectorStore (Memoria Vetorial - Fase 3)
- *              - Instancia InMemorySessionManager para gestao de sessoes (Fase 5)
- *              - Instancia ConversationManager para orquestracao multi-turno com RAG (Fase 5)
- *              - Simula 2 turnos de conversa para provar a retencao de memoria de sessao
+ * @file main-cli.ts
+ * @description Ponto de entrada do sistema SOBERANO — Interface interativa de terminal.
+ *
+ *              Realiza o bootstrap via buildDependencies() em src/bootstrap.ts,
+ *              eliminando duplicação de wiring com main.ts (princípio DRY).
+ *
+ *              Funcionalidades:
+ *              - Teste de comunicação com o motor cognitivo
+ *              - Teste do FileSensor (leitura de arquivo local)
+ *              - Demonstração do SqliteVectorStore (RAG)
+ *              - Simulação multi-turno via ConversationManager com Tool Calling
+ *              - Graceful Shutdown via SIGINT/SIGTERM
  */
 
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { OllamaProvider } from './infra/OllamaProvider.ts';
-import { IMotorCognitivo } from './core/IMotorCognitivo.ts';
-import { ConsoleLogger } from './infra/ConsoleLogger.ts';
-import { ILogger } from './core/ILogger.ts';
-import { CircuitBreaker } from './infra/CircuitBreaker.ts';
-import { NativeHttpServer } from './infra/NativeHttpServer.ts';
-import { IHttpServer } from './core/IHttpServer.ts';
+import { buildDependencies, resolveProjectRoot } from './bootstrap.ts';
 import { FileSensor } from './infra/FileSensor.ts';
 import { ISensor } from './core/ISensor.ts';
-import { SqliteVectorStore } from './infra/SqliteVectorStore.ts';
-import { OllamaEmbeddingProvider } from './infra/OllamaEmbeddingProvider.ts';
-import { IVectorStore } from './core/IVectorStore.ts';
-import { IEmbeddingProvider } from './core/IEmbeddingProvider.ts';
-import { SqliteSessionManager } from './infra/SqliteSessionManager.ts';
-import { ISessionManager } from './core/ISessionManager.ts';
-import { ConversationManager } from './infra/ConversationManager.ts';
-import { IConversationManager } from './core/IConversationManager.ts';
-import { ToolRegistry } from './infra/ToolRegistry.ts';
-import { IToolRegistry } from './core/IToolRegistry.ts';
-import { SystemTimeTool } from './infra/tools/SystemTimeTool.ts';
-import { CalculatorTool } from './infra/tools/CalculatorTool.ts';
-import { ReadFileTool } from './infra/tools/ReadFileTool.ts';
+import { NativeHttpServer } from './infra/NativeHttpServer.ts';
+import { IHttpServer } from './core/IHttpServer.ts';
 
 let isShuttingDown = false;
-let shutdownInProgress = false;
-
-function registerShutdownHandlers(
-  logger: ILogger,
-  shutdownController: AbortController,
-  httpServer: IHttpServer
-): void {
-    const shutdown = async (signal: string) => {
-      if (isShuttingDown) {
-        logger.warn('[main] Signal ' + signal + ' received again. Forcing exit.');
-        process.exit(1);
-      }
-
-      isShuttingDown = true;
-      logger.info('[main] Signal ' + signal + ' received. Initiating graceful shutdown...');
-
-      const forceExitTimer = setTimeout(() => {
-        logger.error('[main] Shutdown timeout exceeded. Forcing exit.');
-        process.exit(1);
-      }, 5_000);
-
-      process.removeAllListeners('SIGINT');
-      process.removeAllListeners('SIGTERM');
-
-      // Prevent race condition: ensure abort is called before cleanup
-      if (!shutdownInProgress) {
-        shutdownInProgress = true;
-        shutdownController.abort();
-        clearTimeout(forceExitTimer);
-        logger.info('[main] Shutdown signalled. Resources will be released in finally block.');
-      } else {
-        clearTimeout(forceExitTimer);
-        logger.info('[main] Shutdown already in progress.');
-      }
-    };
-
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-  logger.info('[main] Graceful shutdown handlers registered (SIGINT/SIGTERM).');
-}
 
 async function bootstrap(): Promise<void> {
-  const logger: ILogger = new ConsoleLogger('SOBERANO');
-  const shutdownController = new AbortController();
-  const circuitBreaker = new CircuitBreaker({ logger });
+  const { logger, shutdownController, motor, sessionManager, vectorStore, embeddingProvider, conversationManager } =
+    await buildDependencies({
+      loggerTag: 'SOBERANO',
+      sessionDbPath: 'nexus_core_cli.db',
+      vectorDbPath: 'nexus_knowledge_cli.db',
+    });
 
-  const globalTimeoutSignal = AbortSignal.timeout(120_000);
-  const combinedSignal = AbortSignal.any([shutdownController.signal, globalTimeoutSignal]);
-
-  const provider = new OllamaProvider({ logger, circuitBreaker });
-  provider.setAbortSignal(combinedSignal);
-  const motor: IMotorCognitivo = provider;
-
-  // --- Session Manager ---
-  const sessionManager: ISessionManager = new SqliteSessionManager({
-    logger,
-    dbPath: 'nexus_core_cli.db',
+  // ─── Graceful Shutdown (proteção do SQLite WAL) ─────────────────────────
+  shutdownController.signal.addEventListener('abort', () => {
+    // As conexões com banco são fechadas pelo bootstrap.ts
+    logger.info('[main] Shutdown signalled. Resources will be released.');
   });
 
-  // --- Vector Store e Embeddings ---
-  const embeddingProvider: IEmbeddingProvider = new OllamaEmbeddingProvider({ logger });
-  const vectorStore: IVectorStore = new SqliteVectorStore({ logger, dbPath: 'nexus_knowledge_cli.db' });
+  const projectRoot = resolveProjectRoot();
+  const rendererDir = join(projectRoot, 'src', 'renderer');
 
-  // --- Tool Registry ---
-  const toolRegistry: IToolRegistry = new ToolRegistry({ logger });
-  const systemTimeTool = new SystemTimeTool();
-  toolRegistry.registrar(systemTimeTool);
-  logger.info('[main] SystemTimeTool registered in ToolRegistry.');
-
-  const calculatorTool = new CalculatorTool();
-  toolRegistry.registrar(calculatorTool);
-  logger.info('[main] CalculatorTool registered in ToolRegistry.');
-
-  const readFileTool = new ReadFileTool();
-  toolRegistry.registrar(readFileTool);
-  logger.info('[main] ReadFileTool registered in ToolRegistry.');
-
-  // --- Conversation Manager ---
-  const conversationManager: IConversationManager = new ConversationManager({
-    logger,
-    motor,
-    sessionManager,
-    vectorStore,
-    embeddingProvider,
-    toolRegistry,
-  });
-
-  // --- Resolve rendererDir: dist/renderer = __dirname + '/renderer' ---
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = join(__filename, '..');
-  const rendererDir = join(__dirname, 'renderer');
-
-  // --- HTTP Server ---
+  // ─── HTTP Server (necessário para API de chat) ──────────────────────────
   const httpServer: IHttpServer = new NativeHttpServer({
     logger,
     conversationManager,
@@ -144,8 +49,6 @@ async function bootstrap(): Promise<void> {
     rendererDir,
     abortSignal: shutdownController.signal,
   });
-
-  registerShutdownHandlers(logger, shutdownController, httpServer);
 
   const portArg = process.argv[3];
   let HTTP_PORT = 3000;
@@ -183,7 +86,7 @@ async function bootstrap(): Promise<void> {
       const fileSensor: ISensor<string> = new FileSensor({ logger });
 
       try {
-        const conteudo = await fileSensor.ler(filePath, combinedSignal);
+        const conteudo = await fileSensor.ler(filePath, shutdownController.signal);
         logger.info('[main] Conteudo do arquivo "' + filePath + '":');
         logger.info(conteudo);
         logger.info('[main] FileSensor test completed successfully.');
@@ -206,7 +109,7 @@ async function bootstrap(): Promise<void> {
       const txt1 = 'Gato é um felino mamifero.';
       const txt2 = 'Cachorro é um canino mamifero leal.';
       const txt3 = 'Águia é uma ave de rapina imponente.';
-      
+
       await vectorStore.adicionar('doc-cli-1', await embeddingProvider.gerarEmbedding(txt1), { texto: txt1, fonte: 'enciclopedia' });
       await vectorStore.adicionar('doc-cli-2', await embeddingProvider.gerarEmbedding(txt2), { texto: txt2, fonte: 'enciclopedia' });
       await vectorStore.adicionar('doc-cli-3', await embeddingProvider.gerarEmbedding(txt3), { texto: txt3, fonte: 'enciclopedia' });
@@ -290,8 +193,7 @@ async function bootstrap(): Promise<void> {
     process.exit(1);
   } finally {
     // Ensure httpServer.stop() is called exactly once to avoid race condition
-    if (!shutdownInProgress) {
-      shutdownInProgress = true;
+    if (!shutdownController.signal.aborted) {
       await httpServer.stop().catch((err) => {
         logger.error('[main] Error stopping HTTP server: ' + err);
       });

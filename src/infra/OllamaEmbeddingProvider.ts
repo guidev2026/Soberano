@@ -6,6 +6,7 @@
 
 import { IEmbeddingProvider } from '../core/IEmbeddingProvider.ts';
 import { ILogger } from '../core/ILogger.ts';
+import { ICircuitBreaker } from '../core/ICircuitBreaker.ts';
 
 export interface OllamaEmbeddingProviderOptions {
   /** Instância do logger */
@@ -14,57 +15,67 @@ export interface OllamaEmbeddingProviderOptions {
   model?: string;
   /** URL base do Ollama (Padrão: http://localhost:11434) */
   baseUrl?: string;
+  /** Instância do CircuitBreaker para proteção contra falhas do servidor de embeddings */
+  circuitBreaker: ICircuitBreaker;
 }
 
 export class OllamaEmbeddingProvider extends IEmbeddingProvider {
   private readonly logger: ILogger;
   private readonly model: string;
   private readonly baseUrl: string;
+  private readonly circuitBreaker: ICircuitBreaker;
 
+  /**
+   * @param options - Objeto de configuração (OllamaEmbeddingProviderOptions).
+   * @throws {Error} Se circuitBreaker não for fornecido (DIP obrigatório).
+   */
   constructor(options: OllamaEmbeddingProviderOptions) {
     super();
     this.logger = options.logger;
     this.model = options.model ?? 'nomic-embed-text';
     this.baseUrl = options.baseUrl ?? 'http://localhost:11434';
+
+    if (!options.circuitBreaker) {
+      throw new Error(
+        '[OllamaEmbeddingProvider] CircuitBreaker is required for DIP compliance. ' +
+        'Provide an instance of ICircuitBreaker in the configuration.'
+      );
+    }
+    this.circuitBreaker = options.circuitBreaker;
   }
 
   async gerarEmbedding(texto: string): Promise<number[]> {
     const url = `${this.baseUrl}/api/embeddings`;
-    
-    const maxRetries = 2;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: this.model,
-            prompt: texto
-          })
-        });
+    const body = JSON.stringify({
+      model: this.model,
+      prompt: texto
+    });
 
-        if (!response.ok) {
-          throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
-        }
+    const executeFetch = async (): Promise<number[]> => {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
 
-        const data = await response.json() as { embedding: number[] };
-        
-        if (!data.embedding || !Array.isArray(data.embedding)) {
-          throw new Error('Formato de resposta inválido do Ollama: embedding não encontrado.');
-        }
-
-        return data.embedding;
-      } catch (error) {
-        if (attempt === maxRetries) {
-          this.logger.error(`[OllamaEmbeddingProvider] Falha ao gerar embedding após ${maxRetries} tentativas: ${error}`);
-          throw error;
-        }
-        this.logger.warn(`[OllamaEmbeddingProvider] Falha na tentativa ${attempt}. Tentando novamente...`);
-        // Pequeno delay
-        await new Promise(res => setTimeout(res, 500 * attempt));
+      if (!response.ok) {
+        throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
       }
+
+      const data = await response.json() as { embedding: number[] };
+
+      if (!data.embedding || !Array.isArray(data.embedding)) {
+        throw new Error('Formato de resposta inválido do Ollama: embedding não encontrado.');
+      }
+
+      return data.embedding;
+    };
+
+    try {
+      return await this.circuitBreaker.execute(executeFetch);
+    } catch (error) {
+      this.logger.error(`[OllamaEmbeddingProvider] Falha ao gerar embedding: ${error}`);
+      throw error;
     }
-    
-    throw new Error('Falha inesperada ao gerar embedding');
   }
 }

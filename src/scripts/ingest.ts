@@ -7,6 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { ConsoleLogger } from '../infra/ConsoleLogger.ts';
+import { CircuitBreaker } from '../infra/CircuitBreaker.ts';
 import { OllamaEmbeddingProvider } from '../infra/OllamaEmbeddingProvider.ts';
 import { SqliteVectorStore } from '../infra/SqliteVectorStore.ts';
 
@@ -19,7 +20,8 @@ async function main() {
     process.exit(1);
   }
 
-  const embeddingProvider = new OllamaEmbeddingProvider({ logger });
+  const circuitBreaker = new CircuitBreaker({ logger });
+  const embeddingProvider = new OllamaEmbeddingProvider({ logger, circuitBreaker });
   const vectorStore = new SqliteVectorStore({ logger, dbPath: 'nexus_knowledge.db' });
 
   try {
