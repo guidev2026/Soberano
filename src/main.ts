@@ -28,9 +28,10 @@ import { NativeHttpServer } from './infra/NativeHttpServer.ts';
 import type { NativeHttpServerOptions } from './infra/NativeHttpServer.ts';
 import { OllamaProvider } from './infra/OllamaProvider.ts';
 import { DeepSeekProvider } from './infra/DeepSeekProvider.ts';
-import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
+import { SqliteSessionManager } from './infra/SqliteSessionManager.ts';
 import { ConversationManager } from './infra/ConversationManager.ts';
-import { MockVectorStore } from './infra/MockVectorStore.ts';
+import { SqliteVectorStore } from './infra/SqliteVectorStore.ts';
+import { OllamaEmbeddingProvider } from './infra/OllamaEmbeddingProvider.ts';
 import { ILogger } from './core/ILogger.ts';
 import { ITool } from './core/ITool.ts';
 
@@ -104,9 +105,10 @@ async function main(): Promise<void> {
     logger.info(`[main] Cognitive Engine configured to use Ollama local provider (Model: ${model}).`);
   }
 
-  const sessionManager = new InMemorySessionManager({ logger });
+  const sessionManager = new SqliteSessionManager({ logger, dbPath: 'nexus_core.db' });
 
-  const vectorStore = new MockVectorStore({ logger });
+  const vectorStore = new SqliteVectorStore({ logger, dbPath: 'nexus_knowledge.db' });
+  const embeddingProvider = new OllamaEmbeddingProvider({ logger, model: 'nomic-embed-text' });
 
   const conversationManager = new ConversationManager({
     logger,
@@ -114,6 +116,7 @@ async function main(): Promise<void> {
     sessionManager,
     toolRegistry,
     vectorStore,
+    embeddingProvider,
   });
 
   // ─── 2. Servidor HTTP ──────────────────────────────────────────────────

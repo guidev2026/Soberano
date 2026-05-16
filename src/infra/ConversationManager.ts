@@ -21,6 +21,7 @@ import { ISessionManager } from '../core/ISessionManager.ts';
 import { IVectorStore } from '../core/IVectorStore.ts';
 import { ILogger } from '../core/ILogger.ts';
 import { IToolRegistry } from '../core/IToolRegistry.ts';
+import { IEmbeddingProvider } from '../core/IEmbeddingProvider.ts';
 
 export interface ConversationManagerOptions {
   /** Instância obrigatória de ILogger para logging estruturado */
@@ -35,6 +36,8 @@ export interface ConversationManagerOptions {
   /** Instância opcional do Tool Registry para Tool Calling.
    *  Se não fornecida, o Tool Calling é desabilitado. */
   toolRegistry?: IToolRegistry;
+  /** Instância opcional do Provedor de Embeddings para RAG. */
+  embeddingProvider?: IEmbeddingProvider;
   /** Nome do sistema SOBERANO para a mensagem de system prompt */
   systemName?: string;
   /** Número máximo de iterações do Tool Calling Loop (segurança anti-loop infinito).
@@ -47,6 +50,7 @@ export class ConversationManager extends IConversationManager {
   private readonly motor: IMotorCognitivo;
   private readonly sessionManager: ISessionManager;
   private readonly vectorStore?: IVectorStore;
+  private readonly embeddingProvider?: IEmbeddingProvider;
   private readonly toolRegistry?: IToolRegistry;
   private readonly systemName: string;
   private readonly maxToolIterations: number;
@@ -61,6 +65,7 @@ export class ConversationManager extends IConversationManager {
     this.motor = options.motor;
     this.sessionManager = options.sessionManager;
     this.vectorStore = options.vectorStore;
+    this.embeddingProvider = options.embeddingProvider;
     this.toolRegistry = options.toolRegistry;
     this.systemName = options.systemName ?? 'SOBERANO';
     this.maxToolIterations = options.maxToolIterations ?? 3;
@@ -140,9 +145,13 @@ export class ConversationManager extends IConversationManager {
     let documentosRecuperados: string[] = [];
     if (this.vectorStore) {
       try {
-        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
+        // Utiliza o provedor real se disponível, ou fallback para heurístico
+        const queryVector = this.embeddingProvider 
+          ? await this.embeddingProvider.gerarEmbedding(inputUsuario)
+          : this.gerarEmbeddingHeuristico(inputUsuario);
+          
         this.logger.debug(
-          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
+          `[ConversationManager] Generated embedding for RAG query (${queryVector.length} dims).`
         );
 
         const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);
@@ -281,9 +290,13 @@ export class ConversationManager extends IConversationManager {
     let documentosRecuperados: string[] = [];
     if (this.vectorStore) {
       try {
-        const queryVector = this.gerarEmbeddingHeuristico(inputUsuario);
+        // Utiliza o provedor real se disponível, ou fallback para heurístico
+        const queryVector = this.embeddingProvider 
+          ? await this.embeddingProvider.gerarEmbedding(inputUsuario)
+          : this.gerarEmbeddingHeuristico(inputUsuario);
+          
         this.logger.debug(
-          `[ConversationManager] Generated heuristic embedding for RAG query (${queryVector.length} dims).`
+          `[ConversationManager] Generated embedding for RAG query (${queryVector.length} dims).`
         );
 
         const resultados = await this.vectorStore.buscarSimilares(queryVector, 3);

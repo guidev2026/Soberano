@@ -1,6 +1,6 @@
 {
   "name": "soberano",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "SOBERANO - Microsserviço Local de IA Generativa (Tauri + Node.js HTTP/SSE)",
   "type": "module",
   "scripts": {

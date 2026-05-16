@@ -35,3 +35,18 @@ declare module 'node:test' {
   export function beforeEach(fn: () => void | Promise<void>): void;
   export function afterEach(fn: () => void | Promise<void>): void;
 }
+
+// node:sqlite (Node.js 22.5.0+)
+declare module 'node:sqlite' {
+  export class DatabaseSync {
+    constructor(location: string, options?: { open?: boolean });
+    exec(sql: string): void;
+    prepare(sql: string): StatementSync;
+    close(): void;
+  }
+  export interface StatementSync {
+    all(...namedParameters: any[]): any[];
+    run(...namedParameters: any[]): { changes: number | bigint; lastInsertRowid: number | bigint };
+    get(...namedParameters: any[]): any;
+  }
+}

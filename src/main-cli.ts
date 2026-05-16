@@ -28,9 +28,11 @@ import { NativeHttpServer } from './infra/NativeHttpServer.ts';
 import { IHttpServer } from './core/IHttpServer.ts';
 import { FileSensor } from './infra/FileSensor.ts';
 import { ISensor } from './core/ISensor.ts';
-import { MockVectorStore } from './infra/MockVectorStore.ts';
+import { SqliteVectorStore } from './infra/SqliteVectorStore.ts';
+import { OllamaEmbeddingProvider } from './infra/OllamaEmbeddingProvider.ts';
 import { IVectorStore } from './core/IVectorStore.ts';
-import { InMemorySessionManager } from './infra/InMemorySessionManager.ts';
+import { IEmbeddingProvider } from './core/IEmbeddingProvider.ts';
+import { SqliteSessionManager } from './infra/SqliteSessionManager.ts';
 import { ISessionManager } from './core/ISessionManager.ts';
 import { ConversationManager } from './infra/ConversationManager.ts';
 import { IConversationManager } from './core/IConversationManager.ts';
@@ -96,13 +98,14 @@ async function bootstrap(): Promise<void> {
   const motor: IMotorCognitivo = provider;
 
   // --- Session Manager ---
-  const sessionManager: ISessionManager = new InMemorySessionManager({
+  const sessionManager: ISessionManager = new SqliteSessionManager({
     logger,
-    maxMessagesPerSession: 20,
+    dbPath: 'nexus_core_cli.db',
   });
 
-  // --- Vector Store ---
-  const vectorStore: IVectorStore = new MockVectorStore({ logger });
+  // --- Vector Store e Embeddings ---
+  const embeddingProvider: IEmbeddingProvider = new OllamaEmbeddingProvider({ logger });
+  const vectorStore: IVectorStore = new SqliteVectorStore({ logger, dbPath: 'nexus_knowledge_cli.db' });
 
   // --- Tool Registry ---
   const toolRegistry: IToolRegistry = new ToolRegistry({ logger });
@@ -124,6 +127,7 @@ async function bootstrap(): Promise<void> {
     motor,
     sessionManager,
     vectorStore,
+    embeddingProvider,
     toolRegistry,
   });
 
@@ -195,24 +199,31 @@ async function bootstrap(): Promise<void> {
       logger.info('[main] Nenhum caminho de arquivo fornecido. Uso: npm start -- <caminho-do-arquivo> [porta]');
     }
 
-    // DEMONSTRACAO DO MOCK VECTOR STORE (Fase 3)
-    logger.info('[main] === MOCK VECTOR STORE - Demonstracao ===');
+    // DEMONSTRACAO DO SQLITE VECTOR STORE (RAG)
+    logger.info('[main] === SQLITE VECTOR STORE (RAG) - Demonstracao ===');
 
-    await vectorStore.adicionar('doc-1', [0.1, 0.2, 0.3], { texto: 'Gato felino mamifero', fonte: 'enciclopedia' });
-    await vectorStore.adicionar('doc-2', [0.4, 0.5, 0.6], { texto: 'Cachorro canino mamifero', fonte: 'enciclopedia' });
-    await vectorStore.adicionar('doc-3', [0.7, 0.8, 0.9], { texto: 'Aguia ave rapina', fonte: 'enciclopedia' });
+    try {
+      const txt1 = 'Gato é um felino mamifero.';
+      const txt2 = 'Cachorro é um canino mamifero leal.';
+      const txt3 = 'Águia é uma ave de rapina imponente.';
+      
+      await vectorStore.adicionar('doc-cli-1', await embeddingProvider.gerarEmbedding(txt1), { texto: txt1, fonte: 'enciclopedia' });
+      await vectorStore.adicionar('doc-cli-2', await embeddingProvider.gerarEmbedding(txt2), { texto: txt2, fonte: 'enciclopedia' });
+      await vectorStore.adicionar('doc-cli-3', await embeddingProvider.gerarEmbedding(txt3), { texto: txt3, fonte: 'enciclopedia' });
+      logger.info('[main] 3 vectors added to SqliteVectorStore.');
+    } catch(e) {
+      logger.info('[main] Vetores possivelmente já existem no banco CLI.');
+    }
 
-    logger.info('[main] 3 vectors added to MockVectorStore.');
-
-    const queryVector = [0.35, 0.45, 0.55];
+    const queryVector = await embeddingProvider.gerarEmbedding('fale sobre felinos');
     const similar = await vectorStore.buscarSimilares(queryVector, 2);
 
-    logger.info('[main] Top ' + similar.length + ' similar vectors to query [0.35, 0.45, 0.55]:');
+    logger.info('[main] Top ' + similar.length + ' similar vectors to query:');
     for (const result of similar) {
       logger.info('  -> id="' + result.id + '", score=' + result.score.toFixed(4) + ', texto="' + result.metadata.texto + '"');
     }
 
-    logger.info('[main] MockVectorStore demonstration completed successfully.');
+    logger.info('[main] SqliteVectorStore demonstration completed successfully.');
 
     // TESTE DO CONVERSATION MANAGER (Fase 5)
     logger.info('[main] === CONVERSATION MANAGER - Demonstracao: Sessoes + RAG (Fase 5) ===');
